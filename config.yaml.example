@@ -1,0 +1,53 @@
+# Comfy Complete - Runtime Configuration
+# Copy this file to config.yaml and customize for your setup
+
+# Docker image to run
+image: comfy-complete:latest
+
+# Port to expose ComfyUI on
+port: 8188
+
+# Container name (optional)
+name: comfy-complete
+
+# Volume mounts - local paths that will be mounted into the container
+# Supports ~ for home directory and environment variables
+volumes:
+  # Model files (checkpoints, loras, etc.)
+  models: ~/comfy-complete/models
+
+  # Generated output images/videos
+  output: ~/comfy-complete/output
+
+  # Input files for img2img, etc.
+  input: ~/comfy-complete/input
+
+  # Saved workflows
+  workflows: ~/comfy-complete/workflows
+
+# GPU settings
+gpu:
+  # Enable GPU access (requires nvidia-container-toolkit)
+  enabled: true
+
+  # GPU devices to use: "all" or comma-separated IDs like "0" or "0,1"
+  devices: all
+
+# Node filtering - disable nodes based on labels from supported_nodes.yaml
+# Uses OR logic: nodes matching ANY condition are disabled
+# Each deployment chooses which labels to disable.
+# Available labels: ReadsArbitraryFile, WritesToDisk, CreatesLargeOutputs,
+#   NetworkAccess, RequiresExternalAPI, Stateful, HasCustomEndpoints,
+#   PathParsing, DuplicateOfCoreNode, Incompatible, RequiresWebcam,
+#   RequiresDisplay, RequiresClipboard, RequiresGPU, BrokenNode,
+#   ExecutesArbitraryCode, RuntimeModelDownload, RuntimePipInstall
+#
+# Example: a restrictive policy that disables most labeled nodes
+disable_nodes:
+  or:
+    - Incompatible: true
+    - BrokenNode: true
+    - ExecutesArbitraryCode: true
+    - ReadsArbitraryFile: true
+    - WritesToDisk: true
+    - NetworkAccess: true

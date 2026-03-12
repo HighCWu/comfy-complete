@@ -1,0 +1,134 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "Crop and Stitch E2E",
+      "description": "Full round-trip test: crop then stitch back",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "noise",
+      "width": 768,
+      "height": 768,
+      "seed": 123
+    }
+  },
+  "3": {
+    "class_type": "CreateShapeMask",
+    "inputs": {
+      "shape": "circle",
+      "frames": 1,
+      "location_x": 300,
+      "location_y": 400,
+      "grow": 0,
+      "frame_width": 768,
+      "frame_height": 768,
+      "shape_width": 200,
+      "shape_height": 200
+    }
+  },
+  "4": {
+    "class_type": "InpaintCropImproved",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "mask": [
+        "3",
+        0
+      ],
+      "downscale_algorithm": "lanczos",
+      "upscale_algorithm": "lanczos",
+      "preresize": false,
+      "preresize_mode": "ensure minimum resolution",
+      "preresize_min_width": 1024,
+      "preresize_min_height": 1024,
+      "preresize_max_width": 16384,
+      "preresize_max_height": 16384,
+      "mask_fill_holes": true,
+      "mask_expand_pixels": 8,
+      "mask_invert": false,
+      "mask_blend_pixels": 16,
+      "mask_hipass_filter": 0.05,
+      "extend_for_outpainting": false,
+      "extend_up_factor": 1.0,
+      "extend_down_factor": 1.0,
+      "extend_left_factor": 1.0,
+      "extend_right_factor": 1.0,
+      "context_from_mask_extend_factor": 1.5,
+      "output_resize_to_target_size": true,
+      "output_target_width": 512,
+      "output_target_height": 512,
+      "output_padding": "64"
+    }
+  },
+  "5": {
+    "class_type": "InpaintStitchImproved",
+    "inputs": {
+      "stitcher": [
+        "4",
+        0
+      ],
+      "inpainted_image": [
+        "4",
+        1
+      ]
+    }
+  },
+  "6": {
+    "class_type": "AssertTensorShape",
+    "inputs": {
+      "tensor": [
+        "5",
+        0
+      ],
+      "batch": -1,
+      "height": 768,
+      "width": 768,
+      "channels": 3
+    }
+  },
+  "7": {
+    "class_type": "AssertTensorShape",
+    "inputs": {
+      "tensor": [
+        "4",
+        1
+      ],
+      "batch": -1,
+      "height": 512,
+      "width": 512,
+      "channels": 3
+    }
+  },
+  "8": {
+    "class_type": "AssertTensorShape",
+    "inputs": {
+      "tensor": [
+        "4",
+        2
+      ],
+      "batch": -1,
+      "height": 512,
+      "width": 512,
+      "channels": -1
+    }
+  },
+  "9": {
+    "class_type": "AssertImageMatch",
+    "inputs": {
+      "image": [
+        "5",
+        0
+      ],
+      "perceptual_hash": "0001000000100000000010000010001000011001001000100000000000000010",
+      "delta": 0.05,
+      "hash_function": "dhash"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+# Comfy Complete - Version Lock
+# This file pins the exact versions of ComfyUI core components.
+# Update these versions when upgrading the distribution.
+
+pinned:
+  comfyui:
+    ref: v0.18.2
+
+  comfyui_frontend_package:
+    ref: 1.41.18
+
+  comfyui_workflow_templates:
+    ref: 0.9.21

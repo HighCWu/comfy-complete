@@ -1,0 +1,19 @@
+services:
+  comfy-complete:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: comfy-complete
+    platform: linux/amd64
+    restart: always
+    #environment:
+      #COMFY_EXTRA_LIBS: "lib1 lib2==1.0.0"
+    #volumes:
+      #- /path/to/models:/app/comfyui/models
+    ports:
+      - "8188:8188"
+    networks:
+      - comfy
+
+networks:
+  comfy:

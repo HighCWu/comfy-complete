@@ -1,0 +1,74 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "CM_TypeConversions",
+      "description": "Test type conversion operations (IntToFloat, FloatToInt, BoolToInt, IntToBool)",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "CM_IntToFloat",
+    "inputs": {
+      "a": 5
+    }
+  },
+  "3": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "CM_FloatToInt",
+    "inputs": {
+      "a": 7.8
+    }
+  },
+  "5": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "4",
+        0
+      ],
+      "input2": 7
+    }
+  },
+  "6": {
+    "class_type": "CM_BoolToInt",
+    "inputs": {
+      "a": true
+    }
+  },
+  "7": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "6",
+        0
+      ],
+      "input2": 1
+    }
+  },
+  "8": {
+    "class_type": "CM_IntToBool",
+    "inputs": {
+      "a": 0
+    }
+  },
+  "9": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "8",
+        0
+      ],
+      "input2": false
+    }
+  }
+}

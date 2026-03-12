@@ -1,0 +1,39 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "AudioPad",
+      "description": "Test that AudioPad adds silence to audio",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 2.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "3": {
+    "class_type": "AudioPad",
+    "inputs": {
+      "audio": [
+        "2",
+        0
+      ],
+      "pad_start_seconds": 0.5,
+      "pad_end_seconds": 0.5
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

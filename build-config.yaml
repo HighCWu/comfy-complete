@@ -1,0 +1,7 @@
+# Comfy Complete - Build Configuration
+# Settings that apply during container build, not at runtime.
+
+build:
+  # Remove ComfyUI Manager after custom nodes are installed.
+  # This prevents users from installing additional nodes in managed environments.
+  remove_manager: true

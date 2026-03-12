@@ -1,0 +1,7 @@
+# Node packs that require GPU hardware to import (CUDA/nvvfx/TensorRT dependencies)
+# These are expected to show "IMPORT FAILED" when ComfyUI runs in --cpu mode
+# and are excluded from the sync-objectinfo CI import failure check.
+#
+# Format: one node pack folder name per line (as it appears in custom_nodes/)
+# Lines starting with # are comments
+comfyui_nvidia_rtx_nodes

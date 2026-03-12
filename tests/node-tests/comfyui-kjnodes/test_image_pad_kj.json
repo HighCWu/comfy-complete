@@ -1,0 +1,45 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "ImagePadKJ",
+      "description": "Test image padding with KJ nodes",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "noise",
+      "width": 256,
+      "height": 256,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "ImagePadKJ",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "left": 10,
+      "right": 10,
+      "top": 10,
+      "bottom": 10,
+      "extra_padding": 0,
+      "pad_mode": "edge",
+      "color": "#000000"
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

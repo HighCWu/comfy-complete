@@ -1,0 +1,38 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "AudioDePlosive",
+      "description": "Test that AudioDePlosive applies low cut filter",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 2.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "3": {
+    "class_type": "AudioDePlosive",
+    "inputs": {
+      "audio": [
+        "2",
+        0
+      ],
+      "cutoff_hz": 80
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

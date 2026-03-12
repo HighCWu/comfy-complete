@@ -1,0 +1,50 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "AudioCombine",
+      "description": "Test that AudioCombine combines two audio tracks",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 5.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "3": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 5.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "4": {
+    "class_type": "AudioCombine",
+    "inputs": {
+      "audio_1": [
+        "2",
+        0
+      ],
+      "audio_2": [
+        "3",
+        0
+      ],
+      "method": "add"
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "4",
+        0
+      ]
+    }
+  }
+}

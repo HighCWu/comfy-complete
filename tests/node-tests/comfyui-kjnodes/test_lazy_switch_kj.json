@@ -1,0 +1,52 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "LazySwitchKJ",
+      "description": "Test lazy switch for conditional outputs",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "white",
+      "width": 256,
+      "height": 256,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "black",
+      "width": 256,
+      "height": 256,
+      "seed": 43
+    }
+  },
+  "4": {
+    "class_type": "LazySwitchKJ",
+    "inputs": {
+      "switch": true,
+      "on_false": [
+        "2",
+        0
+      ],
+      "on_true": [
+        "3",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "4",
+        0
+      ]
+    }
+  }
+}

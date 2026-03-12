@@ -1,0 +1,87 @@
+# Ephemeral Test Trigger
+#
+# When a maintainer adds the 'ephemeral-test' label to a PR, this workflow
+# sends a repository_dispatch event to the cloud repo to spin up an ephemeral
+# environment, run test workflows against this branch, and post results back.
+#
+# Security: Only @Comfy-Org members should add the 'ephemeral-test' label.
+# GitHub org membership controls who can add labels to PRs. This workflow
+# does not enforce membership checks itself - repo branch protection and
+# org-level permissions handle that.
+#
+# Requirements:
+#   - CLOUD_REPO_PAT: A Personal Access Token (or GitHub App token) with
+#     'repo' scope on the cloud repo (Comfy-Org/cloud). Set as a repository
+#     secret in comfy-complete.
+
+name: Ephemeral Test
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  trigger-ephemeral:
+    # Only run when the 'ephemeral-test' label is added
+    if: github.event.label.name == 'ephemeral-test'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Post pending comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: [
+                '**Ephemeral Test Triggered**',
+                '',
+                'An ephemeral environment is being created to test this branch.',
+                'Results will be posted here when complete.',
+                '',
+                `Commit: \`${context.payload.pull_request.head.sha.substring(0, 8)}\``,
+                `Branch: \`${context.payload.pull_request.head.ref}\``,
+              ].join('\n'),
+            });
+
+      - name: Set pending status check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'pending',
+              context: 'ephemeral-test',
+              description: 'Ephemeral environment is being provisioned...',
+            });
+
+      - name: Dispatch to cloud repo
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CLOUD_REPO_PAT }}
+          script: |
+            // Send repository_dispatch to the cloud repo so it can create
+            // an ephemeral environment pointing at this comfy-complete branch.
+            //
+            // Cloud-side workflow should:
+            //   1. Create a temporary PR/branch pointing to this CC branch
+            //   2. Spin up an ephemeral GCP environment
+            //   3. Run test workflows against it
+            //   4. Send results back via repository_dispatch (ephemeral-test-results)
+            await github.rest.repos.createDispatchEvent({
+              owner: 'Comfy-Org',
+              repo: 'cloud',
+              event_type: 'ephemeral-test',
+              client_payload: {
+                pr_number: context.payload.pull_request.number,
+                pr_branch: context.payload.pull_request.head.ref,
+                pr_head_sha: context.payload.pull_request.head.sha,
+                source_repo: `${context.repo.owner}/${context.repo.repo}`,
+              },
+            });
+            core.info(`Dispatched ephemeral-test to cloud repo for PR #${context.payload.pull_request.number}`);

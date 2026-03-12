@@ -1,0 +1,47 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "ADE_AnimateDiffSettings",
+      "description": "Test that ADE_AnimateDiffSettings creates settings with adjustments",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "ADE_AdjustPEFullStretch",
+    "inputs": {
+      "pe_stretch": 24,
+      "print_adjustment": false
+    }
+  },
+  "3": {
+    "class_type": "ADE_AdjustWeightAllAdd",
+    "inputs": {
+      "all_ADD": 0.1,
+      "print_adjustment": false
+    }
+  },
+  "4": {
+    "class_type": "ADE_AnimateDiffSettings",
+    "inputs": {
+      "pe_adjust": [
+        "2",
+        0
+      ],
+      "weight_adjust": [
+        "3",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "4",
+        0
+      ]
+    }
+  }
+}

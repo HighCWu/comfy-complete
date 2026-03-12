@@ -1,0 +1,65 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "CM_BoolBinaryOperation",
+      "description": "Test boolean binary operations (And, Or, Xor)",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "CM_BoolBinaryOperation",
+    "inputs": {
+      "op": "And",
+      "a": true,
+      "b": true
+    }
+  },
+  "3": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "2",
+        0
+      ],
+      "input2": true
+    }
+  },
+  "4": {
+    "class_type": "CM_BoolBinaryOperation",
+    "inputs": {
+      "op": "Or",
+      "a": false,
+      "b": true
+    }
+  },
+  "5": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "4",
+        0
+      ],
+      "input2": true
+    }
+  },
+  "6": {
+    "class_type": "CM_BoolBinaryOperation",
+    "inputs": {
+      "op": "Xor",
+      "a": true,
+      "b": true
+    }
+  },
+  "7": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "6",
+        0
+      ],
+      "input2": false
+    }
+  }
+}

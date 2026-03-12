@@ -1,0 +1,267 @@
+name: Custom Node Review
+
+on:
+  pull_request:
+    paths:
+      - 'supported_nodes.yaml'
+    types: [opened, synchronize, reopened]
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review (optional)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # ── Script-based checks (deterministic, always runs) ───────────────────
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install pyyaml
+          chmod +x scripts/pr-review/*.sh scripts/add-node/*.sh
+
+      - name: Install ripgrep
+        run: |
+          curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep_14.1.0-1_amd64.deb
+          sudo dpkg -i ripgrep_14.1.0-1_amd64.deb
+
+      - name: Detect changes
+        id: changes
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          git fetch origin "$BASE_REF"
+
+          python scripts/pr-review/detect_changes.py \
+            --base "origin/$BASE_REF" \
+            --config supported_nodes.yaml \
+            --output changes.json
+
+          echo "Changes detected:"
+          cat changes.json
+
+          HAS_CHANGES=$(jq -r '.summary.has_changes' changes.json)
+          NEW_COUNT=$(jq -r '.summary.new_count' changes.json)
+          UPDATED_COUNT=$(jq -r '.summary.updated_count' changes.json)
+
+          echo "has_changes=$HAS_CHANGES" >> $GITHUB_OUTPUT
+          echo "new_count=$NEW_COUNT" >> $GITHUB_OUTPUT
+          echo "updated_count=$UPDATED_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Validate all changed entries
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          FAILED=0
+          for name in $(jq -r '.new_packs[].name, .updated_packs[].name' changes.json 2>/dev/null); do
+            echo "=== Validating: $name ==="
+            python scripts/add-node/validate-entry.py \
+              --yaml supported_nodes.yaml \
+              --name "$name" || FAILED=1
+            echo ""
+          done
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::One or more entries failed validation"
+            exit 1
+          fi
+
+      - name: Clone changed node packs
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          mkdir -p /tmp/nodes
+          python scripts/pr-review/clone_nodes.py \
+            --changes changes.json \
+            --dest /tmp/nodes || true
+
+          echo "Cloned node packs:"
+          ls -la /tmp/nodes/ || echo "No nodes cloned"
+
+      - name: Run security scans
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          mkdir -p scan-results
+          BLOCKER_FOUND=0
+
+          for dir in /tmp/nodes/*/; do
+            if [ -d "$dir" ]; then
+              node_name=$(basename "$dir")
+              echo "=== Security scan: $node_name ==="
+              if ! ./scripts/pr-review/security-scan.sh "$dir" > "scan-results/${node_name}.txt" 2>&1; then
+                BLOCKER_FOUND=1
+                echo "::warning::Security blockers found in $node_name"
+              fi
+              cat "scan-results/${node_name}.txt"
+              echo ""
+            fi
+          done
+
+          if [ "$BLOCKER_FOUND" -ne 0 ]; then
+            echo "::error::Security blockers found — see scan results above"
+            exit 1
+          fi
+
+      - name: Check licenses
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          mkdir -p license-results
+          LICENSE_FAILED=0
+          for dir in /tmp/nodes/*/; do
+            if [ -d "$dir" ]; then
+              node_name=$(basename "$dir")
+              echo "=== License check: $node_name ==="
+              if ! python scripts/add-node/check-license.py "$dir" > "license-results/${node_name}.txt" 2>&1; then
+                LICENSE_FAILED=1
+                echo "::error::License blockers found in $node_name"
+              fi
+              cat "license-results/${node_name}.txt"
+              echo ""
+            fi
+          done
+          if [ "$LICENSE_FAILED" -ne 0 ]; then
+            echo "::error::License check failed"
+            exit 1
+          fi
+
+      - name: Check dependencies
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          for name in $(jq -r '.new_packs[].name, .updated_packs[].name' changes.json 2>/dev/null); do
+            echo "=== Dependency check: $name ==="
+            python scripts/add-node/compile-deps.py \
+              --yaml supported_nodes.yaml \
+              --name "$name" \
+              --requirements requirements.txt || true
+            echo ""
+          done
+
+      - name: Suggest labels
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          mkdir -p label-suggestions
+
+          for dir in /tmp/nodes/*/; do
+            if [ -d "$dir" ]; then
+              node_name=$(basename "$dir")
+              echo "=== Label suggestions: $node_name ==="
+              python scripts/add-node/suggest-labels.py "$dir" \
+                > "label-suggestions/${node_name}.txt" 2>&1 || true
+              cat "label-suggestions/${node_name}.txt"
+              echo ""
+            fi
+          done
+
+      - name: Upload scan artifacts
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-results
+          path: |
+            changes.json
+            scan-results/
+            license-results/
+            label-suggestions/
+
+      - name: No changes detected
+        if: steps.changes.outputs.has_changes != 'true'
+        run: echo "No changes to supported_nodes.yaml detected."
+
+  # ── Claude review (optional, deeper analysis) ──────────────────────────
+  ai-review:
+    needs: validate
+    if: ${{ !endsWith(github.actor, '[bot]') }}
+    runs-on: ubuntu-latest
+    # Only run if ANTHROPIC_API_KEY is configured
+    env:
+      HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+    steps:
+      - name: Skip if no API key
+        if: env.HAS_KEY != 'true'
+        run: echo "Skipping AI review — ANTHROPIC_API_KEY not configured"
+
+      - uses: actions/checkout@v4
+        if: env.HAS_KEY == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Download scan artifacts
+        if: env.HAS_KEY == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: review-results
+
+      - name: Setup Python
+        if: env.HAS_KEY == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: env.HAS_KEY == 'true'
+        run: pip install pyyaml
+
+      - name: Install ripgrep
+        if: env.HAS_KEY == 'true'
+        run: |
+          curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep_14.1.0-1_amd64.deb
+          sudo dpkg -i ripgrep_14.1.0-1_amd64.deb
+
+      - name: Clone changed node packs
+        if: env.HAS_KEY == 'true'
+        run: |
+          mkdir -p /tmp/nodes
+          python scripts/pr-review/clone_nodes.py \
+            --changes changes.json \
+            --dest /tmp/nodes || true
+
+      - name: Run Claude Review
+        if: env.HAS_KEY == 'true'
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: 15
+          direct_prompt: |
+            You are the Comfy Complete PR Review Agent. Review this PR according to your instructions in `.claude/agents/pr-reviewer.md`.
+
+            ## Context
+
+            This PR modifies the custom node configuration. Your job is to:
+            1. Analyze the changes detected in `changes.json`
+            2. Review security scan results in `scan-results/`
+            3. Review label suggestions in `label-suggestions/`
+            4. Check that labels are correctly assigned
+            5. Post a structured review comment
+
+            ## Files to Read
+
+            1. First, read your instructions: `.claude/agents/pr-reviewer.md`
+            2. Read the detected changes: `changes.json`
+            3. Read security scan results: `scan-results/*.txt`
+            4. Read label suggestions: `label-suggestions/*.txt`
+            5. Read the PR's `supported_nodes.yaml` to see the full context
+            6. For each cloned node pack in `/tmp/nodes/`, analyze the Python code
+
+            ## Important
+
+            - The script-based checks (validate job) have already run — focus on deeper code analysis
+            - Compare suggested labels against declared labels — flag discrepancies
+            - Be thorough but concise
+            - Only suggest labels you're confident about based on code analysis
+            - Flag security blockers clearly
+            - For version updates, focus on what's NEW, not existing patterns

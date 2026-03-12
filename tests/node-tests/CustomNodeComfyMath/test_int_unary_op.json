@@ -1,0 +1,45 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "CM_IntUnaryOperation",
+      "description": "Test integer unary operations (Neg, Abs)",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "CM_IntUnaryOperation",
+    "inputs": {
+      "op": "Neg",
+      "a": 5
+    }
+  },
+  "3": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "2",
+        0
+      ],
+      "input2": -5
+    }
+  },
+  "4": {
+    "class_type": "CM_IntUnaryOperation",
+    "inputs": {
+      "op": "Abs",
+      "a": -10
+    }
+  },
+  "5": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "4",
+        0
+      ],
+      "input2": 10
+    }
+  }
+}

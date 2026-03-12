@@ -1,0 +1,37 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "AudioGetTempo",
+      "description": "Test that AudioGetTempo returns tempo information",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 5.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "3": {
+    "class_type": "AudioGetTempo",
+    "inputs": {
+      "audio": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        1
+      ]
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "CM_FloatBinaryOperation",
+      "description": "Test float binary operations (add, subtract, multiply, divide)",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "CM_FloatBinaryOperation",
+    "inputs": {
+      "op": "Add",
+      "a": 2.5,
+      "b": 3.5
+    }
+  },
+  "3": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "CM_FloatBinaryOperation",
+    "inputs": {
+      "op": "Mul",
+      "a": 2.0,
+      "b": 3.0
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "4",
+        0
+      ]
+    }
+  },
+  "6": {
+    "class_type": "CM_FloatBinaryOperation",
+    "inputs": {
+      "op": "Div",
+      "a": 10.0,
+      "b": 2.0
+    }
+  },
+  "7": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "6",
+        0
+      ]
+    }
+  }
+}

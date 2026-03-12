@@ -1,0 +1,40 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "BinaryPreprocessor",
+      "description": "Test binary threshold preprocessor",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "noise",
+      "width": 512,
+      "height": 512,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "BinaryPreprocessor",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "bin_threshold": 128,
+      "resolution": 512
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

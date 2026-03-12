@@ -1,0 +1,91 @@
+# Ephemeral Test Results Receiver
+#
+# Receives test results from the cloud repo after an ephemeral environment
+# has finished running test workflows. Posts a formatted summary comment on
+# the originating PR and updates the commit status check.
+#
+# Triggered by repository_dispatch from the cloud repo with event type
+# 'ephemeral-test-results'. The cloud repo must have a PAT or GitHub App
+# token with permissions to dispatch events to this repo.
+#
+# Expected payload:
+#   pr_number:    int    - The comfy-complete PR number
+#   pr_head_sha:  string - The commit SHA that was tested
+#   overall:      string - "success" or "failure"
+#   results:      array  - List of { name, status, duration, error? }
+#   environment:  string - Ephemeral environment identifier
+#   logs_url:     string - URL to full test logs (optional)
+
+name: Ephemeral Test Results
+
+on:
+  repository_dispatch:
+    types: [ephemeral-test-results]
+
+jobs:
+  post-results:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post results comment and update status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const payload = context.payload.client_payload;
+            const prNumber = payload.pr_number;
+            const sha = payload.pr_head_sha;
+            const overall = payload.overall;  // "success" or "failure"
+            const results = payload.results || [];
+            const environment = payload.environment || 'unknown';
+            const logsUrl = payload.logs_url || '';
+
+            // Build results table
+            const header = '| Workflow | Status | Duration |';
+            const divider = '|----------|--------|----------|';
+            const rows = results.map(r => {
+              const icon = r.status === 'pass' ? 'PASS' : 'FAIL';
+              const duration = r.duration || '-';
+              const error = r.error ? ` (${r.error})` : '';
+              return `| ${r.name} | ${icon}${error} | ${duration} |`;
+            });
+
+            const passCount = results.filter(r => r.status === 'pass').length;
+            const failCount = results.filter(r => r.status !== 'pass').length;
+
+            const lines = [
+              `**Ephemeral Test Results**`,
+              '',
+              `Commit: \`${sha.substring(0, 8)}\` | Environment: \`${environment}\``,
+              '',
+              `**${passCount} passed, ${failCount} failed** out of ${results.length} workflows`,
+              '',
+              header,
+              divider,
+              ...rows,
+            ];
+
+            if (logsUrl) {
+              lines.push('', `[View full logs](${logsUrl})`);
+            }
+
+            // Post comment on PR
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: lines.join('\n'),
+            });
+
+            // Update commit status check
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: sha,
+              state: overall === 'success' ? 'success' : 'failure',
+              context: 'ephemeral-test',
+              description: overall === 'success'
+                ? `All ${results.length} test workflows passed`
+                : `${failCount} of ${results.length} test workflows failed`,
+              target_url: logsUrl || undefined,
+            });
+
+            core.info(`Posted results for PR #${prNumber}: ${overall}`);

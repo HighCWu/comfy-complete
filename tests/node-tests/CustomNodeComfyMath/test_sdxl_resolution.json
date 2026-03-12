@@ -1,0 +1,47 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "CM_NearestSDXLResolution",
+      "description": "Test NearestSDXLResolution for finding optimal SDXL resolution",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "noise",
+      "width": 1920,
+      "height": 1080,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "CM_NearestSDXLResolution",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        1
+      ]
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "CM_FloatUnaryOperation",
+      "description": "Test float unary operations (Neg, Abs, Sqrt)",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "CM_FloatUnaryOperation",
+    "inputs": {
+      "op": "Neg",
+      "a": 2.5
+    }
+  },
+  "3": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "CM_FloatUnaryOperation",
+    "inputs": {
+      "op": "Abs",
+      "a": -3.5
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "4",
+        0
+      ]
+    }
+  },
+  "6": {
+    "class_type": "CM_FloatUnaryOperation",
+    "inputs": {
+      "op": "Sqrt",
+      "a": 16.0
+    }
+  },
+  "7": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "6",
+        0
+      ]
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "ADE_AdjustPEFullStretch",
+      "description": "Test that ADE_AdjustPEFullStretch creates PE adjustment",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "ADE_AdjustPEFullStretch",
+    "inputs": {
+      "pe_stretch": 24,
+      "print_adjustment": false
+    }
+  },
+  "3": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "2",
+        0
+      ]
+    }
+  }
+}

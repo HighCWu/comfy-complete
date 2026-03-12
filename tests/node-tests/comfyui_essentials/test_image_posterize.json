@@ -1,0 +1,39 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "ImagePosterize_",
+      "description": "Test image posterization",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "noise",
+      "width": 256,
+      "height": 256,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "ImagePosterize+",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "threshold": 0.5
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

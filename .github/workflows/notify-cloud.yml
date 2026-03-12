@@ -1,0 +1,25 @@
+name: Notify Cloud Repo
+
+# When comfy-complete pushes to main, notify the cloud repo to update its submodule.
+# This triggers the cloud repo's comfy-complete-sync.yml workflow.
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify cloud repo
+        env:
+          GH_TOKEN: ${{ secrets.CLOUD_REPO_PAT }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          curl -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Comfy-Org/cloud/dispatches \
+            -d "{\"event_type\":\"comfy-complete-updated\",\"client_payload\":{\"ref\":\"$COMMIT_SHA\",\"branch\":\"main\"}}"
+          echo "Dispatched comfy-complete-updated event to cloud repo"

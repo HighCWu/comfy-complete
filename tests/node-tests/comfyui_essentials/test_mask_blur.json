@@ -1,0 +1,50 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "MaskBlur_",
+      "description": "Test mask blur",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "white",
+      "width": 256,
+      "height": 256,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "channel": "red"
+    }
+  },
+  "4": {
+    "class_type": "MaskBlur+",
+    "inputs": {
+      "mask": [
+        "3",
+        0
+      ],
+      "amount": 5,
+      "device": "cpu"
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "4",
+        0
+      ]
+    }
+  }
+}

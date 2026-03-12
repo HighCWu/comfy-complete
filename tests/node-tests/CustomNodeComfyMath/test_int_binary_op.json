@@ -1,0 +1,65 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "CM_IntBinaryOperation",
+      "description": "Test integer binary operations (add, subtract, multiply)",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "CM_IntBinaryOperation",
+    "inputs": {
+      "op": "Add",
+      "a": 5,
+      "b": 3
+    }
+  },
+  "3": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "2",
+        0
+      ],
+      "input2": 8
+    }
+  },
+  "4": {
+    "class_type": "CM_IntBinaryOperation",
+    "inputs": {
+      "op": "Sub",
+      "a": 10,
+      "b": 4
+    }
+  },
+  "5": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "4",
+        0
+      ],
+      "input2": 6
+    }
+  },
+  "6": {
+    "class_type": "CM_IntBinaryOperation",
+    "inputs": {
+      "op": "Mul",
+      "a": 6,
+      "b": 7
+    }
+  },
+  "7": {
+    "class_type": "AssertEqual",
+    "inputs": {
+      "input1": [
+        "6",
+        0
+      ],
+      "input2": 42
+    }
+  }
+}

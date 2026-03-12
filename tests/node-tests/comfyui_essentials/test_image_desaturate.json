@@ -1,0 +1,40 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "ImageDesaturate_",
+      "description": "Test image desaturation",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "noise",
+      "width": 256,
+      "height": 256,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "ImageDesaturate+",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "factor": 0.5,
+      "method": "luminance (Rec.709)"
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

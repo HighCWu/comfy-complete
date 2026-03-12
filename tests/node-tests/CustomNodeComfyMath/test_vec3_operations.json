@@ -1,0 +1,55 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "CM_Vec3Operations",
+      "description": "Test Vec3 compose and breakout operations",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "CM_ComposeVec3",
+    "inputs": {
+      "x": 1.0,
+      "y": 2.0,
+      "z": 3.0
+    }
+  },
+  "3": {
+    "class_type": "CM_BreakoutVec3",
+    "inputs": {
+      "a": [
+        "2",
+        0
+      ]
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        1
+      ]
+    }
+  },
+  "6": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        2
+      ]
+    }
+  }
+}

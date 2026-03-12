@@ -1,0 +1,40 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "AudioDelay",
+      "description": "Test that AudioDelay applies delay effect",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 2.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "3": {
+    "class_type": "AudioDelay",
+    "inputs": {
+      "audio": [
+        "2",
+        0
+      ],
+      "delay_ms": 250.0,
+      "feedback": 0.3,
+      "mix": 0.5
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

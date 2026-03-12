@@ -1,0 +1,41 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "AudioReverb",
+      "description": "Test that AudioReverb applies reverb effect",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 2.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "3": {
+    "class_type": "AudioReverb",
+    "inputs": {
+      "audio": [
+        "2",
+        0
+      ],
+      "room_size": 0.5,
+      "damping": 0.5,
+      "wet_level": 0.3,
+      "dry_level": 0.7
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "TilePreprocessor",
+      "description": "Test tile preprocessor",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "noise",
+      "width": 512,
+      "height": 512,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "TilePreprocessor",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "pyrUp_iters": 3,
+      "resolution": 512
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

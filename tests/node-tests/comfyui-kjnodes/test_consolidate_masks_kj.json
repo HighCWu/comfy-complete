@@ -1,0 +1,51 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "ConsolidateMasksKJ",
+      "description": "Test mask consolidation",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "TestImageGenerator",
+    "inputs": {
+      "image_type": "white",
+      "width": 256,
+      "height": 256,
+      "seed": 42
+    }
+  },
+  "3": {
+    "class_type": "ImageToMask",
+    "inputs": {
+      "image": [
+        "2",
+        0
+      ],
+      "channel": "red"
+    }
+  },
+  "4": {
+    "class_type": "ConsolidateMasksKJ",
+    "inputs": {
+      "masks": [
+        "3",
+        0
+      ],
+      "width": 256,
+      "height": 256,
+      "padding": 0
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "4",
+        0
+      ]
+    }
+  }
+}

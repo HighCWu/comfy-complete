@@ -1,0 +1,39 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "AudioTrim",
+      "description": "Test that AudioTrim trims audio",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 5.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "3": {
+    "class_type": "AudioTrim",
+    "inputs": {
+      "audio": [
+        "2",
+        0
+      ],
+      "trim_start_seconds": 1.0,
+      "trim_end_seconds": 1.0
+    }
+  },
+  "4": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "3",
+        0
+      ]
+    }
+  }
+}

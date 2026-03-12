@@ -1,0 +1,49 @@
+{
+  "1": {
+    "class_type": "TestDefinition",
+    "inputs": {
+      "name": "AudioConcatenate",
+      "description": "Test that AudioConcatenate joins two audio tracks",
+      "requiresGPU": false,
+      "extraTime": 0
+    }
+  },
+  "2": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 2.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "3": {
+    "class_type": "EmptyAudio",
+    "inputs": {
+      "duration": 2.0,
+      "sample_rate": 44100,
+      "channels": 2
+    }
+  },
+  "4": {
+    "class_type": "AudioConcatenate",
+    "inputs": {
+      "audio_a": [
+        "2",
+        0
+      ],
+      "audio_b": [
+        "3",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "AssertExecuted",
+    "inputs": {
+      "input": [
+        "4",
+        0
+      ]
+    }
+  }
+}

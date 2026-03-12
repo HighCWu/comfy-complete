@@ -1,0 +1,1419 @@
+# Comfy Complete - Supported Custom Nodes
+# This file defines the custom node packs that are part of the Comfy Complete distribution.
+# Each node pack is pinned to a specific version to ensure compatibility.
+
+# Available labels - all labels used in node_packs must be declared here
+labels:
+  - ReadsArbitraryFile     # Node can read files from arbitrary paths
+  - CreatesLargeOutputs    # Node may create unusually large outputs
+  - WritesToDisk           # Node writes to the filesystem
+  - NetworkAccess          # Node makes network requests
+  - Stateful               # Node persists user-specific data between runs
+  - HasCustomEndpoints     # Node registers custom HTTP server routes
+  - RequiresExternalAPI    # Node requires external API keys (OpenAI, etc.)
+  - PathParsing            # Node parses, manipulates, or exposes filesystem path information
+  - DuplicateOfCoreNode    # Node duplicates functionality available in a core ComfyUI node
+  - Incompatible           # Node fundamentally cannot work in a remote/headless environment
+  - RequiresWebcam         # Node accesses webcam/camera hardware
+  - RequiresDisplay        # Node requires GUI/display/X11 (preview windows, interactive UI)
+  - RequiresClipboard      # Node accesses system clipboard
+  - RequiresGPU            # Node requires GPU hardware (CUDA/ROCm) and will fail on CPU-only
+  - BrokenNode             # Node is temporarily broken (API incompatibility, missing deps, etc.)
+  - ExecutesArbitraryCode  # Node executes user-provided code (Python, JS, shell, etc.)
+  - RuntimeModelDownload   # Node downloads models at inference time instead of pre-provisioned
+  - RuntimePipInstall      # Node installs pip packages during execution
+
+node_packs:
+  - name: core
+    node_labels:
+      LoadImageDataSetFromFolder:
+        - ReadsArbitraryFile
+      LoadImageTextDataSetFromFolder:
+        - ReadsArbitraryFile
+      LoadTrainingDataset:
+        - ReadsArbitraryFile
+      SaveImageDataSetToFolder:
+        - WritesToDisk
+      SaveImageTextDataSetToFolder:
+        - WritesToDisk
+      SaveLoRA:
+        - CreatesLargeOutputs
+      SaveTrainingDataset:
+        - WritesToDisk
+      CheckpointSave:
+        - CreatesLargeOutputs
+      ImageOnlyCheckpointSave:
+        - CreatesLargeOutputs
+      ModelSave:
+        - CreatesLargeOutputs
+      ModelSaveKJ:
+        - CreatesLargeOutputs
+      LoraSave:
+        - WritesToDisk
+      CLIPSave:
+        - WritesToDisk
+      VAESave:
+        - WritesToDisk
+
+  - name: comfyui-kjnodes
+    version: "1.2.8"
+    node_labels:
+      LoadVideosFromFolder:
+        - ReadsArbitraryFile
+      LoadImagesFromFolderKJ:
+        - ReadsArbitraryFile
+      SaveImageKJ:
+        - WritesToDisk
+      SaveStringKJ:
+        - WritesToDisk
+      StartRecordCUDAMemoryHistory:
+        - Stateful
+      EndRecordCUDAMemoryHistory:
+        - Stateful
+        - WritesToDisk
+      VisualizeCUDAMemoryHistory:
+        - WritesToDisk
+      WebcamCaptureCV2:
+        - RequiresWebcam
+      DownloadAndLoadCLIPSeg:
+        - RuntimeModelDownload
+        - NetworkAccess
+      Superprompt:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: https://github.com/kijai/ComfyUI-KwaiKolorsWrapper@6fc1cd9d20bb7537facf180e5494b486b9710e24
+    node_labels:
+      DownloadAndLoadKolorsModel:
+        - RuntimeModelDownload
+        - NetworkAccess
+      DownloadAndLoadChatGLM3:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: comfyui_controlnet_aux
+    version: "1.1.3"
+    node_labels:
+      AnimeFace_SemSegPreprocessor:
+        - RuntimeModelDownload
+      AnyLineArtPreprocessor_aux:
+        - RuntimeModelDownload
+      DensePosePreprocessor:
+        - RuntimeModelDownload
+      DepthAnythingPreprocessor:
+        - RuntimeModelDownload
+      Zoe_DepthAnythingPreprocessor:
+        - RuntimeModelDownload
+      DepthAnythingV2Preprocessor:
+        - RuntimeModelDownload
+      Metric_DepthAnythingV2Preprocessor:
+        - RuntimeModelDownload
+      DiffusionEdge_Preprocessor:
+        - RuntimeModelDownload
+        - RuntimePipInstall
+      DSINE-NormalMapPreprocessor:
+        - RuntimeModelDownload
+      DWPreprocessor:
+        - RuntimeModelDownload
+      AnimalPosePreprocessor:
+        - RuntimeModelDownload
+      HEDPreprocessor:
+        - RuntimeModelDownload
+      FakeScribblePreprocessor:
+        - RuntimeModelDownload
+      LeReS-DepthMapPreprocessor:
+        - RuntimeModelDownload
+      LineArtPreprocessor:
+        - RuntimeModelDownload
+      AnimeLineArtPreprocessor:
+        - RuntimeModelDownload
+      Manga2Anime_LineArt_Preprocessor:
+        - RuntimeModelDownload
+      MediaPipe-FaceMeshPreprocessor:
+        - RuntimePipInstall
+      MeshGraphormer-DepthMapPreprocessor:
+        - RuntimeModelDownload
+        - RuntimePipInstall
+      "MeshGraphormer+ImpactDetector-DepthMapPreprocessor":
+        - RuntimeModelDownload
+        - RuntimePipInstall
+      Metric3D-DepthMapPreprocessor:
+        - RuntimeModelDownload
+      Metric3D-NormalMapPreprocessor:
+        - RuntimeModelDownload
+      MiDaS-DepthMapPreprocessor:
+        - RuntimeModelDownload
+      MiDaS-NormalMapPreprocessor:
+        - RuntimeModelDownload
+      M-LSDPreprocessor:
+        - RuntimeModelDownload
+      BAE-NormalMapPreprocessor:
+        - RuntimeModelDownload
+      OneFormer-COCO-SemSegPreprocessor:
+        - RuntimeModelDownload
+      OneFormer-ADE20K-SemSegPreprocessor:
+        - RuntimeModelDownload
+      OpenposePreprocessor:
+        - RuntimeModelDownload
+      PiDiNetPreprocessor:
+        - RuntimeModelDownload
+      ScribblePreprocessor:
+        - RuntimeModelDownload
+      Scribble_PiDiNet_Preprocessor:
+        - RuntimeModelDownload
+      SAMPreprocessor:
+        - RuntimeModelDownload
+      TEEDPreprocessor:
+        - RuntimeModelDownload
+      UniFormer-SemSegPreprocessor:
+        - RuntimeModelDownload
+      Unimatch_OptFlowPreprocessor:
+        - RuntimeModelDownload
+      Zoe-DepthMapPreprocessor:
+        - RuntimeModelDownload
+      SavePoseKpsAsJsonFile:
+        - WritesToDisk
+
+  - name: comfyui-animatediff-evolved
+    version: "1.5.6"
+    node_labels:
+      ADE_LoadCameraPosesFromPath:
+        - ReadsArbitraryFile
+
+  - name: comfyui-videohelpersuite
+    version: "1.7.9"
+    node_labels:
+      VHS_LoadVideoPath:
+        - ReadsArbitraryFile
+      VHS_LoadVideoFFmpegPath:
+        - ReadsArbitraryFile
+      VHS_LoadImagesPath:
+        - ReadsArbitraryFile
+      VHS_LoadImagePath:
+        - ReadsArbitraryFile
+      VHS_SelectFilename:
+        - ReadsArbitraryFile
+      VHS_LoadImages:
+        - ReadsArbitraryFile
+      VHS_LoadAudio:
+        - ReadsArbitraryFile
+      VHS_VideoCombine:
+        - CreatesLargeOutputs
+
+  - name: comfyui_ultimatesdupscale
+    version: "1.6.2"
+
+  - name: audio-separation-nodes-comfyui
+    version: "1.5.0"
+    node_labels:
+      AudioSeparation:
+        - RuntimeModelDownload
+
+  - name: ComfyUI-WanVideoWrapper
+    version: "1.4.7"
+    node_labels:
+      WanVideoVRAMManagement:
+        - Incompatible
+      WanVideoSetBlockSwap:
+        - Incompatible
+      WanVideoBlockSwap:
+        - Incompatible
+      WanVideoLoraSelectByName:
+        - Incompatible
+      DownloadAndLoadNLFModel:
+        - NetworkAccess
+        - RuntimeModelDownload
+      DownloadAndLoadWav2VecModel:
+        - RuntimeModelDownload
+        - NetworkAccess
+      WanVideoUniAnimateDWPoseDetector:
+        - RuntimeModelDownload
+        - NetworkAccess
+      LynxEncodeFaceIP:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: "https://github.com/kijai/ComfyUI-DynamiCrafterWrapper@d312c62982f1582b7955444d3a22ac948fb9c603"
+    version: ""
+    node_labels:
+      DownloadAndLoadCLIPModel:
+        - Incompatible
+      DownloadAndLoadDynamiCrafterModel:
+        - RuntimeModelDownload
+        - NetworkAccess
+      DownloadAndLoadCLIPVisionModel:
+        - RuntimeModelDownload
+        - NetworkAccess
+      DownloadAndLoadDynamiCrafterCNModel:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: comfyui-enricos-nodes
+    version: "3.1.6"
+    node_labels:
+      Compositor3:
+        - HasCustomEndpoints
+        - RequiresDisplay
+      Compositor4:
+        - RequiresDisplay
+      ImageColorSampler:
+        - HasCustomEndpoints
+        - RequiresDisplay
+
+  - name: comfyui-florence2
+    version: "1.0.7"
+    node_labels:
+      Florence2ModelLoader:
+        - Incompatible
+      DownloadAndLoadFlorence2Model:
+        - RuntimeModelDownload
+        - NetworkAccess
+      DownloadAndLoadFlorence2Lora:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: comfyui-inpaint-cropandstitch
+    version: "2.1.8"
+    web_directory: js
+
+  - name: comfyui-inpaint-nodes
+    version: "1.4.0"
+
+  - name: comfyui_essentials
+    version: "1.1.0"
+    node_labels:
+      "LoadCLIPSegModels+":
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: comfyui-systms-facecomposite
+    version: "1.0.0"
+
+  - name: comfyui-supir
+    version: "1.0.4"
+    node_labels:
+      SUPIR_Upscale:
+        - RuntimeModelDownload
+      SUPIR_model_loader:
+        - RuntimeModelDownload
+      SUPIR_model_loader_v2:
+        - RuntimeModelDownload
+      SUPIR_model_loader_v2_clip:
+        - RuntimeModelDownload
+
+  - name: comfyui-segment-anything-2
+    version: "1.0.2"
+    node_labels:
+      DownloadAndLoadSAM2Model:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: "https://github.com/Comfy-Org/CustomNodeComfyMath@c01177221c31b8e5fbc062778fc8254aeb541638"
+    version: ""
+
+  - name: comfyui-impact-pack
+    version: "8.28.2"
+    node_labels:
+      PreviewBridge:
+        - RequiresDisplay
+      PreviewBridgeLatent:
+        - RequiresDisplay
+      ImageReceiver:
+        - RequiresDisplay
+      ImageSender:
+        - RequiresDisplay
+      MaskRectAreaAdvanced:
+        - RequiresDisplay
+      MaskRectArea:
+        - RequiresDisplay
+      ImpactSEGSPicker:
+        - RequiresDisplay
+      LatentReceiver:
+        - RequiresDisplay
+      ImpactValueReceiver:
+        - RequiresDisplay
+      ImpactQueueTrigger:
+        - Incompatible
+      ImpactQueueTriggerCountdown:
+        - Incompatible
+      ImpactSetWidgetValue:
+        - RequiresDisplay
+      ImpactHFTransformersClassifierProvider:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: comfyui_ipadapter_plus
+    version: "2.0.0"
+    node_labels:
+      IPAdapterSaveEmbeds:
+        - WritesToDisk
+
+  - name: ComfyUI-WanAnimatePreprocess
+    version: "1.0.1"
+
+  - name: "https://github.com/lum3on/ComfyUI_AudioTools@c816d0a1629c05a0f463ddb77ea96ada69875d32"
+    version: ""
+    node_labels:
+      AudioLoadBatch:
+        - ReadsArbitraryFile
+      AudioGetFromList:
+        - Incompatible
+      AudioStemSeparate:
+        - RuntimeModelDownload
+        - NetworkAccess
+        - Stateful
+      AudioSpeechDenoise:
+        - RuntimeModelDownload
+        - NetworkAccess
+        - Stateful
+      AudioSpeechToTextWhisper:
+        - RuntimeModelDownload
+        - NetworkAccess
+        - Stateful
+      TextToSpeech:
+        - Incompatible
+
+  - name: comfyui-fl-path-animator
+    version: "1.0.6"
+
+  - name: "https://github.com/kijai/ComfyUI-DepthAnythingV2@d505cbca99803fc63327b8305618a23e59a18b42"
+    version: ""
+    node_labels:
+      DownloadAndLoadDepthAnythingV2Model:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: "https://github.com/kijai/ComfyUI-Lotus@dcd5bea7a418717a6e0c27a5f607058cb9c24a5e"
+    version: ""
+
+  - name: "https://github.com/AIWarper/ComfyUI-NormalCrafterWrapper@10408381e60f42775a977966e111f1353d86e970"
+    version: ""
+    node_labels:
+      NormalCrafterNode:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: comfyui-advanced-controlnet
+    version: "1.5.6"
+    node_labels:
+      LoadImagesFromDirectory:
+        - ReadsArbitraryFile
+
+  - name: comfyui-frame-interpolation
+    version: "1.0.8"
+    node_labels:
+      GMFSS Fortuna VFI:
+        - NetworkAccess
+        - RuntimeModelDownload
+      M2M VFI:
+        - NetworkAccess
+        - RuntimeModelDownload
+      Sepconv VFI:
+        - NetworkAccess
+        - RuntimeModelDownload
+      AMT VFI:
+        - NetworkAccess
+        - RuntimeModelDownload
+      STMFNet VFI:
+        - NetworkAccess
+        - RuntimeModelDownload
+      RIFE VFI:
+        - RuntimeModelDownload
+        - NetworkAccess
+      FILM VFI:
+        - RuntimeModelDownload
+        - NetworkAccess
+      CAIN VFI:
+        - RuntimeModelDownload
+        - NetworkAccess
+      FLAVR VFI:
+        - RuntimeModelDownload
+        - NetworkAccess
+      IFRNet VFI:
+        - RuntimeModelDownload
+        - NetworkAccess
+      IFUnet VFI:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: comfyui-impact-subpack
+    version: "1.3.5"
+
+  - name: ComfyUI-SCAIL-Pose
+    version: "1.0.1"
+    node_labels:
+      SaveNLFPosesAs3D:
+        - PathParsing
+
+  # v1.1.4
+  - name: "https://github.com/gseth/ControlAltAI-Nodes@721492b66c9cede8ae23ae10615462ad80cfd061"
+    version: ""
+    node_labels:
+      FluxAttentionControl:
+        - Stateful
+        - RequiresGPU
+      FluxAttentionCleanup:
+        - Stateful
+
+  - name: "https://github.com/ClownsharkBatwing/RES4LYF@0dc91c0817e8b40b429b2f5dd26fc7b1c3cd0c53"
+    version: ""
+    node_labels:
+      ConditioningToBase64:
+        - Incompatible
+      Base64ToConditioning:
+        - Incompatible
+        - ExecutesArbitraryCode
+      ClownsharKSamplerOptions:
+        - ExecutesArbitraryCode
+      SamplerOptions_TimestepScaling:
+        - ExecutesArbitraryCode
+      "Sigmas Math1":
+        - ExecutesArbitraryCode
+      "Sigmas Math3":
+        - ExecutesArbitraryCode
+      TextLoadFile:
+        - ReadsArbitraryFile
+      UNetSave:
+        - WritesToDisk
+        - CreatesLargeOutputs
+      "Latent to Cuda":
+        - RequiresGPU
+
+  - name: comfyui_layerstyle
+    version: "2.0.32"
+    web_directory: js
+    node_labels:
+      "LayerUtility: ImageTaggerSave":
+        - WritesToDisk
+      "LayerUtility: ImageTaggerSaveV2":
+        - WritesToDisk
+      "LayerUtility: LoadImagesFromPath":
+        - ReadsArbitraryFile
+      "LayerUtility: PurgeVRAM":
+        - Stateful
+      "LayerUtility: PurgeVRAM V2":
+        - Stateful
+      "LayerUtility: QueueStop":
+        - Incompatible
+      "LayerMask: RemBgUltra":
+        - NetworkAccess
+      "LayerMask: RmBgUltra V2":
+        - NetworkAccess
+      "LayerUtility: LoadVQAModel":
+        - RuntimeModelDownload
+      "LayerMask: MaskEdgeUltraDetail V2":
+        - RuntimeModelDownload
+      "LayerMask: MaskEdgeUltraDetail V3":
+        - RuntimeModelDownload
+
+  - name: ComfyUI_LayerStyle_Advance
+    version: "2.0.37"
+    web_directory: js
+    node_labels:
+      "LayerUtility: SaveImagePlus":
+        - WritesToDisk
+      "LayerUtility: SaveImagePlusV2":
+        - WritesToDisk
+      "LayerUtility: LoadPSD":
+        - ReadsArbitraryFile
+      "LayerUtility: Gemini":
+        - RequiresExternalAPI
+      "LayerUtility: GeminiV2":
+        - RequiresExternalAPI
+      "LayerMask: ObjectDetectorGemini":
+        - RequiresExternalAPI
+      "LayerMask: ObjectDetectorGeminiV2":
+        - RequiresExternalAPI
+      "LayerUtility: GeminiImageEdit":
+        - RequiresExternalAPI
+      "LayerUtility: DeepSeekAPI":
+        - RequiresExternalAPI
+      "LayerUtility: DeepSeekAPIV2":
+        - RequiresExternalAPI
+      "LayerUtility: ZhipuGLM4V":
+        - RequiresExternalAPI
+      "LayerUtility: ZhipuGLM4":
+        - RequiresExternalAPI
+      "LayerUtility: JimengI2IAPI":
+        - RequiresExternalAPI
+      "LayerUtility: PromptEmbellish":
+        - RequiresExternalAPI
+      "LayerUtility: PromptTagger":
+        - RequiresExternalAPI
+      "LayerUtility: LoadJoyCaption2Model":
+        - RuntimeModelDownload
+      "LayerUtility: JoyCaption2":
+        - RuntimeModelDownload
+      "LayerUtility: JoyCaption2ExtraOptions":
+        - RuntimeModelDownload
+      "LayerUtility: JoyCaption2Split":
+        - RuntimeModelDownload
+      "LayerUtility: LoadJoyCaptionBeta1Model":
+        - RuntimeModelDownload
+      "LayerUtility: JoyCaptionBeta1":
+        - RuntimeModelDownload
+      "LayerUtility: JoyCaptionBeta1ExtraOptions":
+        - RuntimeModelDownload
+      "LayerUtility: LlamaVision":
+        - RuntimeModelDownload
+      "LayerUtility: PhiPrompt":
+        - RuntimeModelDownload
+      "LayerUtility: AddBlindWaterMark":
+        - Incompatible
+      "LayerUtility: ShowBlindWaterMark":
+        - Incompatible
+      "LayerUtility: ImageRewardFilter":
+        - RuntimeModelDownload
+      "LayerFilter: LightLeak":
+        - Incompatible
+      # TODO: Re-enable after merge to main triggers upload-models workflow
+      # which creates asset DB records. Models already in GCS, preset mappings
+      # and model_directories.go are correct. Just needs DB asset sync.
+      "LayerMask: Florence2Ultra":
+        - RuntimeModelDownload
+      "LayerMask: LoadFlorence2Model":
+        - RuntimeModelDownload
+      "LayerUtility: Florence2Image2Prompt":
+        - RuntimeModelDownload
+      "LayerMask: HumanPartsUltra":
+        - NetworkAccess
+        - RuntimeModelDownload
+
+  # v1.0.0
+  - name: "https://github.com/filliptm/ComfyUI_Fill-ChatterBox@2f72aca98e4ceda18caceaef91ddf5683f5f093e"
+    version: ""
+    web_directory: web
+    node_labels:
+      FL_ChatterboxTTS:
+        - RuntimeModelDownload
+        - Stateful
+      FL_ChatterboxTurboTTS:
+        - RuntimeModelDownload
+        - Stateful
+      FL_ChatterboxMultilingualTTS:
+        - RuntimeModelDownload
+        - Stateful
+      FL_ChatterboxVC:
+        - RuntimeModelDownload
+        - Stateful
+      FL_ChatterboxDialogTTS:
+        - RuntimeModelDownload
+        - Stateful
+
+  - name: comfyui-qwenmultiangle
+    version: "0.5.0"
+    web_directory: js
+
+  # latest (2025-01-18)
+  - name: "https://github.com/lquesada/ComfyUI-Prompt-Combinator@3576ace3f2776918c1046b6674fbe345a46dba2f"
+    version: ""
+    node_labels:
+      PromptCombinatorExportGallery:
+        - WritesToDisk
+
+  # latest (2025-01-08)
+  - name: "https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast@4820b3f02347bddcbbb9a5a85ab7638fe976366e"
+    version: ""
+    node_labels:
+      FlashVSRInitPipe:
+        - RuntimeModelDownload
+      FlashVSRNode:
+        - CreatesLargeOutputs
+      FlashVSRNodeAdv:
+        - CreatesLargeOutputs
+
+  # v2.5.24
+  - name: "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler@4490bd1f482e026674543386bb2a4d176da245b9"
+    version: ""
+    node_labels:
+      SeedVR2LoadDiTModel:
+        - RuntimeModelDownload
+      SeedVR2LoadVAEModel:
+        - RuntimeModelDownload
+      SeedVR2VideoUpscaler:
+        - CreatesLargeOutputs
+
+  - name: "https://github.com/flybirdxx/ComfyUI-Qwen-TTS@5e97d3cce967c842aeee02854725c371c8a101d7"
+    version: ""
+    node_labels:
+      FB_Qwen3TTSSaveVoice:
+        - WritesToDisk
+      FB_Qwen3TTSLoadSpeaker:
+        - ReadsArbitraryFile
+      FB_Qwen3TTSVoiceDesign:
+        - RuntimeModelDownload
+      FB_Qwen3TTSVoiceClone:
+        - RuntimeModelDownload
+      FB_Qwen3TTSCustomVoice:
+        - RuntimeModelDownload
+      FB_Qwen3TTSVoiceClonePrompt:
+        - RuntimeModelDownload
+      FB_Qwen3TTSDialogueInference:
+        - RuntimeModelDownload
+      FB_Qwen3TTSTrain:
+        - RuntimeModelDownload
+        - ReadsArbitraryFile
+        - WritesToDisk
+        - CreatesLargeOutputs
+
+  - name: comfyui-sam3
+    version: "0.1.2"
+    node_labels:
+      LoadSAM3Model:
+        - RuntimeModelDownload
+      SAM3InteractiveCollector:
+        - HasCustomEndpoints
+        - RequiresDisplay
+        - Stateful
+      SAM3PointCollector:
+        - RequiresDisplay
+      SAM3BBoxCollector:
+        - RequiresDisplay
+      SAM3MultiRegionCollector:
+        - RequiresDisplay
+
+  - name: "https://github.com/jtydhr88/ComfyUI-UltraShape1@2f8ea9b59bda7528ea2884b0868e205ece342e9e"
+    version: ""
+    node_labels:
+      UltraShapeSaveGLB:
+        - WritesToDisk
+      UltraShapeSaveMesh:
+        - WritesToDisk
+      UltraShapeMeshSelector:
+        - RequiresDisplay
+
+  - name: comfyui-rmbg
+    version: "3.0.0"
+    web_directory: web
+    node_labels:
+      AILab_LoadImage:
+        - ReadsArbitraryFile
+        - NetworkAccess
+      AILab_LoadImageSimple:
+        - ReadsArbitraryFile
+        - NetworkAccess
+      AILab_LoadImageAdvanced:
+        - ReadsArbitraryFile
+        - NetworkAccess
+      AILab_LoadImageBatch:
+        - ReadsArbitraryFile
+        - NetworkAccess
+      AILab_YoloV8:
+        - Incompatible
+      AILab_YoloV8Adv:
+        - Incompatible
+      Segment:
+        - Incompatible
+        - RuntimeModelDownload
+      SegmentV2:
+        - Incompatible
+        - RuntimeModelDownload
+      RMBG:
+        - RuntimeModelDownload
+      BiRefNetRMBG:
+        - RuntimeModelDownload
+      AILab_Florence2:
+        - RuntimeModelDownload
+      SAM2Segment:
+        - RuntimeModelDownload
+      SAM3Segment:
+        - RuntimeModelDownload
+      AILab_SDMatte:
+        - RuntimeModelDownload
+      AILab_LamaRemover:
+        - RuntimeModelDownload
+      BodySegment:
+        - RuntimeModelDownload
+      ClothesSegment:
+        - RuntimeModelDownload
+      FaceSegment:
+        - RuntimeModelDownload
+      FashionSegmentAccessories:
+        - RuntimeModelDownload
+      FashionSegmentClothing:
+        - RuntimeModelDownload
+
+  - name: ComfyUI-QwenVL
+    version: "2.1.1"
+    node_labels:
+      AILab_QwenVL:
+        - RuntimeModelDownload
+      AILab_QwenVL_Advanced:
+        - RuntimeModelDownload
+      AILab_QwenVL_GGUF:
+        - Incompatible
+        - RuntimeModelDownload
+      AILab_QwenVL_GGUF_Advanced:
+        - Incompatible
+        - RuntimeModelDownload
+      AILab_QwenVL_PromptEnhancer:
+        - RuntimeModelDownload
+      AILab_QwenVL_GGUF_PromptEnhancer:
+        - Incompatible
+        - RuntimeModelDownload
+
+  - name: "https://github.com/ltdrdata/was-node-suite-comfyui@afeee09ba44e713ec52a413ac6b105fd06b2d356"
+    version: ""
+    node_labels:
+      "BLIP Analyze Image":
+        - Incompatible
+      "BLIP Model Loader":
+        - Incompatible
+      "CLIPSeg Batch Masking":
+        - Incompatible
+      "CLIPSeg Masking":
+        - Incompatible
+      "CLIPSeg Model Loader":
+        - Incompatible
+      CLIPSEG2:
+        - Incompatible
+      "Cache Node":
+        - Incompatible
+      "Create Morph Image from Path":
+        - ReadsArbitraryFile
+      "Create Video from Path":
+        - ReadsArbitraryFile
+      "Diffusers Hub Model Down-Loader":
+        - NetworkAccess
+        - RuntimeModelDownload
+      "Export API":
+        - Incompatible
+      "Image History Loader":
+        - ReadsArbitraryFile
+      "Image Load":
+        - ReadsArbitraryFile
+      "Image Save":
+        - WritesToDisk
+      "Image Send HTTP":
+        - NetworkAccess
+      "Load Cache":
+        - Incompatible
+      "Load Image Batch":
+        - ReadsArbitraryFile
+      "Load Text File":
+        - ReadsArbitraryFile
+      "MiDaS Depth Approximation":
+        - Incompatible
+      "MiDaS Mask Image":
+        - Incompatible
+      "MiDaS Model Loader":
+        - Incompatible
+      "SAM Model Loader":
+        - Incompatible
+      "Save Text File":
+        - WritesToDisk
+      "Text File History Loader":
+        - ReadsArbitraryFile
+      "Text Load Line From File":
+        - ReadsArbitraryFile
+      "Text Random Prompt":
+        - Incompatible
+        - NetworkAccess
+      "True Random.org Number Generator":
+        - NetworkAccess
+      "Video Dump Frames":
+        - WritesToDisk
+      "Write to GIF":
+        - WritesToDisk
+      "Write to Video":
+        - WritesToDisk
+
+  - name: comfyui-sharp
+    version: "0.0.3"
+    node_labels:
+      LoadSharpModel:
+        - RuntimeModelDownload
+
+  - name: comfyui-logic
+    version: "1.0.0"
+    node_labels:
+      "DebugPrint-\U0001F52C":
+        - Incompatible
+
+  - name: comfyui-PlyPreview
+    version: "1.1.0"
+    web_directory: web
+    node_labels:
+      PlyPreviewLoadGaussianPLYEnhance:
+        - ReadsArbitraryFile
+      PlyPreviewLoadGaussianPLYPathEnhance:
+        - ReadsArbitraryFile
+
+  - name: https://github.com/kijai/ComfyUI-LivePortraitKJ@4d9dc6205b79e50f81c0e6d245a2e0e5e53d5ecd
+    node_labels:
+      DownloadAndLoadLivePortraitModels:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: "https://github.com/fxtdstudios/radiance@v2.0.0"
+    version: ""
+    web_directory: js
+    node_labels:
+      FXTD_RadianceViewer:
+        - RequiresDisplay
+      LoadImageEXR:
+        - ReadsArbitraryFile
+      LoadImageEXRSequence:
+        - ReadsArbitraryFile
+      OCIOListColorspaces:
+        - Incompatible
+      RadianceLUTApply:
+        - ReadsArbitraryFile
+      RadianceLUTBake:
+        - WritesToDisk
+      RadianceReadVideo:
+        - ReadsArbitraryFile
+      RadianceReadSequence:
+        - ReadsArbitraryFile
+      RadianceWrite:
+        - CreatesLargeOutputs
+      RadianceQCExport:
+        - WritesToDisk
+      RadianceDepthMapGenerator:
+        - RuntimeModelDownload
+        - NetworkAccess
+        - Stateful
+      RadianceAIUpscale:
+        - RuntimeModelDownload
+        - NetworkAccess
+        - Stateful
+      RadianceNukeBridge:
+        - Incompatible
+        - NetworkAccess
+      ACESConfigManager:
+        - NetworkAccess
+        - WritesToDisk
+
+  - name: "https://github.com/shiimizu/ComfyUI-TiledDiffusion@a155b1bac39147381aeaa52b9be42e545626a44f"
+    version: ""
+
+  - name: "https://github.com/spacepxl/ComfyUI-Image-Filters@bbb3fb0045461adf3602faeedaf40af57090d4e2"
+    version: ""
+    node_labels:
+      ModelTest:
+        - Incompatible
+        - ExecutesArbitraryCode
+
+  - name: "https://github.com/Comfy-Org/ComfyUI-test-framework@80caae462d3293a2d40c2938de33a5f50eea8333"
+    version: ""
+
+  - name: ComfyUI-DepthAnythingV3
+    version: "0.1.2"
+    node_labels:
+      DA3_SavePointCloud:
+        - WritesToDisk
+      DA3_FilterGaussians:
+        - WritesToDisk
+      DA3_ToMesh:
+        - WritesToDisk
+      DA3_PreviewPointCloud:
+        - WritesToDisk
+      DepthAnythingV3_Streaming:
+        - WritesToDisk
+      DA3_DownloadModel:
+        - NetworkAccess
+      LoadSALADModel:
+        # Only consumed by DepthAnythingV3_Streaming (disabled on cloud)
+        - Incompatible
+
+  # v1.0.0
+  - name: "https://github.com/PowerHouseMan/ComfyUI-AdvancedLivePortrait@3bba732915e22f18af0d221b9c5c282990181f1b"
+    version: ""
+    node_labels:
+      SaveExpData:
+        - WritesToDisk
+      LoadExpData:
+        - ReadsArbitraryFile
+      AdvancedLivePortrait:
+        - RuntimeModelDownload
+        - NetworkAccess
+      ExpressionEditor:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  # v0.9
+  - name: "https://github.com/BadCafeCode/masquerade-nodes-comfyui@432cb4d146a391b387a0cd25ace824328b5b61cf"
+    version: ""
+    node_labels:
+      "Mask By Text":
+        - NetworkAccess
+        - RuntimeModelDownload
+        - RuntimePipInstall
+        - Stateful
+      "Create QR Code":
+        - Incompatible
+        - RuntimePipInstall
+
+  # ComfyQR by coreyryanhanson - QR code generation for generative QR art
+  - name: "https://github.com/coreyryanhanson/ComfyQR@e31449c99a6ba8c5c567646659e0a75e4056259f"
+    version: ""
+
+  # comfyui-various by jamesWalker55 - image ops, primitives, RAFT optical flow, color ops
+  - name: "https://github.com/jamesWalker55/comfyui-various@5bd85aaf7616878471469c4ec7e11bbd0cef3bf2"
+    version: ""
+    node_labels:
+      JWImageLoadRGB:
+        - ReadsArbitraryFile
+      JWImageLoadRGBA:
+        - ReadsArbitraryFile
+      JWLoadImagesFromString:
+        - ReadsArbitraryFile
+      JWImageSaveToPath:
+        - WritesToDisk
+      JWImageLoadRGBFromClipboard:
+        - RequiresClipboard
+      "JWImageLoadRGBA From Clipboard":
+        - RequiresClipboard
+      RAFTLoadFlowFromEXRChannels:
+        - ReadsArbitraryFile
+      JWLoadImageSequence:
+        - ReadsArbitraryFile
+      JWLoadImageSequenceWithStopIndex:
+        - ReadsArbitraryFile
+      JWSaveImageSequence:
+        - WritesToDisk
+      JWImageLoadRGBIfExists:
+        - ReadsArbitraryFile
+      JWLoadAudio:
+        - ReadsArbitraryFile
+      JWAudioSaveToPath:
+        - WritesToDisk
+
+  - name: comfyui-cogvideoxwrapper
+    version: "1.5.1"
+    node_labels:
+      DownloadAndLoadCogVideoModel:
+        - RuntimeModelDownload
+        - NetworkAccess
+      DownloadAndLoadCogVideoGGUFModel:
+        - RuntimeModelDownload
+        - NetworkAccess
+      DownloadAndLoadCogVideoControlNet:
+        - RuntimeModelDownload
+        - NetworkAccess
+      DownloadAndLoadToraModel:
+        - RuntimeModelDownload
+        - NetworkAccess
+
+  - name: "https://github.com/glowcone/comfyui-string-converter@0e1e78f877e4d5fc2b46ace8fa21a0ef70e92f11"
+    version: ""
+
+  - name: comfyui_face_parsing
+    version: "1.0.5"
+    node_labels:
+      "FaceParsingModelLoader(FaceParsing)":
+        - RuntimeModelDownload
+      "FaceParsingProcessorLoader(FaceParsing)":
+        - RuntimeModelDownload
+
+  - name: nodesweet
+    version: "1.0.1"
+
+  # v1.2.2 - SeC (Segment Concept) SOTA video object segmentation
+  - name: "https://github.com/9nate-drake/Comfyui-SecNodes@af39e6260bc414873fbb2dc8df355904d1609754"
+    version: ""
+
+  - name: "https://github.com/kijai/ComfyUI-MimicMotionWrapper@89d0ed551dbb1e0a14e89a01d42a39e9ed755d9c"
+    version: ""
+    node_labels:
+      DownloadAndLoadMimicMotionModel:
+        - RuntimeModelDownload
+      MimicMotionGetPoses:
+        - RuntimeModelDownload
+
+  - name: basic_data_handling
+    version: "1.4.0"
+    node_labels:
+      "Basic data handling: PathLoadStringFile":
+        - ReadsArbitraryFile
+      "Basic data handling: PathLoadImageRGB":
+        - ReadsArbitraryFile
+      "Basic data handling: PathLoadImageRGBA":
+        - ReadsArbitraryFile
+      "Basic data handling: PathLoadMaskFromAlpha":
+        - ReadsArbitraryFile
+      "Basic data handling: PathLoadMaskFromGreyscale":
+        - ReadsArbitraryFile
+      "Basic data handling: PathSaveStringFile":
+        - WritesToDisk
+      "Basic data handling: PathSaveImageRGB":
+        - WritesToDisk
+      "Basic data handling: PathSaveImageRGBA":
+        - WritesToDisk
+      "Basic data handling: PathGlob":
+        - ReadsArbitraryFile
+      "Basic data handling: PathListDir":
+        - ReadsArbitraryFile
+      "Basic data handling: PathGetSize":
+        - ReadsArbitraryFile
+      "Basic data handling: PathExists":
+        - ReadsArbitraryFile
+      "Basic data handling: PathIsFile":
+        - ReadsArbitraryFile
+      "Basic data handling: PathIsDir":
+        - ReadsArbitraryFile
+      "Basic data handling: PathExpandVars":
+        - PathParsing
+      "Basic data handling: PathGetCwd":
+        - PathParsing
+      "Basic data handling: PathAbspath":
+        - PathParsing
+      "Basic data handling: PathBasename":
+        - PathParsing
+      "Basic data handling: PathCommonPrefix":
+        - PathParsing
+      "Basic data handling: PathDirname":
+        - PathParsing
+      "Basic data handling: PathGetExtension":
+        - PathParsing
+      "Basic data handling: PathInputDir":
+        - PathParsing
+      "Basic data handling: PathIsAbsolute":
+        - PathParsing
+      "Basic data handling: PathJoin":
+        - PathParsing
+      "Basic data handling: PathNormalize":
+        - PathParsing
+      "Basic data handling: PathOutputDir":
+        - PathParsing
+      "Basic data handling: PathRelative":
+        - PathParsing
+      "Basic data handling: PathSetExtension":
+        - PathParsing
+      "Basic data handling: PathSplit":
+        - PathParsing
+      "Basic data handling: PathSplitExt":
+        - PathParsing
+
+  - name: ComfyUI-MelBandRoFormer
+    version: "1.0.2"
+
+  - name: "https://github.com/Extraltodeus/Skimmed_CFG@b2cf6e99303f9f310054b888fa23c37da9a4d224"
+    version: ""
+
+  - name: sd-dynamic-thresholding
+    version: "1.0.1"
+
+  - name: "https://github.com/filliptm/ComfyUI_Fill-Nodes@12c5bcded72a7f2c31c3df37516987c5d3691e28"
+    version: ""
+    web_directory: web
+    node_labels:
+      FL_CodeNode:
+        - ReadsArbitraryFile
+        - ExecutesArbitraryCode
+      FL_JS:
+        - Incompatible
+      FL_WF_Agent:
+        - Incompatible
+      FL_SystemCheck:
+        - HasCustomEndpoints
+      FL_Shadertoy:
+        - RequiresDisplay
+      FL_InfiniteZoom:
+        - Incompatible
+      FL_PaperDrawn:
+        - Incompatible
+      FL_ProResVideo:
+        - WritesToDisk
+        - ReadsArbitraryFile
+      FL_VideoCut:
+        - WritesToDisk
+      FL_LoadImage:
+        - HasCustomEndpoints
+        - ReadsArbitraryFile
+      FL_ImagePicker:
+        - HasCustomEndpoints
+        - Stateful
+      FL_TimeLine:
+        - HasCustomEndpoints
+      FL_DirectoryCrawl:
+        - ReadsArbitraryFile
+      FL_ModelInspector:
+        - ReadsArbitraryFile
+      FL_ImageRandomizer:
+        - ReadsArbitraryFile
+      FL_NFTGenerator:
+        - ReadsArbitraryFile
+      FL_CaptionToCSV:
+        - ReadsArbitraryFile
+      FL_LoadCSV:
+        - ReadsArbitraryFile
+      FL_WordFrequencyGraph:
+        - ReadsArbitraryFile
+      FL_ImageCaptionLayout:
+        - ReadsArbitraryFile
+      FL_PDFLoader:
+        - ReadsArbitraryFile
+      FL_BulkPDFLoader:
+        - ReadsArbitraryFile
+      FL_ZipDirectory:
+        - ReadsArbitraryFile
+      FL_SaveImages:
+        - WritesToDisk
+        - ReadsArbitraryFile
+      FL_SaveWebM:
+        - WritesToDisk
+        - ReadsArbitraryFile
+      FL_CaptionSaver_V2:
+        - WritesToDisk
+        - ReadsArbitraryFile
+      FL_MirrorAndAppendCaptions:
+        - WritesToDisk
+        - ReadsArbitraryFile
+      FL_ImageCaptionLayoutPDF:
+        - WritesToDisk
+        - ReadsArbitraryFile
+      FL_ZipSave:
+        - WritesToDisk
+        - ReadsArbitraryFile
+      FL_ImageCaptionSaver:
+        - WritesToDisk
+      FL_VideoCaptionSaver:
+        - WritesToDisk
+        - CreatesLargeOutputs
+      FL_SaveCSV:
+        - WritesToDisk
+      FL_PDFSaver:
+        - WritesToDisk
+      FL_API_ImageSaver:
+        - WritesToDisk
+      FL_SaveAndDisplayImage:
+        - WritesToDisk
+      "FL_SaveWebPImage(SaveImage)":
+        - WritesToDisk
+      FL_SaveRGBAAnimatedWebP:
+        - WritesToDisk
+      FL_FILM:
+        - NetworkAccess
+        - WritesToDisk
+        - Stateful
+      FL_RIFE:
+        - NetworkAccess
+        - WritesToDisk
+        - Stateful
+      FL_ClipScanner:
+        - Stateful
+      # External API nodes - disabled on cloud (require user API keys, cloud has partner nodes)
+      FL_OllamaCaptioner:
+        - NetworkAccess
+      FL_HFHubModelUploader:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_HF_Character:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_HF_UploaderAbsolute:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_HFDatasetDownloader:
+        - NetworkAccess
+      FL_Hedra_API:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GoogleDriveDownloader:
+        - NetworkAccess
+      FL_GoogleDriveImageDownloader:
+        - NetworkAccess
+      FL_GoogleCloudStorage:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_SendToDiscordWebhook:
+        - NetworkAccess
+      FL_KartelJobInput:
+        - NetworkAccess
+      FL_KartelJobOutput:
+        - NetworkAccess
+      FL_Fal_Gemini_ImageEdit:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_Kling_AIAvatar:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_Kontext:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_Pixverse:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_Pixverse_LipSync:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_Pixverse_Transition:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_SeedVR_Upscale:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_Seedance_i2v:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_Seedream_Edit:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Fal_Sora:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GeminiImageEditor:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GeminiImageGenADV:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GeminiTextAPI:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GeminiVideoCaptioner:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_PixVerseAPI:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_RunwayAct2:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_RunwayImageAPI:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_VertexGemini25FlashImage:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Veo3VideoGen:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_Dalle3:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GPT_Image1:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GPT_Image1_ADV:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GPT_Text:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_GPT_Vision:
+        - NetworkAccess
+        - RequiresExternalAPI
+      FL_SimpleGPTVision:
+        - NetworkAccess
+        - RequiresExternalAPI
+
+  - name: comfyui_steudio
+    version: "2.0.5"
+    node_labels:
+      "Display UI":
+        # Duplicate of core PreviewAny ("Preview as Text") node; does not work on cloud
+        - DuplicateOfCoreNode
+      "Load Images into List":
+        - ReadsArbitraryFile
+
+  - name: "https://github.com/logtd/ComfyUI-Fluxtapoz@17c71bea20e932945e9c1be0586cfd4b7e51cbf6"
+    version: ""
+
+  # v1.0.5
+  - name: "https://github.com/lrzjason/ComfyUI-EditUtils@256a2340b161da3f814e5982ca4aa999f474df93"
+    version: ""
+
+  - name: feedback-sampler
+    version: "2.0.0"
+
+  - name: vewd
+    version: "1.7.2"
+    node_labels:
+      Vewd:
+        - HasCustomEndpoints
+        - Stateful
+        - WritesToDisk
+        - RequiresDisplay
+
+  - name: comfyui-workflow-prettier
+    version: "1.0.5"
+    web_directory: web
+
+  - name: "https://github.com/Lightricks/ComfyUI-LTXVideo@531512f7286963dc7aff1fd8bf5556e95eae03af"
+    version: ""
+    node_labels:
+      GemmaAPITextEncode:
+        - RequiresExternalAPI
+        - NetworkAccess
+      LTXVSaveConditioning:
+        - WritesToDisk
+
+  - name: "https://github.com/yuvraj108c/ComfyUI-Upscaler-Tensorrt@dfc266538368e4c9a03a296917716a214517ccb5"
+    version: ""
+    web_directory: js
+    node_labels:
+      UpscalerTensorrt:
+        - RequiresGPU
+      LoadUpscalerTensorrtModel:
+        - RuntimeModelDownload
+        - RequiresGPU
+
+  - name: comfyui-layerdiffuse
+    version: "1.0.4"
+    node_labels:
+      # SD1.5 attn_sharing nodes are broken in this custom node: AttentionSharingUnit.forward() does not accept
+      # transformer_options kwarg added in newer ComfyUI attention API
+      LayeredDiffusionApply:
+        - RuntimeModelDownload
+      LayeredDiffusionJointApply:
+        - Incompatible
+        - RuntimeModelDownload
+      LayeredDiffusionCondApply:
+        - RuntimeModelDownload
+      LayeredDiffusionCondJointApply:
+        - Incompatible
+        - RuntimeModelDownload
+      LayeredDiffusionDiffApply:
+        - RuntimeModelDownload
+      LayeredDiffusionDecode:
+        - RuntimeModelDownload
+      LayeredDiffusionDecodeRGBA:
+        - RuntimeModelDownload
+      LayeredDiffusionDecodeSplit:
+        - RuntimeModelDownload
+
+  - name: comfyui-itools
+    version: "0.6.8"
+    web_directory: web
+    node_labels:
+      iToolsPromptLoader:
+        - ReadsArbitraryFile
+      iToolsPromptSaver:
+        - WritesToDisk
+      iToolsLoadImages:
+        - ReadsArbitraryFile
+      iToolsLoadRandomImage:
+        - ReadsArbitraryFile
+      iToolsPaintNode:
+        - HasCustomEndpoints
+      iToolsCropImage:
+        - HasCustomEndpoints
+      # iToolsTestNode, iToolsDomNode, iToolsFreeChat, iToolsFreeSchnell are
+      # conditional nodes (disabled by default in __init__.py settings) and
+      # never register in object_info — no labels needed
+
+  - name: https://github.com/Liquid-XO/ComfyUI_SchemaNodes@ddf686844093e9e5032afa02b60e50ed494a7e72
+    version: ""  # 0.1.1+4 (post-registry, includes save fixes + text output feature)
+    web_directory: js
+
+  - name: comfyui-ic-light-native
+    version: "1.0.1"
+
+  - name: comfyui_nvidia_rtx_nodes
+    version: "0.1.2"
+
+  - name: "https://github.com/kijai/ComfyUI-GIMM-VFI@4c9a3123762af85e7c796e41737da0b70c75d72d"
+    version: ""
+
+  - name: wanvaceadvanced
+    version: "1.4.0"
+    node_labels:
+      WanVacePhantomDual:
+        - Incompatible
+      WanVacePhantomExperimental:
+        - Incompatible
+
+  - name: comfyui-bfsnodes
+    version: "1.0.0"
