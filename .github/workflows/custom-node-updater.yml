@@ -1,0 +1,53 @@
+name: Custom Node Updater
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly on Mondays at 6 AM UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (check for updates without creating PR)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  update-custom-nodes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude Code Agent
+        id: claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Read and follow the instructions in `.claude/agents/custom-node-updater.md`.
+
+            Runtime context:
+            - Dry run mode: ${{ github.event.inputs.dry_run || 'false' }}
+            - Config file is at `supported_nodes.yaml` (repo root).
+            - Auto-assign reviewers: deepme987, bigcat88
+          allowed_tools: |
+            Bash(curl:*),Bash(gh:*),Bash(git:*),Bash(jq:*),Bash(yq:*),Bash(rg:*),Bash(grep:*),Bash(python*),Bash(ast-grep:*),Read,Write,Edit,Glob,Grep
+
+      - name: Summary
+        if: always()
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          {
+            echo "## Custom Node Updater Complete"
+            echo ""
+            echo "Dry run: $DRY_RUN"
+          } >> "$GITHUB_STEP_SUMMARY"

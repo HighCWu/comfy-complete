@@ -1,18 +1,9 @@
 ## Description
 
-<!-- Briefly describe what this PR does and why. -->
-
-## Type of Change
-
-- [ ] New node pack
-- [ ] Version update (existing node pack)
-- [ ] Dependency change
-- [ ] Bug fix
-- [ ] Other (please describe)
+<!-- What changed and why. -->
 
 ## Checklist
 
 - [ ] Tests pass (`pytest tests/ -v`)
-- [ ] Labels are correctly set in `supported_nodes.yaml`
-- [ ] All dependencies in `requirements.txt` are pinned to exact versions (`==`)
-- [ ] Documentation updated (if applicable)
+- [ ] Dependency pins in `requirements.txt` use exact versions (`==`)
+- [ ] `version_lock.yaml` / `supported_nodes.yaml` updates are internally consistent
