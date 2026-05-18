@@ -261,18 +261,27 @@ class TestRealConfig:
         assert errors == [], f"Label validation errors:\n" + "\n".join(errors)
 
     def test_labels_count(self, real_config):
-        """Verify we have all 18 declared labels."""
-        assert len(real_config.get("labels", [])) == 18
+        """Verify the declared label count matches the current set.
+
+        Current state (post cloud->external migration): 10 labels, matching
+        the production cloud content as of 2026-05. The PRD-v2 expansion to
+        18 labels (adding Incompatible, RequiresGPU, BrokenNode, etc.) is
+        Milestone B work — when that migration ships, bump this assertion
+        and update test_expected_labels_present below.
+        """
+        assert len(real_config.get("labels", [])) == 10
 
     def test_expected_labels_present(self, real_config):
-        """Verify all expected labels are declared."""
+        """Verify all expected labels are declared.
+
+        Current set reflects production cloud content. PRD-v2 expanded set
+        is Milestone B work; see test_labels_count docstring.
+        """
         expected = {
-            "ReadsArbitraryFile", "WritesToDisk", "CreatesLargeOutputs",
-            "NetworkAccess", "RequiresExternalAPI", "Stateful",
-            "HasCustomEndpoints", "PathParsing", "DuplicateOfCoreNode",
-            "Incompatible", "RequiresWebcam", "RequiresDisplay",
-            "RequiresClipboard", "RequiresGPU", "BrokenNode",
-            "ExecutesArbitraryCode", "RuntimeModelDownload", "RuntimePipInstall",
+            "ReadsArbitraryFile", "CreatesLargeOutputs", "DisabledOnCloud",
+            "WritesToDisk", "NetworkAccess", "Stateful",
+            "HasCustomEndpoints", "RequiresExternalAPI", "PathParsing",
+            "DuplicateOfCoreNode",
         }
         declared = set(real_config.get("labels", []))
         assert declared == expected

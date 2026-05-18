@@ -1,7 +1,8 @@
 name: Notify Cloud Repo
 
-# When comfy-complete pushes to main, notify the cloud repo to update its submodule.
-# This triggers the cloud repo's comfy-complete-sync.yml workflow.
+# When comfy-complete pushes to main, notify the cloud repo to bump its pinned
+# ref in comfy_complete_version.yaml. This triggers cloud's
+# comfy-complete-sync.yml workflow which opens a draft PR with the new ref.
 
 on:
   push:

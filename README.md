@@ -1,220 +1,154 @@
 # Comfy Complete
 
-A batteries-included distribution of ComfyUI, open-sourced for the community.
+The reproducible runtime that [Comfy Cloud](https://comfy.org) deploys —
+ComfyUI core, a curated set of custom node packs, and exact pinned Python
+dependencies, in one repo and one Docker image.
 
-## What is Comfy Complete?
+This repo is public **for transparency**. It is the authoritative source for
+what Comfy Cloud is running at any given commit. Cloud pulls the cc-base
+image built from this repo (or builds it directly from this repo's contents).
 
-Comfy Complete provides:
+> **Phase 1 status.** This repo's contents are managed by the Comfy Cloud
+> team. We are not accepting external node submissions or dependency PRs at
+> this stage — please file issues or reach us via the Comfy Cloud Discord if
+> you have requests.
 
-- **Pinned Python Dependencies**: All dependencies are pinned to exact versions that are tested to work together
-- **Curated Custom Nodes**: A set of popular custom nodes pre-configured and tested for compatibility
-- **Version-Locked ComfyUI**: Specific commit of ComfyUI core that's known to work with all included dependencies
+## What's inside
 
-This makes it easy to:
-- Run ComfyUI locally without dependency conflicts
-- Ensure your custom node works with the broader ecosystem
-- Prepare your node pack for inclusion in managed ComfyUI deployments
+- **Pinned ComfyUI**: `version_lock.yaml` pins core + frontend + workflow templates.
+- **Pinned Python deps**: `requirements.txt` — every package at an exact `==` version.
+- **Curated custom node packs**: `supported_nodes.yaml` — each pack pinned to a specific version, with permission labels declared.
+- **Reproducible Dockerfile**: `docker/Dockerfile.cloudbuild` produces the
+  cc-base image that cloud's inference workers run.
 
 ## Quick Start
 
-### Using Docker Compose (Recommended)
+### Docker Compose (Recommended)
 
-Update the volumn in `compose.yaml` with your `/path/to/models`, and run:
+Edit the model volume path in `compose.yaml`, then:
 
 ```bash
-# Run ComfyUI
-docker compose up -d
-
-# Stop ComfyUI
-docker compose down
+docker compose up -d   # start
+docker compose down    # stop
 ```
 
-### Manual Installation
+### Build the cc-base image yourself
 
-1. Clone ComfyUI at the pinned version:
 ```bash
-git clone https://github.com/Comfy-Org/ComfyUI.git
-cd ComfyUI
-git checkout $(grep -A1 'comfyui:' /path/to/comfy-complete/version_lock.yaml | grep ref | cut -d'"' -f2)
+docker build -f docker/Dockerfile.cloudbuild -t comfy-complete-base:local .
 ```
 
-2. Install Python dependencies:
-```bash
-pip install -r /path/to/comfy-complete/requirements.txt
-```
+The build clones ComfyUI at the pinned ref, installs the pinned Python deps,
+and installs every custom node pack in `supported_nodes.yaml`. Layer order is
+tuned for cache reuse — re-running after only `supported_nodes.yaml` changes
+should reuse most layers.
 
-3. Install custom nodes:
+### Manual install (no Docker)
+
 ```bash
+# Clone ComfyUI at the pinned ref
+COMFY_REF=$(grep -A1 'comfyui:' version_lock.yaml | grep ref | cut -d'"' -f2)
+git clone https://github.com/comfyanonymous/ComfyUI.git
+(cd ComfyUI && git checkout "$COMFY_REF")
+
+# Install pinned deps
+pip install -r requirements.txt
+
+# Install custom nodes
 pip install comfy-cli pyyaml
-python /path/to/comfy-complete/scripts/install_custom_nodes.py --comfy-path .
+python scripts/install_custom_nodes.py --comfy-path ./ComfyUI
 ```
 
 ## Repository Structure
 
 ```
 comfy-complete/
-├── compose.yaml            # Compose file
-├── requirements.txt        # Pinned Python dependencies
-├── supported_nodes.yaml    # Supported custom node packs with versions
-├── version_lock.yaml       # ComfyUI core version pinning
+├── compose.yaml             # local docker-compose
+├── requirements.txt         # pinned Python dependencies
+├── supported_nodes.yaml     # curated custom node packs + labels
+├── version_lock.yaml        # ComfyUI core + frontend + templates pins
 ├── scripts/
-│   └── install_custom_nodes.py  # Custom node installation script
+│   └── install_custom_nodes.py
 ├── docker/
-│   ├── Dockerfile          # Container build file
-│   └── entrypoint.sh       # Container entrypoint
-└── tests/
-    └── test_requirements.py     # Dependency validation tests
+│   ├── Dockerfile           # local docker build
+│   ├── Dockerfile.cloudbuild  # cc-base production build
+│   └── entrypoint.sh
+└── tests/                   # pin validation + label assertions
 ```
 
-## For Custom Node Authors
-
-### Making Your Node Compatible
-
-1. **Target Comfy Complete Dependencies**: Check `requirements.txt` for available packages and their versions. If your node needs these packages, it should work with the listed versions.
-
-2. **Specify Additional Dependencies**: If your node requires packages not in Comfy Complete, list them in your `requirements.txt`. Include transitive dependencies with pinned versions.
-
-3. **Avoid Conflicting Versions**: Don't require versions that conflict with Comfy Complete's pinned versions.
-
-### Getting Your Node Added
-
-To add your custom node to Comfy Complete:
-
-1. Ensure your node works with the dependencies in `requirements.txt`
-2. Add any additional required dependencies to your node's `requirements.txt`
-3. Submit a PR adding your node to `supported_nodes.yaml`
-4. An automated reviewer will analyze your code for security and labeling
-
-**See [docs/adding-custom-nodes.md](docs/adding-custom-nodes.md) for the complete guide.**
-
-### Node Pack Configuration
-
-Nodes in `supported_nodes.yaml` may have:
-
-- `version`: Pinned version or git commit
-- `node_labels`: Permission labels for specific nodes
-- `web_directory`: Custom web assets directory
-
-Example:
-```yaml
-- name: my-custom-nodes
-  version: "1.0.0"
-  node_labels:
-    LoadFromPath:
-      - ReadsArbitraryFile
-    SaveToFile:
-      - WritesToDisk
-```
-
-### Available Labels
-
-Labels describe what a node **does** — each deployment decides which labels to disable via its own policy file.
-
-| Label                  | Description                                                  |
-|------------------------|--------------------------------------------------------------|
-| `ReadsArbitraryFile`   | Node reads from user-provided file paths                     |
-| `WritesToDisk`         | Node writes files to filesystem                              |
-| `CreatesLargeOutputs`  | Node produces large outputs (video, audio, models)           |
-| `NetworkAccess`        | Node makes network requests                                  |
-| `RequiresExternalAPI`  | Node requires external API keys                              |
-| `Stateful`             | Node persists user-specific data between runs                |
-| `HasCustomEndpoints`   | Node registers custom HTTP server routes                     |
-| `PathParsing`          | Node exposes filesystem path information                     |
-| `DuplicateOfCoreNode`  | Node duplicates functionality of a core ComfyUI node         |
-| `Incompatible`         | Node is incompatible with the distribution environment       |
-| `RequiresWebcam`       | Node requires webcam hardware access                         |
-| `RequiresDisplay`      | Node requires interactive display or browser UI              |
-| `RequiresClipboard`    | Node requires system clipboard access                        |
-| `RequiresGPU`          | Node hardcodes CUDA/GPU usage and will crash without one     |
-| `BrokenNode`           | Node is currently broken or non-functional                   |
-| `ExecutesArbitraryCode`| Node executes user-provided code (eval, exec, pickle, etc.) |
-| `RuntimeModelDownload` | Node downloads models from the internet at execution time    |
-| `RuntimePipInstall`    | Node installs Python packages via pip at execution time      |
-
-## Testing
-
-Run the test suite to validate the environment:
-
-```bash
-# Install test dependencies
-pip install pytest pyyaml
-
-# Run tests
-pytest tests/ -v
-```
-
-The tests verify:
-- `requirements.txt` is valid and resolvable
-- All packages are pinned to exact versions
-- YAML config files are valid
-- No known conflicting packages
-
-## Configuration Files
+## Configuration files
 
 ### version_lock.yaml
-
-Pins the exact version of ComfyUI core:
 
 ```yaml
 pinned:
   comfyui:
-    ref: "<ref>"
-  comfyui_frontend:
-    ref: "<ref>"
-  workflow_templates:
-    ref: "<ref>"
+    ref: "<sha-or-tag>"
+  comfyui_frontend_package:
+    ref: "<version>"
+  comfyui_workflow_templates:
+    ref: "<version>"
 ```
 
 ### supported_nodes.yaml
 
-Lists all supported custom node packs:
-
 ```yaml
 node_packs:
-  - name: comfyui-kjnodes
-    version: "1.1.6"
+  - name: <comfy-registry-id>
+    version: "<version>"
     node_labels:
-      LoadVideosFromFolder:
-        - ReadsArbitraryFile
+      <NodeClassName>:
+        - <Label1>
+        - <Label2>
 ```
 
-## Docker Environment Variables
+## Permission labels
 
-| Variable               | Default   | Description                                        |
-|------------------------|-----------|----------------------------------------------------|
-| `COMFY_LISTEN_HOST`    | `0.0.0.0` | Host to listen on                                  |
-| `COMFY_PORT`           | `8188`    | Port to listen on                                  |
-| `COMFY_PREVIEW_METHOD` | (none)    | Preview method (latent2rgb, taesd, etc.)           |
-| `COMFY_EXTRA_ARGS`     | (none)    | Additional ComfyUI arguments                       |
-| `COMFY_EXTRA_LIBS`     | (none)    | Additional ComfyUI dependencies (for testing ONLY) |
+Every node pack declares the permissions its nodes need. Comfy Cloud's
+deployment policy decides which labels to disable based on the runtime
+environment.
 
-## FAQ
+| Label | Meaning |
+|-------|---------|
+| `ReadsArbitraryFile` | Node reads from user-provided file paths |
+| `WritesToDisk` | Node writes files to filesystem |
+| `CreatesLargeOutputs` | Node produces large outputs (video, audio, models) |
+| `NetworkAccess` | Node makes network requests |
+| `RequiresExternalAPI` | Node requires external API keys |
+| `Stateful` | Node persists user-specific data between runs |
+| `HasCustomEndpoints` | Node registers custom HTTP server routes |
+| `PathParsing` | Node exposes filesystem path information |
+| `DuplicateOfCoreNode` | Node duplicates functionality of a core ComfyUI node |
+| `Incompatible` | Node is incompatible with the distribution environment |
+| `RequiresWebcam` | Node requires webcam hardware access |
+| `RequiresDisplay` | Node requires interactive display or browser UI |
+| `RequiresClipboard` | Node requires system clipboard access |
+| `RequiresGPU` | Node hardcodes CUDA/GPU usage and will crash without one |
+| `BrokenNode` | Node is currently broken or non-functional |
+| `ExecutesArbitraryCode` | Node executes user-provided code (eval, exec, pickle, etc.) |
+| `RuntimeModelDownload` | Node downloads models from the internet at execution time |
+| `RuntimePipInstall` | Node installs Python packages via pip at execution time |
 
-**Q: Does this solve all local dependency issues?**
+## Docker environment variables
 
-Partially. This sets a baseline of dependencies that work together. If you use only nodes from Comfy Complete, you shouldn't have conflicts.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMFY_LISTEN_HOST` | `0.0.0.0` | Host to listen on |
+| `COMFY_PORT` | `8188` | Port to listen on |
+| `COMFY_PREVIEW_METHOD` | (none) | Preview method (latent2rgb, taesd, etc.) |
+| `COMFY_EXTRA_ARGS` | (none) | Additional ComfyUI arguments |
+| `COMFY_EXTRA_LIBS` | (none) | Additional pip packages installed at startup (testing only) |
 
-**Q: Can I use any node pack with Comfy Complete?**
+## Tests
 
-Nodes not in `supported_nodes.yaml` may work but aren't guaranteed. They might require dependencies that conflict with the pinned versions.
+```bash
+pip install pytest pyyaml
+pytest tests/ -v
+```
 
-**Q: How do I update to a newer version of a node pack?**
-
-Submit a PR updating the version in `supported_nodes.yaml`. Ensure tests pass with the new version.
-
-**Q: My node pack was removed. Why?**
-
-Node packs may be removed if they become difficult to maintain or conflict with more commonly used packages.
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Test changes locally with the full test suite
-2. Ensure dependency changes don't break existing node packs
-3. Follow the existing code style
-4. Update documentation as needed
+Tests verify: `requirements.txt` resolves, every package is pinned to an
+exact version, YAML configs are valid, no known conflicting packages.
 
 ## License
 
-[License information here]
+Apache 2.0 — see [LICENSE](./LICENSE).

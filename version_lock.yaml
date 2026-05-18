@@ -1,13 +1,17 @@
 # Comfy Complete - Version Lock
-# This file pins the exact versions of ComfyUI core components.
-# Update these versions when upgrading the distribution.
+#
+# Authoritative source for ComfyUI core, frontend, and workflow-template refs
+# bundled in this distribution. Consumers (cloud, local installs, downstream
+# builds) read these refs to clone matching ComfyUI components.
+#
+# Bumping a ref here is a deliberate PR — same review surface as a go.mod bump.
 
 pinned:
   comfyui:
-    ref: v0.18.2
+    ref: v0.21.1
 
   comfyui_frontend_package:
-    ref: 1.41.18
+    ref: 1.43.18
 
   comfyui_workflow_templates:
-    ref: 0.9.21
+    ref: 0.9.75

@@ -1,8 +1,58 @@
 # Admin Setup Guide
 
-Manual steps required to complete the comfy-complete infrastructure. These require org admin or repo admin permissions that can't be done via CI.
+Configuration for the comfy-complete repository. Tracks what has been applied
+and what still requires manual action.
 
-## 1. Repository Secrets (Comfy-Org/comfy-complete)
+## Repo Settings (APPLIED 2026-03-27)
+
+| Setting | Value | Matches |
+|---------|-------|---------|
+| Merge method | Squash only | ComfyUI_frontend |
+| Delete branch on merge | Yes | ComfyUI_frontend |
+| Wiki | Disabled | — |
+| Auto-merge | Disabled | ComfyUI core |
+
+## Branch Ruleset: `ProtectMain` (APPLIED 2026-03-27)
+
+Ruleset ID `14420755` — uses GitHub's rulesets API (same as ComfyUI core and
+ComfyUI_frontend, NOT legacy branch protection).
+
+| Rule | Configuration |
+|------|--------------|
+| No deletion | Prevent main branch deletion |
+| No force push | Prevent non-fast-forward pushes |
+| Linear history | Required |
+| Pull request | 1 approval, code owner review, stale review dismissal, thread resolution required, squash only |
+| Required checks | `validate`, `yaml-lint`, `test-workflows` |
+| Bypass actors | None — nobody can bypass |
+
+The `ai-review` check is intentionally NOT required — it only runs when
+`ANTHROPIC_API_KEY` is configured and skips bot actors.
+
+View/edit: https://github.com/Comfy-Org/comfy-complete/rules/14420755
+
+## CODEOWNERS (APPLIED 2026-03-27)
+
+File: `/CODEOWNERS` (repo root, matching ComfyUI core's placement)
+
+| Pattern | Owners | Purpose |
+|---------|--------|---------|
+| `*` (default) | `@Comfy-Org/comfy-cloud-team` | All files require cloud team review |
+| `/supported_nodes.yaml` | `@deepme987 @bigcat88` | Node definitions — critical path for submissions |
+| `/.github/` | `@deepme987` | CI and automation |
+| `/scripts/` | `@deepme987` | Review and build scripts |
+| `.claude/`, `.cursor/`, `**/CLAUDE.md` | (none) | LLM config — no owner review needed |
+
+## Team Access (APPLIED 2026-03-27)
+
+| Team | Permission | Purpose |
+|------|-----------|---------|
+| `comfy-cloud-team` | Write (`push`) | Code ownership, PR reviews |
+| `comfy-bots` | Read (`pull`) | Automation (CI bots) |
+
+---
+
+## 1. Repository Secrets — MANUAL ACTION REQUIRED
 
 ### ANTHROPIC_API_KEY
 Enables the Claude AI review agent on PRs. Same key used on `archived-comfy-complete`.
@@ -30,41 +80,6 @@ gh secret set SUBMODULE_PAT --repo Comfy-Org/comfy-complete --body "ghp_..."
 ```
 
 Not needed once comfy-complete goes public.
-
----
-
-## 2. Branch Protection (Comfy-Org/comfy-complete)
-
-GitHub → Comfy-Org/comfy-complete → Settings → Branches → Add rule for `main`:
-
-- [x] **Require a pull request before merging**
-  - [x] Require approvals: **1**
-  - [x] Dismiss stale pull request approvals when new commits are pushed
-- [x] **Require status checks to pass before merging**
-  - Required checks:
-    - `validate` (from CI workflow)
-    - `yaml-lint` (from CI workflow)
-    - `test-workflows` (from CI workflow)
-- [x] **Restrict who can push to matching branches**
-  - Only org members / maintainers
-- [x] **Do not allow force pushes**
-- [x] **Do not allow deletions**
-
----
-
-## 3. CODEOWNERS (Comfy-Org/comfy-complete)
-
-Create `.github/CODEOWNERS` in the comfy-complete repo:
-
-```
-# Backend team must approve all node configuration changes
-supported_nodes.yaml    @Comfy-Org/backend
-requirements.txt        @Comfy-Org/backend
-version_lock.yaml       @Comfy-Org/backend
-build-config.yaml       @Comfy-Org/backend
-```
-
-This ensures node config changes require backend team approval even if the repo is public.
 
 ---
 
@@ -127,13 +142,27 @@ Then add a push step to `cloudbuild/cloudbuild.yaml` to re-tag and push to Docke
 
 ## Priority Order
 
-| Step | Urgency | Blocks |
+| Step | Urgency | Status |
 |------|---------|--------|
-| 1. ANTHROPIC_API_KEY | Now | Claude review agent on PRs |
-| 2. Branch protection | Now | Prevents unreviewed merges |
-| 3. CODEOWNERS | Now | Requires backend team approval |
-| 4. CLOUD_REPO_PAT | Before ephemeral testing | Ephemeral test dispatch |
-| 5. GitHub App access | After merge | Simplifies Cloud Build auth |
-| 6. ArgoCD cleanup | After merge | Removes workarounds |
-| 7. Secret Manager cleanup | After step 5 | Removes unused secret |
-| 8. Docker Hub | When frontend needs it | Frontend testing |
+| Repo settings (squash, delete branch) | Now | **DONE** |
+| Branch ruleset (ProtectMain) | Now | **DONE** |
+| CODEOWNERS | Now | **DONE** (needs commit+push) |
+| Team access (comfy-cloud-team) | Now | **DONE** |
+| ANTHROPIC_API_KEY secret | Now | **TODO** — enables AI review agent |
+| CLOUD_REPO_PAT secret | Before ephemeral testing | **TODO** — enables cross-repo dispatch |
+| GitHub App access | After cloud PR #2909 merge | TODO — simplifies Cloud Build auth |
+| ArgoCD cleanup | After cloud PR #2909 merge | TODO — removes submodule workarounds |
+| Secret Manager cleanup | After GitHub App access | TODO — removes unused secret |
+| Docker Hub | When frontend needs it | TODO — frontend testing |
+
+## Verification Checklist
+
+After committing CODEOWNERS and setting up secrets, verify by opening a test PR:
+
+- [ ] PR requires at least 1 approval from a code owner
+- [ ] PR cannot merge without `validate`, `yaml-lint`, `test-workflows` passing
+- [ ] Stale reviews are dismissed when new commits are pushed
+- [ ] Only squash merge is available
+- [ ] Branch is auto-deleted after merge
+- [ ] `custom-node-review.yml` runs AI review (if `ANTHROPIC_API_KEY` configured)
+- [ ] Direct pushes to main are blocked

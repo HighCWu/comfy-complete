@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1
+# =====================================================
+# Comfy Complete - CI Container (CPU)
+#
+# Self-contained CPU build with ComfyUI + all custom nodes.
+# No GPU, no Go sidecar — just ComfyUI + nodes + Python.
+#
+# Two modes:
+#   1. Standalone: docker build -f docker/Dockerfile.ci -t comfy-complete-ci .
+#   2. Extend CI base: docker build -f docker/Dockerfile.ci \
+#        --build-arg CI_BASE_IMAGE=ghcr.io/comfy-org/comfyui-ci-container:0.0.16 .
+#
+# Usage:
+#   docker run -p 8188:8188 comfy-complete-ci
+# =====================================================
+
+FROM python:3.12-slim-bookworm
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates libgl1-mesa-glx libglib2.0-0 jq \
+    gcc g++ python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv for fast package management
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/bin/
+
+WORKDIR /app
+
+# Copy version lock to determine ComfyUI ref
+COPY version_lock.yaml /app/version_lock.yaml
+
+# Install base tools (comfy-cli WITH deps — it needs prompt_toolkit, questionary, etc.)
+RUN uv pip install --system pyyaml yq "comfy-cli==1.5.4"
+
+# Clone ComfyUI at pinned version
+RUN COMFYUI_REF=$(yq -r '.pinned.comfyui.ref' /app/version_lock.yaml) && \
+    echo "Cloning ComfyUI at ref: ${COMFYUI_REF}" && \
+    git clone --depth 1 https://github.com/Comfy-Org/ComfyUI.git /ComfyUI && \
+    cd /ComfyUI && git fetch --depth 1 origin "${COMFYUI_REF}" && git checkout FETCH_HEAD
+
+# Install PyTorch CPU
+RUN uv pip install --system torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install ComfyUI requirements
+RUN uv pip install --system -r /ComfyUI/requirements.txt
+
+# Copy comfy-complete config
+COPY supported_nodes.yaml /app/supported_nodes.yaml
+COPY requirements.txt /app/cc-requirements.txt
+COPY scripts/install_custom_nodes.py /app/install_custom_nodes.py
+
+# Install comfy-complete requirements (skip GPU-only packages)
+# SAM-2: requires CUDA compilation
+# cupy-cuda12x: CUDA-only
+# nvidia-vfx: NVIDIA GPU SDK
+RUN grep -v -E '^(SAM-2|cupy-cuda|nvidia-vfx)' /app/cc-requirements.txt > /tmp/cpu-requirements.txt && \
+    uv pip install --system --no-deps -r /tmp/cpu-requirements.txt && \
+    rm /tmp/cpu-requirements.txt
+
+# Install frontend
+RUN FRONTEND_REF=$(yq -r '.pinned.comfyui_frontend_package.ref' /app/version_lock.yaml) && \
+    echo "Installing frontend ${FRONTEND_REF}" && \
+    uv pip install --system --no-deps comfyui_frontend_package==${FRONTEND_REF}
+
+# Create skip_download_model marker
+RUN mkdir -p /ComfyUI/custom_nodes && \
+    touch /ComfyUI/custom_nodes/skip_download_model
+
+# Install custom nodes (--no-deps — requirements already installed above)
+RUN cd /ComfyUI && python /app/install_custom_nodes.py \
+    --comfy-path /ComfyUI \
+    --config /app/supported_nodes.yaml \
+    --no-deps
+
+# Clean up
+RUN rm -f /ComfyUI/custom_nodes/skip_download_model
+
+WORKDIR /ComfyUI
+EXPOSE 8188
+
+CMD ["python", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--cpu"]

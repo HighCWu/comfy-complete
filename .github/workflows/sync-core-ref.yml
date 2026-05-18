@@ -1,0 +1,160 @@
+name: Sync - Core Ref
+
+# Manually-triggered workflow to bump version_lock.yaml.pinned.comfyui.ref to a
+# specific ComfyUI PR's head SHA. Used to test a candidate ComfyUI change
+# end-to-end (CC PR opens here → CC PR merges → cloud auto-bumps + preview-gpu).
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_repo:
+        description: The source ComfyUI repository (public or private)
+        required: false
+        type: choice
+        default: Comfy-Org/ComfyUI
+        options:
+          - Comfy-Org/ComfyUI
+          - Comfy-Org/ComfyUI-private
+
+      core_pr:
+        description: ComfyUI PR number to update to
+        required: true
+        type: number
+
+env:
+  CORE_PR_PREFIX: previews/core-pr-
+
+jobs:
+  update-ref:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install yq
+        run: pip install yq
+
+      - name: Read current core ref
+        id: current-ref
+        run: |
+          CURRENT_REF="$(yq -r '.pinned.comfyui.ref' version_lock.yaml)"
+          echo "ref=$CURRENT_REF" >> $GITHUB_OUTPUT
+          echo "Current core ref: $CURRENT_REF"
+
+      - name: Get latest ref from ComfyUI PR
+        id: latest-ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CORE_GH_REPO: ${{ inputs.core_repo }}
+          CORE_PR: ${{ inputs.core_pr }}
+        run: |
+          if [ "$CORE_PR" -le "0" ]; then
+            echo "Error: Invalid ComfyUI PR number $CORE_PR"
+            exit 1
+          fi
+          CORE_PR_JSON=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$CORE_GH_REPO/pulls/$CORE_PR")
+          CORE_BRANCH=$(jq -r '.head.ref' <<< "$CORE_PR_JSON")
+          PR_BRANCH="${CORE_PR_PREFIX}$CORE_PR"
+          LATEST_REF=$(jq -r '.head.sha' <<< "$CORE_PR_JSON")
+          if [ -z "$LATEST_REF" ] || [ "$LATEST_REF" = "null" ]; then
+            echo "Error: Could not fetch latest ref for $CORE_GH_REPO PR #$CORE_PR"
+            exit 1
+          fi
+
+          echo "core_branch=$CORE_BRANCH" >> $GITHUB_OUTPUT
+          echo "pr_branch=$PR_BRANCH" >> $GITHUB_OUTPUT
+          echo "ref=$LATEST_REF" >> $GITHUB_OUTPUT
+          echo "Latest ref on $CORE_BRANCH: $LATEST_REF"
+
+      - name: Check if update is needed
+        id: check
+        env:
+          CURRENT_REF: ${{ steps.current-ref.outputs.ref }}
+          LATEST_REF: ${{ steps.latest-ref.outputs.ref }}
+        run: |
+          if [ "$CURRENT_REF" = "$LATEST_REF" ]; then
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+            echo "No update needed - already at latest ref"
+          else
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+            echo "Update needed: $CURRENT_REF -> $LATEST_REF"
+          fi
+
+      - name: Update version_lock.yaml
+        if: steps.check.outputs.needs_update == 'true'
+        env:
+          LATEST_REF: ${{ steps.latest-ref.outputs.ref }}
+        run: |
+          LATEST_REF="$LATEST_REF" yq -i -y '.pinned.comfyui.ref = env.LATEST_REF' version_lock.yaml
+          echo "Updated version_lock.yaml with ref: $LATEST_REF"
+
+      - name: Generate diff URL
+        if: steps.check.outputs.needs_update == 'true'
+        id: diff-url
+        env:
+          CORE_GH_REPO: ${{ inputs.core_repo }}
+          OLD_REF: ${{ steps.current-ref.outputs.ref }}
+          NEW_REF: ${{ steps.latest-ref.outputs.ref }}
+        run: |
+          DIFF_URL="https://github.com/$CORE_GH_REPO/compare/$OLD_REF...$NEW_REF"
+          echo "url=$DIFF_URL" >> $GITHUB_OUTPUT
+          echo "Diff URL: $DIFF_URL"
+
+      - name: Create Pull Request
+        if: steps.check.outputs.needs_update == 'true'
+        id: create-pr
+        uses: peter-evans/create-pull-request@v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: Update ComfyUI to ${{ steps.latest-ref.outputs.ref }}
+          title: "test: bump ComfyUI ref from ${{ steps.latest-ref.outputs.core_branch }}"
+          body: |
+            Bumps `version_lock.yaml.pinned.comfyui.ref` to the head of
+            [${{ inputs.core_repo }} PR #${{ inputs.core_pr }}](https://github.com/${{ inputs.core_repo }}/pull/${{ inputs.core_pr }}).
+
+            **Branch**: `${{ steps.latest-ref.outputs.core_branch }}`
+            **Previous ref**: `${{ steps.current-ref.outputs.ref }}`
+            **New ref**: `${{ steps.latest-ref.outputs.ref }}`
+
+            ### Changes
+            View the diff between refs:
+            ${{ steps.diff-url.outputs.url }}
+
+            ### Downstream
+            This PR has auto-merge enabled — once CC CI passes (validate, yaml-lint,
+            test-workflows, custom-node-review), it merges and triggers
+            `notify-cloud.yml`, which dispatches to cloud's `comfy-complete-sync.yml`.
+            Cloud opens its own draft pin-bump PR. To exercise the cloud end-to-end
+            (build cc-base + Helm deploy + smoke), add the `preview-gpu` label to
+            that cloud PR after it opens.
+
+            ---
+            🤖 Automatically generated by the Sync Core Ref workflow
+            (Run: ${{ github.run_id }})
+          branch: ${{ steps.latest-ref.outputs.pr_branch }}
+          delete-branch: true
+
+      - name: Enable auto-merge on PR
+        if: steps.check.outputs.needs_update == 'true' && steps.create-pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.create-pr.outputs.pull-request-number }}
+        run: |
+          gh pr merge "$PR" --auto --squash || echo "::warning::auto-merge could not be enabled (likely repo settings); PR will need manual merge"
+
+      - name: No update needed
+        if: steps.check.outputs.needs_update == 'false'
+        env:
+          CORE_BRANCH: ${{ steps.latest-ref.outputs.core_branch }}
+        run: |
+          echo "✅ Already at latest ref on $CORE_BRANCH branch"
+          echo "Current version_lock.yaml is up to date!"
