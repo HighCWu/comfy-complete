@@ -3,5 +3,5 @@
 
 build:
   # Remove ComfyUI Manager after custom nodes are installed.
-  # This prevents users from installing additional nodes in managed environments.
+  # This prevents users from installing additional nodes in production/cloud environments.
   remove_manager: true

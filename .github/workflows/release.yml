@@ -1,0 +1,77 @@
+name: Release
+
+# Manually tag a new comfy-complete release. The tag is the artifact —
+# Cloud pins a CC ref/tag in its own `comfy_complete_version.yaml`, so
+# tagging here marks "this state is publishable for cloud to consider".
+#
+# No Docker image is built here; cloud builds cc-base from the cloned
+# repo at the pinned ref.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type (ignored if version is set)'
+        required: false
+        type: choice
+        default: 'patch'
+        options:
+          - patch
+          - minor
+          - major
+      version:
+        description: 'Explicit version (e.g. v0.2.0). Overrides bump if set.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Compute next version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXPLICIT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${EXPLICIT}" ]; then
+            NEW="${EXPLICIT}"
+            if [[ ! "$NEW" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::version must match vMAJOR.MINOR.PATCH (got: $NEW)"
+              exit 1
+            fi
+          else
+            CURRENT=$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1)
+            if [ -z "$CURRENT" ]; then
+              CURRENT="v0.0.0"
+            fi
+            IFS='.' read -r MAJ MIN PAT <<< "${CURRENT#v}"
+            case "$BUMP" in
+              major) NEW="v$((MAJ+1)).0.0" ;;
+              minor) NEW="v${MAJ}.$((MIN+1)).0" ;;
+              patch|*) NEW="v${MAJ}.${MIN}.$((PAT+1))" ;;
+            esac
+            echo "Current: $CURRENT -> New: $NEW"
+          fi
+          echo "tag=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Tag + create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag "$TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes

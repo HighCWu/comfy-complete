@@ -1,63 +1,56 @@
-# ======================================================
-# ComfyUI Base Image (comfy-complete)
-# Builds the full Python/CUDA environment with ComfyUI,
-# custom nodes, and pinned Python packages.
+# syntax=docker/dockerfile:1
+# =====================================================
+# Comfy Complete - ComfyUI Container
+# A batteries-included ComfyUI distribution
 #
-# Build context = repo root. Build with:
-#   docker build -f docker/Dockerfile.cloudbuild .
+# Layer order optimized for caching (least to most frequently changing):
+# 0. SAM2 builder stage (rarely changes, expensive to build)
+# 1. Base image + system deps
+# 2. Base tools (uv, pyyaml, comfy-cli, git config)
+# 3. ComfyUI clone
+# 4. Python requirements (includes pre-built SAM2 wheel)
+# 5. Custom nodes
+# 6. Post-install config (build-config.yaml options like remove_manager)
+# 7. Entrypoint + user setup
 #
-# When this image is built by cloud's inference cloudbuild,
-# content-hash caching is applied: if the hash of the
-# inputs to cc-resolve matches an existing image in the
-# registry, the build is skipped entirely.
-#
-# IMPORTANT: when adding a new COPY (or any other repo
-# path that affects the build), add the source file to
-# the cc-resolve hash inputs in all three cloud cloudbuild
-# yamls (cloudbuild.yaml, cloudbuild-pr.yaml,
-# cloudbuild-release.yaml) or the cache will silently
-# serve a stale base image.
-#
-# Layer order optimized for caching (least to most
-# frequently changing):
-#   0. SAM2 wheel builder (rarely changes)
-#   1. System dependencies
-#   2. Base tools (uv, comfy-cli, yq)
-#   3. ComfyUI clone at pinned ref
-#   4. Python requirements (changes less than nodes)
-#   5. Custom nodes (changes most frequently)
-# ======================================================
+# Dev mode: Use --build-arg UV_CACHE=1 to enable uv package caching
+# between builds (faster iteration, uses BuildKit cache mounts)
+# =====================================================
 
-# Stage 0: SAM2 wheel builder (cached separately)
-# pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6 AS sam2-builder
-ENV PYTHONDONTWRITEBYTECODE=1
-RUN pip wheel --no-build-isolation --no-deps \
-    "SAM-2 @ https://github.com/facebookresearch/sam2/archive/2b90b9f5ceec907a1c18123530e92e794ad901a4.tar.gz" \
-    -w /wheels
+# =============================================================================
+# Stage 0: SAM2 Builder (cached separately - only rebuilds if commit changes)
+# =============================================================================
+# SAM2 requires compilation with CUDA, which is slow. Building it in a separate
+# stage allows the wheel to be cached and reused across builds.
+ARG BASE_IMAGE
+ARG SAM2_IMAGE=sam2
+FROM $SAM2_IMAGE as sam2
 
-# Stage 1: Python environment setup
-# pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6
-
-ARG COMFYUI_REPO_URL=https://github.com/Comfy-Org/ComfyUI.git
+# =============================================================================
+# Stage 1: Main image
+# =============================================================================
+FROM $BASE_IMAGE
 
 WORKDIR /app
 
-# Set Python path environment variable
+ARG UV_NO_CACHE=1
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHON_PATH=/opt/conda/bin/python
 ENV COMFY_PATH=/app/comfyui
 ENV COMFY_PORT=8188
-ENV UV_PYTHON=/opt/conda/bin/python
+ENV UV_PYTHON=$PYTHON_PATH
 
-# Don't persist uv cache in the image
-ARG UV_NO_CACHE=1
+# UV settings
+ENV UV_HTTP_TIMEOUT=300
+ENV UV_HTTP_RETRIES=5
+ENV UV_LINK_MODE=copy
 
+# =============================================================================
 # Layer 1: System dependencies (rarely changes)
-# Use apt's native retry/backoff to handle transient archive.ubuntu.com
-# failures on Cloud Build worker pools.
-RUN apt-get -o Acquire::Retries=3 update && \
-    apt-get install -y --no-install-recommends \
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
   git \
   wget \
   curl \
@@ -66,43 +59,67 @@ RUN apt-get -o Acquire::Retries=3 update && \
   bash \
   libgl1-mesa-glx \
   libglib2.0-0 \
-  libegl1-mesa \
-  libgl1-mesa-dri \
-  libglfw3 \
   jq \
-  patch \
-  sox \
-  libsox-fmt-all \
-  libzbar0 \
-  && apt-get clean && rm -rf /var/lib/apt/lists/*
+  dumb-init && \
+  apt-get clean && \
+  rm -rf /var/lib/apt/lists/*
 
-# Layer 2: Base tools
-# astral-sh/uv tag: 0.9.29, linux/amd64
-COPY --from=ghcr.io/astral-sh/uv:0.9.29@sha256:efeddf2eadc8e30f9ce73a8a8668574585237becef05213fe804b15a7c52037c /uv /uvx /bin/
+# Create non-root user early (so we can create files owned by this user)
+# comfy-cli needs a home directory for config storage
+RUN groupadd --gid 1000 comfy \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin comfy
 
-# Install comfy-cli (pinned: --no-deps requires >= 1.5.1) and yq (YAML parser)
-RUN uv pip install "comfy-cli==1.5.4" yq
+# =============================================================================
+# Layer 2: Base tools (rarely changes)
+# =============================================================================
+# Install uv for faster dependency installation
+COPY --from=ghcr.io/astral-sh/uv:0.9.29 /uv /uvx /usr/bin/
 
-# Layer 3: ComfyUI clone at pinned ref
-COPY version_lock.yaml /app/version_lock.yaml
-RUN COMFYUI_REF=$(yq -r '.pinned.comfyui.ref' /app/version_lock.yaml) && \
-    if [ -z "$COMFYUI_REF" ] || [ "$COMFYUI_REF" = "null" ]; then \
-        echo "Error: Could not read .pinned.comfyui.ref from version_lock.yaml" && exit 1; \
-    fi && \
-    echo "Checking out ComfyUI ref: $COMFYUI_REF" && \
-    git clone --depth 1 ${COMFYUI_REPO_URL} ${COMFY_PATH} && \
-    cd ${COMFY_PATH} && \
-    git fetch --depth 1 origin "$COMFYUI_REF" && \
-    git checkout FETCH_HEAD
+# Install base Python tools
+# Cache mount persists between builds when using --build-arg UV_CACHE=1
+# - yq: YAML parser (wrapper around jq) for reading version_lock.yaml
+# - comfy-cli: ComfyUI management tool
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
+    uv pip install -v yq comfy-cli
 
-# Set locations where some custom nodes store user-specific data
+# Debug: Check installed comfy-cli version (--no-deps requires >= 1.5.1)
+RUN comfy --version
+
+# Install pre-built SAM2 wheel from builder stage (fast - no compilation needed)
+COPY --from=sam2 /wheels/*.whl /tmp/wheels/
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
+    uv pip install -v --no-deps /tmp/wheels/*.whl && \
+    rm -rf /tmp/wheels
+
+# =============================================================================
+# Layer 3: ComfyUI clone (changes occasionally)
+# =============================================================================
+# Copy version lock file (readable by all users)
+COPY --chmod=644 ../versions/version_lock.yaml /app/version_lock.yaml
+
+# Create base directory with correct ownership (files created as comfy user)
+RUN mkdir -p $COMFY_PATH && chown comfy:comfy $COMFY_PATH
+
+# Set XDG directories for custom nodes that store user-specific data
 ENV XDG_DATA_HOME=/app/comfyui/models/_xdgdata \
     XDG_CACHE_HOME=/app/comfyui/models/_xdgcache \
     XDG_CONFIG_HOME=/app/comfyui/models/_xdgconfig \
     TRANSPARENT_BACKGROUND_FILE_PATH=/app/comfyui/models
 
-# Create ComfyUI directories
-RUN cd ${COMFY_PATH} && \
+# Switch to comfy user for git clone (files created with correct ownership)
+USER comfy
+
+# Clone ComfyUI and checkout specific version (using shallow clone for faster builds)
+# Works with both commit hashes and tags (e.g., "v0.3.75")
+RUN COMFYUI_REF=$(yq -r '.pinned.comfyui.ref' /app/version_lock.yaml) && \
+    echo "Cloning ComfyUI and checking out ref: $COMFYUI_REF" && \
+    git clone --depth 1 https://github.com/Comfy-Org/ComfyUI.git $COMFY_PATH && \
+    cd $COMFY_PATH && \
+    git fetch --depth 1 origin "$COMFYUI_REF" && \
+    git checkout FETCH_HEAD
+
+# Create ComfyUI directories (as comfy user)
+RUN cd $COMFY_PATH && \
     mkdir -p models/checkpoints \
     models/clip \
     models/controlnet \
@@ -120,40 +137,84 @@ RUN cd ${COMFY_PATH} && \
     temp \
     models/_xdgdata \
     models/_xdgcache \
-    models/_xdgconfig
+    models/_xdgconfig \
+    custom_nodes
 
-# Layer 4: Python requirements FIRST (change less frequently than nodes)
-COPY requirements.txt /app/comfyui-requirements.txt
-COPY --from=sam2-builder /wheels/*.whl /tmp/wheels/
-RUN uv pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
-# Filter out SAM-2 (already installed from prebuilt wheel above) and nvidia-vfx
-# (installed separately below from NVIDIA's PyPI index) to avoid re-fetching from
-# Git and to keep nvidia-vfx off the default PyPI index.
-RUN grep -Ev '^(SAM-2 @|nvidia-vfx==)' /app/comfyui-requirements.txt > /tmp/base-requirements.txt && \
-    uv pip install --no-deps -r /tmp/base-requirements.txt && \
-    rm -f /tmp/base-requirements.txt
+# Switch back to root for pip installs
+USER root
+
+# =============================================================================
+# Layer 4: Python requirements (changes frequently)
+# =============================================================================
+COPY ../versions/requirements.txt /app/requirements.txt
+
+# Pin all dependencies to exact versions for deterministic builds
+# -v flag shows granular progress during installation
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
+    uv pip install -v --no-deps -r /app/requirements.txt
 
 # Install nvidia-vfx from NVIDIA's PyPI index (binary wheel includes Maxine VFX SDK libs)
 # Installed separately to avoid exposing all packages to the extra index (dependency confusion risk)
-RUN uv pip install --no-deps --extra-index-url https://pypi.nvidia.com/ nvidia-vfx==0.1.0.1
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
+    uv pip install -v --no-deps --extra-index-url https://pypi.nvidia.com/ nvidia-vfx==0.1.0.1
 
-# Layer 5: Custom nodes (change most frequently)
-COPY supported_nodes.yaml /app/supported_nodes.yaml
-COPY scripts/install_custom_nodes.py /app/install_custom_nodes.py
+# Install frontend and workflow templates from version_lock.yaml (single source of truth)
+RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
+    FRONTEND_REF=$(yq -r '.pinned.comfyui_frontend_package.ref' /app/version_lock.yaml) && \
+    TEMPLATES_REF=$(yq -r '.pinned.comfyui_workflow_templates.ref' /app/version_lock.yaml) && \
+    echo "Installing comfyui_frontend_package==$FRONTEND_REF" && \
+    echo "Installing comfyui_workflow_templates==$TEMPLATES_REF" && \
+    uv pip install -v --no-deps \
+        comfyui_frontend_package==$FRONTEND_REF \
+        comfyui_workflow_templates==$TEMPLATES_REF
 
-# Create the skip_download_model file in the custom_nodes directory
-RUN touch ${COMFY_PATH}/custom_nodes/skip_download_model
+# =============================================================================
+# Layer 5: Custom nodes (changes most frequently)
+# =============================================================================
+COPY --chmod=644 ../versions/supported_nodes.yaml /app/supported_nodes.yaml
+COPY --chmod=755 ../scripts/install_custom_nodes.py /app/install_custom_nodes.py
 
-# Install custom nodes with --no-deps (clone only, deps come from requirements.txt)
-# -u: unbuffered stdout so build logs show incremental progress
-RUN cd ${COMFY_PATH} && ${PYTHON_PATH} -u /app/install_custom_nodes.py --no-deps --comfy-path ${COMFY_PATH}
+# Switch to comfy user for custom nodes installation (files created with correct ownership)
+USER comfy
 
-# Create non-root user (UID/GID 1000) to match K8s securityContext runAsUser
-# and chown the runtime tree so the base image is usable as a standalone
-# artifact. Anyone pulling comfy-complete-base directly will run under
-# runAsUser: 1000.
-# Note: no USER instruction -- consumers (e.g. cloud's K8s securityContext)
-# enforce runAsUser: 1000 at runtime.
-RUN groupadd --gid 1000 comfy \
-    && useradd --uid 1000 --gid 1000 -M --home-dir ${COMFY_PATH} --shell /usr/sbin/nologin comfy \
-    && chown -R 1000:1000 ${COMFY_PATH}
+# Create the skip_download_model file to prevent model downloads during install
+RUN touch $COMFY_PATH/custom_nodes/skip_download_model
+
+# Install custom nodes with --no-deps for production builds
+RUN cd $COMFY_PATH && $PYTHON_PATH /app/install_custom_nodes.py --no-deps
+
+# =============================================================================
+# Layer 6: Post-install configuration (build config options)
+# =============================================================================
+# ARG declared here to avoid invalidating earlier cached layers
+ARG REMOVE_MANAGER=0
+
+# Optionally remove ComfyUI Manager (for locked-down cloud deployments)
+# Use --build-arg REMOVE_MANAGER=1 to enable
+RUN if [ "$REMOVE_MANAGER" = "1" ]; then \
+        echo "Removing ComfyUI Manager..." && \
+        rm -rf $COMFY_PATH/custom_nodes/ComfyUI-Manager; \
+    fi
+
+# Switch back to root for final setup
+USER root
+
+# Allow COMFY_EXTRA_LIBS to be installed at runtime
+RUN chown -hR comfy:comfy /opt/conda/bin /opt/conda/lib/python3.11/site-packages /app/comfyui/models
+
+# =============================================================================
+# Layer 7: Entrypoint (rarely changes)
+# =============================================================================
+COPY ../scripts/entrypoint.sh /app/entrypoint.sh
+RUN chmod 755 /app/entrypoint.sh
+
+# Expose ComfyUI port
+EXPOSE $COMFY_PORT
+
+# Set working directory to ComfyUI
+WORKDIR $COMFY_PATH
+
+# Run as non-root user
+USER comfy
+
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/entrypoint.sh"]

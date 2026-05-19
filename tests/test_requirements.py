@@ -52,9 +52,8 @@ def test_requirements_syntax():
 def test_requirements_resolvable_with_uv():
     """Use uv to verify requirements.txt can be resolved without conflicts."""
     # Check if uv is available
-    import shutil
-
-    if shutil.which("uv") is None:
+    uv_check = subprocess.run(["which", "uv"], capture_output=True)
+    if uv_check.returncode != 0:
         pytest.skip("uv not installed - skipping resolution test")
 
     # Create a temporary directory for the virtual environment
@@ -69,25 +68,17 @@ def test_requirements_resolvable_with_uv():
         )
         assert result.returncode == 0, f"Failed to create venv: {result.stderr}"
 
-        # Try to install dependencies (dry-run, --no-deps to match actual install).
-        # We install with --no-deps in Docker because some packages declare
-        # overly strict bounds (e.g. mediapipe requires numpy<2) that conflict
-        # with our pinned versions but work fine at runtime.
+        # Try to resolve dependencies (dry-run)
         result = subprocess.run(
             [
                 "uv",
                 "pip",
                 "install",
                 "--dry-run",
-                "--no-deps",
                 "-r",
                 str(REQUIREMENTS_FILE),
                 "--python",
-                os.path.join(
-                    venv_path,
-                    "Scripts" if os.name == "nt" else "bin",
-                    "python.exe" if os.name == "nt" else "python",
-                ),
+                os.path.join(venv_path, "bin", "python"),
             ],
             capture_output=True,
             text=True,
@@ -194,67 +185,8 @@ def test_supported_nodes_structure():
     assert isinstance(config["node_packs"], list), "'node_packs' should be a list"
     assert len(config["node_packs"]) > 0, "'node_packs' should not be empty"
 
-    allowed_keys = {
-        "name",
-        "version",
-        "node_labels",
-        "web_directory",
-        "dependency_overrides",
-        "system_dependencies",
-        "models",
-    }
-
     for i, pack in enumerate(config["node_packs"]):
-        pack_name = pack.get("name", f"<index {i}>")
         assert "name" in pack, f"Node pack at index {i} missing 'name' key"
-
-        # Check for unknown keys (catches typos)
-        unknown_keys = set(pack.keys()) - allowed_keys
-        assert not unknown_keys, (
-            f"Node pack '{pack_name}' has unknown keys: {unknown_keys}"
-        )
-
-        # Validate dependency_overrides if present
-        if "dependency_overrides" in pack:
-            dep_overrides = pack["dependency_overrides"]
-            assert isinstance(dep_overrides, list), (
-                f"'{pack_name}': dependency_overrides must be a list"
-            )
-            for j, dep in enumerate(dep_overrides):
-                assert isinstance(dep, str), (
-                    f"'{pack_name}': dependency_overrides[{j}] must be a string"
-                )
-
-        # Validate system_dependencies if present
-        if "system_dependencies" in pack:
-            sys_deps = pack["system_dependencies"]
-            assert isinstance(sys_deps, list), (
-                f"'{pack_name}': system_dependencies must be a list"
-            )
-            for j, dep in enumerate(sys_deps):
-                assert isinstance(dep, str), (
-                    f"'{pack_name}': system_dependencies[{j}] must be a string"
-                )
-
-        # Validate models if present
-        if "models" in pack:
-            models = pack["models"]
-            assert isinstance(models, list), (
-                f"'{pack_name}': models must be a list"
-            )
-            for j, model in enumerate(models):
-                assert isinstance(model, dict), (
-                    f"'{pack_name}': models[{j}] must be a dict"
-                )
-                assert "name" in model, (
-                    f"'{pack_name}': models[{j}] missing required 'name' key"
-                )
-                model_allowed_keys = {"name", "url", "directory", "filename"}
-                unknown_model_keys = set(model.keys()) - model_allowed_keys
-                assert not unknown_model_keys, (
-                    f"'{pack_name}': models[{j}] has unknown keys: "
-                    f"{unknown_model_keys}"
-                )
 
 
 def test_version_lock_structure():

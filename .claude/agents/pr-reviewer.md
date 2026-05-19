@@ -90,7 +90,7 @@ Check if nodes persist data between runs:
 - **Singletons**: `_instance` patterns, class-level state modified at runtime
 - **Session state**: Data that can't be recalculated on next run
 
-Non-stateful caches (recalculable) are OK. User-specific state is NOT OK for managed deployments.
+Non-stateful caches (recalculable) are OK. User-specific state is NOT OK for cloud.
 
 #### UI/Frontend Analysis
 Check for web components:
@@ -102,7 +102,7 @@ Check for web components:
 Check for custom HTTP routes:
 - Look for `@routes` decorators or `PromptServer.instance.routes`
 - Determine if endpoints are stateful (modify persistent data) or stateless
-- Stateful endpoints are problematic for managed deployments
+- Stateful endpoints are problematic for cloud deployment
 
 ### Step 4: Determine Required Labels
 
@@ -112,24 +112,12 @@ Based on your code analysis, determine which labels each node needs:
 |-------|---------------|
 | `ReadsArbitraryFile` | Node has STRING input for file paths AND reads from that path |
 | `WritesToDisk` | Node writes files (save images, models, etc.) |
-| `CreatesLargeOutputs` | Node outputs video, audio, or batch images |
 | `NetworkAccess` | Node makes HTTP requests or opens network connections |
-| `RequiresExternalAPI` | Node requires external API keys (OpenAI, Anthropic, etc.) |
+| `CreatesLargeOutputs` | Node outputs video, audio, or batch images |
+| `DisabledOnCloud` | Node accesses local hardware, GUI, or won't work in cloud |
 | `Stateful` | Node persists user-specific data between workflow runs |
 | `HasCustomEndpoints` | Node registers custom HTTP server routes |
-| `PathParsing` | Node exposes filesystem path information |
-| `DuplicateOfCoreNode` | Node duplicates functionality of a core ComfyUI node |
-| `Incompatible` | Node is incompatible with the distribution environment |
-| `RequiresWebcam` | Node requires webcam hardware access |
-| `RequiresDisplay` | Node requires interactive display or browser UI |
-| `RequiresClipboard` | Node requires system clipboard access |
-| `RequiresGPU` | Node hardcodes CUDA/GPU and will crash without one |
-| `BrokenNode` | Node is currently broken or non-functional |
-| `ExecutesArbitraryCode` | Node executes user-provided code (eval, exec, pickle) |
-| `RuntimeModelDownload` | Node downloads models from the internet at execution time |
-| `RuntimePipInstall` | Node installs Python packages via pip at execution time |
-
-Labels are metadata that describe node capabilities and behaviors. Each deployment environment decides its own policy for which labels to restrict.
+| `RequiresExternalAPI` | Node requires external API keys (OpenAI, Anthropic, etc.) |
 
 **How to detect each:**
 
@@ -167,24 +155,24 @@ aiohttp.ClientSession()
 socket.connect(...)
 ```
 
-**IMPORTANT exception for NetworkAccess -- model downloads:**
-Many nodes use `requests.get()` or `urllib` to download models (from HuggingFace, Civitai, etc.) when the model is missing locally. In deployments where models are pre-provisioned by the infrastructure, the node's own download code never runs because the models are already present on disk.
+**IMPORTANT exception for NetworkAccess — model downloads:**
+Many nodes use `requests.get()` or `urllib` to download models (from HuggingFace, Civitai, etc.) when the model is missing locally. On cloud, these models are **pre-provisioned by the infrastructure**: they are listed in `common/supported_models.json` and downloaded from GCS by the inference service's model downloader *before* the workflow executes. The node's own download code never runs because the models are already present on disk.
 
 **Do NOT apply `NetworkAccess` when ALL of these are true:**
 1. The network calls are exclusively for downloading model/weight files (`.safetensors`, `.pt`, `.pth`, `.onnx`, `.bin`)
-2. **Every** model the node downloads is accounted for in the deployment's model registry
+2. **Every** model the node downloads is accounted for in `common/supported_models.json` — check the PR diff for model entries (model configs are now included in the same PR as node config)
 3. The download code has a "skip if file exists" guard (e.g., `if not os.path.exists(model_path): download()`)
 
 **To verify model coverage in the PR:**
 1. Read the node's download code to extract all model filenames/URLs it may fetch
-2. Check the PR diff for model configuration changes to confirm every model is listed
-3. If any models are **missing** from the model configuration, flag them specifically:
-   > "Warning: Model `face_detector.onnx` is downloaded by `NodeName` but not found in the model configuration. Add model entries or apply `NetworkAccess` label."
+2. Check the PR's `supported_models.json` changes (use `gh pr diff` or read the diff) to confirm every model is listed
+3. If any models are **missing** from `supported_models.json`, flag them specifically:
+   > "⚠️ Model `face_detector.onnx` is downloaded by `NodeName` but not found in `supported_models.json`. Add model entries or apply `NetworkAccess` label."
 
 **DO still apply `NetworkAccess` when:**
 - The node makes runtime API calls (e.g., to OpenAI, translation services, web scraping)
 - The node downloads non-model data at runtime (e.g., fetching images from URLs)
-- The models are NOT listed in the model configuration in this PR
+- The models are NOT listed in `supported_models.json` in this PR
 - The PR includes model entries but does **not** cover all models the node downloads
 
 **Stateful:**
@@ -213,205 +201,6 @@ client = anthropic.Anthropic()
 os.environ["OPENAI_API_KEY"]
 ```
 
-**PathParsing:**
-```python
-# Node returns filesystem paths as STRING outputs:
-RETURN_TYPES = ("STRING",)
-# Combined with path construction/exposure:
-return (os.path.abspath(file_path),)
-return (os.path.join(folder, filename),)
-return (str(Path(input_dir) / name),)
-# Or node exposes directory listings as strings:
-return (", ".join(os.listdir(some_dir)),)
-```
-
-**DuplicateOfCoreNode:**
-```python
-# Node reimplements functionality already in core ComfyUI.
-# Compare NODE_CLASS_MAPPINGS keys against core node names:
-# e.g., a custom "LoadImage" or "SaveImage" that does the same
-# thing as the built-in nodes.
-# Check nodes.py in ComfyUI core for the canonical list.
-NODE_CLASS_MAPPINGS = {
-    "MyLoadImage": MyLoadImage,  # duplicates core "LoadImage"
-}
-```
-
-**Incompatible:**
-```python
-# Node requires system packages not available in the distribution:
-import pyaudio          # requires system-level PortAudio
-import tkinter          # requires system GUI toolkit
-subprocess.run(["apt-get", "install", ...])
-subprocess.run(["ffmpeg", ...])  # only if ffmpeg is not bundled
-
-# Or has broken/unresolvable dependencies:
-# e.g., pinned to an incompatible torch version, requires
-# libraries that conflict with the distribution's environment.
-```
-
-**RequiresWebcam:**
-```python
-# Webcam / camera hardware access:
-cv2.VideoCapture(0)         # index 0 = default webcam
-cv2.VideoCapture(device_id)
-cap = cv2.VideoCapture(camera_index)
-# Any use of VideoCapture with an integer device index
-```
-
-**RequiresDisplay:**
-```python
-# Interactive display or bidirectional browser UI:
-PromptServer.instance.send_sync("prompt_user", ...)  # interactive prompts
-cv2.imshow(window_name, image)
-cv2.waitKey(...)
-plt.show()              # matplotlib interactive display
-# Custom JS widgets that require bidirectional communication
-# (look for js/ directory with widgets that send data back to server)
-```
-
-**RequiresClipboard:**
-```python
-# System clipboard access:
-ImageGrab.grabclipboard()
-pyperclip.paste()
-pyperclip.copy(text)
-# Any PIL.ImageGrab clipboard usage
-from PIL import ImageGrab
-img = ImageGrab.grabclipboard()
-```
-
-**RequiresGPU:**
-```python
-# Hardcoded CUDA/GPU without fallback:
-tensor.to('cuda')
-tensor.to("cuda:0")
-torch.device('cuda')
-model.cuda()
-# WITHOUT a fallback like:
-#   device = "cuda" if torch.cuda.is_available() else "cpu"
-# If the node ONLY uses 'cuda' with no cpu fallback, apply this label.
-```
-
-**BrokenNode:**
-```python
-# Node is currently non-functional:
-# - ImportError on required modules that don't exist
-# - References to removed APIs or deleted dependencies
-# - Syntax errors in Python files
-# - NODE_CLASS_MAPPINGS references classes that fail to import
-# Check by attempting to trace imports and class references.
-```
-
-**ExecutesArbitraryCode:**
-```python
-# Executes user-provided code:
-eval(user_input)
-exec(user_code)
-compile(source, ...) followed by exec(...)
-pickle.loads(user_data)     # deserialization = code execution
-marshal.loads(user_data)
-# Dynamic code construction and execution:
-exec(f"result = {expression}")
-eval(input_expression)
-```
-
-**RuntimeModelDownload:**
-```python
-# Downloads models at execution time:
-from huggingface_hub import hf_hub_download, snapshot_download
-hf_hub_download(repo_id, filename)
-snapshot_download(repo_id)
-torch.hub.download_url_to_file(url, dst)
-urllib.request.urlretrieve(model_url, model_path)
-requests.get(model_url)  # when downloading .safetensors, .pt, .pth, .onnx, .bin
-# Distinguish from NetworkAccess: this label is specifically for
-# model/weight file downloads, not general API calls.
-```
-
-**RuntimePipInstall:**
-```python
-# Installs pip packages during execution:
-subprocess.run([sys.executable, "-m", "pip", "install", ...])
-subprocess.check_call(["pip", "install", package])
-os.system("pip install " + package)
-# importlib fallback patterns:
-try:
-    import some_package
-except ImportError:
-    subprocess.run([..., "pip", "install", "some_package"])
-    import some_package
-# "ensure_package" or "install_if_missing" helper patterns
-```
-
-### Step 4.5: Run Automated Review Scripts
-
-Run the following automated checks for each new or updated node pack. These scripts provide structured JSON output that supplements your manual code review.
-
-#### License Check
-
-For each cloned node pack, check its license and dependency licenses:
-
-```bash
-python scripts/pr-review/license_checker.py --path /tmp/nodes/<node-pack-name> --output license-report.json
-cat license-report.json
-```
-
-**What to look for:**
-- `has_blocker: true` means a blocklisted license was found (AGPL, GPL-3.0, InsightFace, deepface)
-- Check `blocked_deps` for dependencies with restrictive licenses
-- Check `blocked_models` for models with non-commercial license restrictions
-- Warnings about missing license files should be noted but are not blockers
-
-#### Dependency Resolution Check
-
-If any new or updated node pack has `dependency_overrides`, check for conflicts:
-
-```bash
-python scripts/pr-review/dependency_resolver.py --changes changes.json --requirements requirements.txt --output deps-report.json
-cat deps-report.json
-```
-
-**What to look for:**
-- `conflicts` list shows version mismatches between existing requirements and overrides
-- `resolved: false` means the dependencies could not be resolved together
-- Check `suggestions` for recommended fixes
-
-#### Registry Check
-
-Verify that new node packs exist on the Comfy Registry:
-
-```bash
-python scripts/pr-review/registry_checker.py --changes changes.json --output registry-report.json
-cat registry-report.json
-```
-
-**What to look for:**
-- `exists: false` means the node pack is not on the Comfy Registry (may be expected for GitHub URL references)
-- URL-based node packs are automatically skipped (expected behavior)
-- Errors may indicate network issues, not actual problems
-
-#### Model URL Validation
-
-If any node pack declares models, validate their URLs:
-
-```bash
-python scripts/pr-review/model_url_validator.py --changes changes.json --output models-report.json
-cat models-report.json
-```
-
-Or check all models in the config:
-
-```bash
-python scripts/pr-review/model_url_validator.py --config supported_nodes.yaml --output models-report.json
-cat models-report.json
-```
-
-**What to look for:**
-- `accessible: false` means a model URL is broken or unreachable
-- Models larger than 10 GB get a warning (may need special handling)
-- Check `inaccessible` count in summary
-
 ### Step 5: Compare Labels
 
 Compare the labels declared in the PR against what you detected:
@@ -431,13 +220,13 @@ ls test_workflows/<node-pack-name>/api/*.json 2>/dev/null
 
 **What to check:**
 1. **Directory exists**: `test_workflows/<node-pack-name>/api/` should contain `.json` workflow files
-2. **Coverage**: Compare the number of test workflows against the number of non-labeled (enabled) nodes. There should be at least one workflow per testable node, though chain workflows can cover multiple nodes.
+2. **Coverage**: Compare the number of test workflows against the number of non-labeled (cloud-enabled) nodes. There should be at least one workflow per testable node, though chain workflows can cover multiple nodes.
 3. **README**: `test_workflows/<node-pack-name>/README.md` should exist with a coverage summary table
 
 **How to report:**
-- If test workflows exist with reasonable coverage: `Found N test workflows for M testable nodes`
-- If test workflows directory is missing entirely: `Missing - no test_workflows/<node-pack-name>/ directory found`
-- If test workflows exist but coverage is low (less than half the testable nodes): `Low coverage - N workflows for M testable nodes`
+- If test workflows exist with reasonable coverage: `✅ Found N test workflows for M testable nodes`
+- If test workflows directory is missing entirely: `❌ Missing - no test_workflows/<node-pack-name>/ directory found`
+- If test workflows exist but coverage is low (less than half the testable nodes): `⚠️ Low coverage - N workflows for M testable nodes`
 
 **Note**: For version updates, reuse existing test workflows **only if no new nodes were added**. If new nodes were introduced, verify coverage for those nodes. Only skip when no new nodes were added and the directory already exists.
 
@@ -482,56 +271,24 @@ Post a structured review comment. Use this format:
 
 | Node | Current Labels | Required Labels | Status |
 |------|---------------|-----------------|--------|
-| {NodeName} | {labels} | {what you detected} | OK / Missing / Wrong |
+| {NodeName} | {labels} | {what you detected} | ✅ / ⚠️ Missing / ❌ Wrong |
 
 **Recommendations:**
 {Specific label changes needed, with justification from code}
 
 ---
 
-## Automated Checks
-
-### License Check
-
-| Node Pack | License | Status | Details |
-|-----------|---------|--------|---------|
-| {name} | {license type} | OK / Blocked | {reason if blocked} |
-
-**Blocked Dependencies:** {list or "None"}
-**Blocked Models:** {list or "None"}
-
-### Dependency Resolution
-
-| Check | Status | Details |
-|-------|--------|---------|
-| Conflicts found | {count} | {list if any} |
-| Resolution | Resolved / Unresolved / Skipped | {tool used} |
-
-### Registry Status
-
-| Node Pack | Registry | Status |
-|-----------|----------|--------|
-| {name} | Found / Not found / Skipped (URL) | {details} |
-
-### Model URL Validation
-
-| Model | URL | Status | Size |
-|-------|-----|--------|------|
-| {name} | {url} | Accessible / Inaccessible | {size or N/A} |
-
----
-
-## Deployment Compatibility
+## Cloud Compatibility
 
 ### {Node Pack Name}
 
 | Check | Status | Details |
 |-------|--------|---------|
-| Test workflows | N workflows / Low coverage / Missing | {count and coverage} |
-| Stateful nodes | None / Found | {list if any} |
-| Custom UI | None / Has web/ dir | {details} |
-| Custom endpoints | None / Found | {stateful or stateless} |
-| External APIs | None / Required | {which APIs} |
+| Test workflows | ✅ N workflows / ⚠️ Low coverage / ❌ Missing | {count and coverage} |
+| Stateful nodes | ✅ None / ⚠️ Found | {list if any} |
+| Custom UI | ✅ None / ⚠️ Has web/ dir | {details} |
+| Custom endpoints | ✅ None / ⚠️ Found | {stateful or stateless} |
+| External APIs | ✅ None / ⚠️ Required | {which APIs} |
 
 ---
 
@@ -543,7 +300,7 @@ Post a structured review comment. Use this format:
 
 ---
 
-<sub>Comfy Complete PR Review Agent</sub>
+<sub>🤖 Comfy Complete PR Review Agent</sub>
 ```
 
 ## Decision Guidelines
@@ -563,9 +320,6 @@ Post a structured review comment. Use this format:
 - Critical labels missing (e.g., ReadsArbitraryFile on a node that reads arbitrary paths)
 - Code review found serious issues
 - Test workflows are completely missing for a new node pack
-- License checker found blocklisted licenses (AGPL, GPL-3.0, InsightFace, deepface)
-- Dependency resolver found unresolvable conflicts
-- Model URLs are inaccessible (broken download links)
 
 ### NEEDS DISCUSSION when:
 - Borderline security patterns

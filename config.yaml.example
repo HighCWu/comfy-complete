@@ -34,19 +34,12 @@ gpu:
   devices: all
 
 # Node filtering - disable nodes based on labels from supported_nodes.yaml
-# Uses OR logic: nodes matching ANY condition are disabled.
-# Each deployment chooses which labels to disable.
-#
-# Available labels (today, matching the current supported_nodes.yaml):
-#   ReadsArbitraryFile, CreatesLargeOutputs, DisabledOnCloud, WritesToDisk,
-#   NetworkAccess, Stateful, HasCustomEndpoints, RequiresExternalAPI,
-#   PathParsing, DuplicateOfCoreNode
-#
-# Example: a restrictive policy that disables nodes that touch arbitrary paths
-# or the network -- safe defaults for an untrusted local deployment.
+# Uses OR logic: nodes matching ANY condition are disabled
+# Available labels: ReadsArbitraryFile, CreatesLargeOutputs, DisabledOnCloud, WritesToDisk, NetworkAccess
 disable_nodes:
   or:
-    - DisabledOnCloud: true
     - ReadsArbitraryFile: true
     - WritesToDisk: true
+    - CreatesLargeOutputs: true
+    - DisabledOnCloud: true
     - NetworkAccess: true

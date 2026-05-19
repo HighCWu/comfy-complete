@@ -53,11 +53,11 @@ echo ""
 echo "## BLOCKERS"
 echo ""
 
-# eval() - exclude method calls like model.eval(), self.eval()
-COUNT=$($RG -c '(?<!\.)eval\(' --type py -P 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
+# eval()
+COUNT=$($RG -c 'eval\(' --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
 if [ "$COUNT" -gt 0 ]; then
     echo "BLOCKER: eval() - $COUNT occurrences (arbitrary code execution)"
-    $RG -n '(?<!\.)eval\(' --type py -P 2>/dev/null | head -5
+    $RG -n 'eval\(' --type py 2>/dev/null | head -5
     echo ""
     BLOCKER_COUNT=$((BLOCKER_COUNT + 1))
 fi
@@ -132,7 +132,7 @@ fi
 COUNT=$($RG -c 'requests\.(get|post|put|delete)|urllib\.(request|urlopen)|httpx\.' --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
 if [ "$COUNT" -gt 0 ]; then
     echo "WARNING: network requests - $COUNT occurrences (makes external HTTP requests)"
-    echo "  NOTE: If these are model downloads, consider RuntimeModelDownload label. If general API calls, consider NetworkAccess label."
+    echo "  NOTE: If these are model downloads only, check if models are in supported_models.json - cloud pre-provisions models from GCS so the node's download code never runs."
     WARNING_COUNT=$((WARNING_COUNT + 1))
 fi
 
@@ -180,63 +180,10 @@ fi
 echo ""
 
 # ============================================================================
-# LABEL DETECTION CHECKS
+# CLOUD COMPATIBILITY CHECKS
 # ============================================================================
 
-echo "## LABEL DETECTION"
-echo ""
-
-# Runtime model downloads (RuntimeModelDownload label)
-COUNT=$($RG -c 'hf_hub_download|snapshot_download|download_url_to_file|urlretrieve.*model|from_pretrained' --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
-if [ "$COUNT" -gt 0 ]; then
-    echo "WARNING: runtime model downloads - $COUNT occurrences (consider RuntimeModelDownload label)"
-    $RG -n 'hf_hub_download|snapshot_download|download_url_to_file' --type py 2>/dev/null | head -5
-    echo ""
-    WARNING_COUNT=$((WARNING_COUNT + 1))
-fi
-
-# Runtime pip install (RuntimePipInstall label)
-COUNT=$($RG -c 'pip.*install|ensure_package|install_if_missing' --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
-if [ "$COUNT" -gt 0 ]; then
-    echo "WARNING: runtime pip install - $COUNT occurrences (consider RuntimePipInstall label)"
-    $RG -n 'pip.*install|ensure_package' --type py 2>/dev/null | head -5
-    echo ""
-    WARNING_COUNT=$((WARNING_COUNT + 1))
-fi
-
-# Hardcoded CUDA (RequiresGPU label)
-COUNT=$($RG -c "\.to\(['\"]cuda['\"]|\.cuda\(\)|torch\.device\(['\"]cuda" --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
-if [ "$COUNT" -gt 0 ]; then
-    echo "WARNING: hardcoded CUDA - $COUNT occurrences (check for CPU fallback; consider RequiresGPU label)"
-    WARNING_COUNT=$((WARNING_COUNT + 1))
-fi
-
-# Webcam access (RequiresWebcam label)
-COUNT=$($RG -c 'VideoCapture\(\s*[0-9]|VideoCapture\(\s*camera|VideoCapture\(\s*device' --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
-if [ "$COUNT" -gt 0 ]; then
-    echo "WARNING: webcam access - $COUNT occurrences (consider RequiresWebcam label)"
-    WARNING_COUNT=$((WARNING_COUNT + 1))
-fi
-
-# Clipboard access (RequiresClipboard label)
-COUNT=$($RG -c 'grabclipboard|pyperclip|clipboard' --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
-if [ "$COUNT" -gt 0 ]; then
-    echo "WARNING: clipboard access - $COUNT occurrences (consider RequiresClipboard label)"
-    WARNING_COUNT=$((WARNING_COUNT + 1))
-fi
-
-# Interactive display (RequiresDisplay label)
-COUNT=$($RG -c 'cv2\.imshow|cv2\.waitKey|plt\.show|send_sync.*prompt_user' --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
-if [ "$COUNT" -gt 0 ]; then
-    echo "WARNING: interactive display - $COUNT occurrences (consider RequiresDisplay label)"
-    WARNING_COUNT=$((WARNING_COUNT + 1))
-fi
-
-# ============================================================================
-# DEPLOYMENT COMPATIBILITY CHECKS
-# ============================================================================
-
-echo "## DEPLOYMENT COMPATIBILITY"
+echo "## CLOUD COMPATIBILITY"
 echo ""
 
 CLOUD_WARNING_COUNT=0
@@ -246,7 +193,7 @@ if [ -d "web" ] || [ -d "js" ]; then
     WEB_DIR=""
     [ -d "web" ] && WEB_DIR="web/"
     [ -d "js" ] && WEB_DIR="js/"
-    echo "INFO: Custom UI directory found - $WEB_DIR (may modify the default interface)"
+    echo "INFO: Custom UI directory found - $WEB_DIR (may modify default interface)"
     CLOUD_WARNING_COUNT=$((CLOUD_WARNING_COUNT + 1))
 fi
 
@@ -284,10 +231,10 @@ if [ "$COUNT" -gt 0 ]; then
     CLOUD_WARNING_COUNT=$((CLOUD_WARNING_COUNT + 1))
 fi
 
-# System package dependencies (not available in base image)
+# System package dependencies (not available in cloud)
 COUNT=$($RG -c 'subprocess.*\b(espeak|tesseract|imagemagick|convert)\b|os\.system.*\b(espeak|tesseract)' --type py 2>/dev/null | awk -F: '{sum += $2} END {print sum+0}')
 if [ "$COUNT" -gt 0 ]; then
-    echo "WARNING: system packages - $COUNT occurrences (may require packages not in base image)"
+    echo "WARNING: system packages - $COUNT occurrences (may require packages not in cloud)"
     $RG -n 'espeak|tesseract|imagemagick' --type py 2>/dev/null | head -5
     echo ""
     CLOUD_WARNING_COUNT=$((CLOUD_WARNING_COUNT + 1))
@@ -301,7 +248,7 @@ if [ "$COUNT" -gt 0 ]; then
 fi
 
 if [ "$CLOUD_WARNING_COUNT" -eq 0 ]; then
-    echo "No deployment compatibility issues found"
+    echo "No cloud compatibility issues found"
 fi
 
 echo ""
