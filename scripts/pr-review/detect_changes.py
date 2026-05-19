@@ -29,9 +29,6 @@ class NodePack:
     version: str = ""
     node_labels: dict[str, list[str]] = field(default_factory=dict)
     web_directory: str = ""
-    dependency_overrides: list[str] = field(default_factory=list)
-    system_dependencies: list[str] = field(default_factory=list)
-    models: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> NodePack:
@@ -41,26 +38,16 @@ class NodePack:
             version=data.get("version", ""),
             node_labels=data.get("node_labels", {}),
             web_directory=data.get("web_directory", ""),
-            dependency_overrides=data.get("dependency_overrides", []),
-            system_dependencies=data.get("system_dependencies", []),
-            models=data.get("models", []),
         )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        result = {
+        return {
             "name": self.name,
             "version": self.version,
             "node_labels": self.node_labels,
             "web_directory": self.web_directory,
         }
-        if self.dependency_overrides:
-            result["dependency_overrides"] = self.dependency_overrides
-        if self.system_dependencies:
-            result["system_dependencies"] = self.system_dependencies
-        if self.models:
-            result["models"] = self.models
-        return result
 
 
 @dataclass
@@ -210,24 +197,16 @@ def detect_changes(base_ref: str, config_path: str) -> ChangeReport:
 
         # Check if anything changed
         if base_pack.to_dict() != head_pack.to_dict():
-            base_dict: dict[str, Any] = {
-                "version": base_pack.version,
-                "node_labels": base_pack.node_labels,
-            }
-            if base_pack.dependency_overrides:
-                base_dict["dependency_overrides"] = base_pack.dependency_overrides
-
-            head_dict: dict[str, Any] = {
-                "version": head_pack.version,
-                "node_labels": head_pack.node_labels,
-            }
-            if head_pack.dependency_overrides:
-                head_dict["dependency_overrides"] = head_pack.dependency_overrides
-
             update_info: dict[str, Any] = {
                 "name": name,
-                "base": base_dict,
-                "head": head_dict,
+                "base": {
+                    "version": base_pack.version,
+                    "node_labels": base_pack.node_labels,
+                },
+                "head": {
+                    "version": head_pack.version,
+                    "node_labels": head_pack.node_labels,
+                },
             }
 
             # Check for version change

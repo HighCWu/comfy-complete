@@ -1,0 +1,6 @@
+# Cloud-only node packs not part of the open-source comfy-complete distribution.
+# Consumed by sync_custom_node_extensions.py (web extensions) and the sidecar Dockerfile (install).
+
+node_packs:
+  - name: comfyui-datadog-monitor
+    version: "1.0.4"

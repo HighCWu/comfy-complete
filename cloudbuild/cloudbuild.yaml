@@ -1,0 +1,305 @@
+# cloudbuild.yaml
+#
+# Multi-layer Docker image build with content-based caching.
+#
+# Build hierarchy:
+#   1. sam2 (wheel builder) - rebuilds when sam2.Dockerfile changes
+#   2. comfyui-core-deps - rebuilds when sam2 OR external requirements.txt changes
+#   3. comfy-complete - rebuilds when comfyui-core-deps OR comfy_complete.Dockerfile changes
+#
+# Each layer is tagged with a content hash to enable cache reuse across commits.
+
+substitutions:
+  _REPOSITORY: "comfy-complete"
+  _BASE_IMAGE: "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel"
+  _SAM2_COMMIT: "2b90b9f5ceec907a1c18123530e92e794ad901a4"
+  _CONTEXT: "containers/comfy-complete/docker"
+
+steps:
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'calculate-hashes'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+        mkdir -p /workspace
+
+        echo "=========================================="
+        echo "Calculating content hashes..."
+        echo "=========================================="
+
+        # Hash for sam2: based on BASE_IMAGE + SAM2_COMMIT + sam2.Dockerfile
+        SAM2_CONTENT="${_BASE_IMAGE}:${_SAM2_COMMIT}:$(cat ${_CONTEXT}/Dockerfiles/sam2.Dockerfile | sha256sum | cut -d' ' -f1)"
+        SAM2_HASH=$(echo -n "$${SAM2_CONTENT}" | sha256sum | cut -d' ' -f1)
+        SAM2_HASH_SHORT=$${SAM2_HASH:0:12}
+        echo "$${SAM2_HASH}" > /workspace/sam2_hash.txt
+        echo "$${SAM2_HASH_SHORT}" > /workspace/sam2_hash_short.txt
+        echo "sam2 hash: $${SAM2_HASH_SHORT}"
+
+        # Hash for comfy-complete: based on SAM2_HASH + comfy_complete.Dockerfile + scripts/ + versions/
+        CC_CONTENT="$${SAM2_HASH}:$(cat ${_CONTEXT}/Dockerfiles/comfy_complete.Dockerfile | sha256sum | cut -d' ' -f1):$(tar --sort=name --owner=0 --group=0 --mtime='1970-01-01 00:00:00' --mode='a+rwX' -cf - ${_CONTEXT}/scripts ${_CONTEXT}/versions | sha256sum)"
+        CC_HASH=$(echo -n "$${CC_CONTENT}" | sha256sum | cut -d' ' -f1)
+        CC_HASH_SHORT=$${CC_HASH:0:12}
+        echo "$${CC_HASH}" > /workspace/cc_hash.txt
+        echo "$${CC_HASH_SHORT}" > /workspace/cc_hash_short.txt
+        echo "comfy-complete hash: $${CC_HASH_SHORT}"
+
+  # ============================================================================
+  # STEP 2: Check which images already exist
+  # ============================================================================
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'check-existing-images'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        SAM2_HASH_SHORT=$(cat /workspace/sam2_hash_short.txt)
+        CC_HASH_SHORT=$(cat /workspace/cc_hash_short.txt)
+
+        REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}"
+
+        echo "Checking for existing images..."
+
+        # Check sam2
+        SAM2_IMAGE="$${REGISTRY}/sam2:hash-$${SAM2_HASH_SHORT}"
+        if gcloud artifacts docker images describe "$${SAM2_IMAGE}" 2>/dev/null; then
+          echo "SAM2_EXISTS=true" > /workspace/sam2_status.txt
+          echo "✓ sam2 image exists"
+        else
+          echo "SAM2_EXISTS=false" > /workspace/sam2_status.txt
+          echo "✗ sam2 image not found, will build"
+        fi
+
+        # Check comfy-complete
+        CC_IMAGE="$${REGISTRY}/sam2:hash-$${CC_HASH_SHORT}"
+        if gcloud artifacts docker images describe "$${CC_IMAGE}" 2>/dev/null; then
+          echo "CC_EXISTS=true" > /workspace/cc_status.txt
+          echo "✓ comfy-complete image exists"
+        else
+          echo "CC_EXISTS=false" > /workspace/cc_status.txt
+          echo "✗ comfy-complete image not found, will build"
+        fi
+
+  # ============================================================================
+  # STEP 3: Build sam2 (wheel builder)
+  # ============================================================================
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-sam2'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        SAM2_STATUS=$(cat /workspace/sam2_status.txt)
+        SAM2_HASH_SHORT=$(cat /workspace/sam2_hash_short.txt)
+        REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}"
+
+        if [ "$${SAM2_STATUS}" = "SAM2_EXISTS=true" ]; then
+          echo "Skipping sam2 build - image already exists"
+          exit 0
+        fi
+
+        echo "Building sam2..."
+
+        docker build \
+          --build-arg BASE_IMAGE=${_BASE_IMAGE} \
+          --build-arg SAM2_COMMIT=${_SAM2_COMMIT} \
+          -t "$${REGISTRY}/sam2:hash-$${SAM2_HASH_SHORT}" \
+          -t "$${REGISTRY}/sam2:${SHORT_SHA}" \
+          -t "$${REGISTRY}/sam2:${COMMIT_SHA}" \
+          -t "$${REGISTRY}/sam2:latest" \
+          -f ${_CONTEXT}/Dockerfiles/sam2.Dockerfile \
+          ${_CONTEXT}
+
+        echo "sam2 build complete"
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-sam2'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        SAM2_STATUS=$(cat /workspace/sam2_status.txt)
+        SAM2_HASH_SHORT=$(cat /workspace/sam2_hash_short.txt)
+        REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}"
+
+        if [ "$${SAM2_STATUS}" = "SAM2_EXISTS=true" ]; then
+          echo "Skipping sam2 push"
+          exit 0
+        fi
+
+        echo "Pushing sam2..."
+        docker push "$${REGISTRY}/sam2:hash-$${SAM2_HASH_SHORT}"
+        docker push "$${REGISTRY}/sam2:${SHORT_SHA}"
+        docker push "$${REGISTRY}/sam2:${COMMIT_SHA}"
+        docker push "$${REGISTRY}/sam2:latest"
+
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'tag-sam2-existing'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        SAM2_STATUS=$(cat /workspace/sam2_status.txt)
+        SAM2_HASH_SHORT=$(cat /workspace/sam2_hash_short.txt)
+        REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}"
+
+        if [ "$${SAM2_STATUS}" = "SAM2_EXISTS=false" ]; then
+          echo "Skipping - sam2 was newly built"
+          exit 0
+        fi
+
+        echo "Adding commit tags to existing sam2 image..."
+        SOURCE="$${REGISTRY}/sam2:hash-$${SAM2_HASH_SHORT}"
+
+        gcloud artifacts docker tags add "$${SOURCE}" "$${REGISTRY}/sam2:${COMMIT_SHA}" || true
+        gcloud artifacts docker tags add "$${SOURCE}" "$${REGISTRY}/sam2:${SHORT_SHA}" || true
+        gcloud artifacts docker tags add "$${SOURCE}" "$${REGISTRY}/sam2:latest" || true
+
+  # ============================================================================
+  # STEP 5: Build comfy-complete
+  # ============================================================================
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-complete'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        SAM2_HASH_SHORT=$(cat /workspace/sam2_hash_short.txt)
+        CC_STATUS=$(cat /workspace/cc_status.txt)
+        CC_HASH_SHORT=$(cat /workspace/cc_hash_short.txt)
+        REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}"
+
+        if [ "$${CC_STATUS}" = "CC_EXISTS=true" ]; then
+          echo "Skipping comfy-complete build - image already exists"
+          exit 0
+        fi
+
+        echo "Building comfy-complete..."
+
+        docker build \
+          --build-arg BASE_IMAGE="${_BASE_IMAGE}" \
+          --build-arg SAM2_IMAGE="$${REGISTRY}/sam2:hash-$${SAM2_HASH_SHORT}" \
+          --build-arg COMFYUI_REF=$(yq -r '.pinned.comfyui.ref' ${_CONTEXT}/versions/version_lock.yaml) \
+          -t "$${REGISTRY}/comfy-complete:hash-$${CC_HASH_SHORT}" \
+          -t "$${REGISTRY}/comfy-complete:${SHORT_SHA}" \
+          -t "$${REGISTRY}/comfy-complete:${COMMIT_SHA}" \
+          -t "$${REGISTRY}/comfy-complete:latest" \
+          -f ${_CONTEXT}/Dockerfiles/comfy_complete.Dockerfile \
+          ${_CONTEXT}
+
+        echo "comfy-complete build complete"
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-complete'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        CC_STATUS=$(cat /workspace/cc_status.txt)
+        CC_HASH_SHORT=$(cat /workspace/cc_hash_short.txt)
+        REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}"
+
+        if [ "$${CC_STATUS}" = "CC_EXISTS=true" ]; then
+          echo "Skipping comfy-complete push"
+          exit 0
+        fi
+
+        echo "Pushing comfy-complete..."
+        docker push "$${REGISTRY}/comfy-complete:hash-$${CC_HASH_SHORT}"
+        docker push "$${REGISTRY}/comfy-complete:${SHORT_SHA}"
+        docker push "$${REGISTRY}/comfy-complete:${COMMIT_SHA}"
+        docker push "$${REGISTRY}/comfy-complete:latest"
+
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'tag-complete-existing'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+
+        CC_STATUS=$(cat /workspace/cc_status.txt)
+        CC_HASH_SHORT=$(cat /workspace/cc_hash_short.txt)
+        REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}"
+
+        if [ "$${CC_STATUS}" = "CC_EXISTS=false" ]; then
+          echo "Skipping - comfy-complete was newly built"
+          exit 0
+        fi
+
+        echo "Adding commit tags to existing comfy-complete image..."
+        SOURCE="$${REGISTRY}/comfy-complete:hash-$${CC_HASH_SHORT}"
+
+        gcloud artifacts docker tags add "$${SOURCE}" "$${REGISTRY}/comfy-complete:${COMMIT_SHA}" || true
+        gcloud artifacts docker tags add "$${SOURCE}" "$${REGISTRY}/comfy-complete:${SHORT_SHA}" || true
+        gcloud artifacts docker tags add "$${SOURCE}" "$${REGISTRY}/comfy-complete:latest" || true
+
+  # ============================================================================
+  # STEP 6: Summary
+  # ============================================================================
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'summary'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "=========================================="
+        echo "Build Summary"
+        echo "=========================================="
+        echo ""
+        echo "Configuration:"
+        echo "  Base image:  ${_BASE_IMAGE}"
+        echo "  SAM2 commit: ${_SAM2_COMMIT}"
+        echo "  ComfyUI ref: $(yq -r '.pinned.comfyui.ref' ${_CONTEXT}/versions/version_lock.yaml)"
+        echo ""
+        echo "Content Hashes:"
+        echo "  sam2:             $(cat /workspace/sam2_hash_short.txt)"
+        echo "  comfy-complete:    $(cat /workspace/cc_hash_short.txt)"
+        echo ""
+        echo "Build Actions:"
+
+        SAM2_STATUS=$(cat /workspace/sam2_status.txt)
+        CC_STATUS=$(cat /workspace/cc_status.txt)
+
+        if [ "$${SAM2_STATUS}" = "SAM2_EXISTS=true" ]; then
+          echo "  sam2:             ♻️  Reused existing (added commit tags)"
+        else
+          echo "  sam2:             🔨 Built new image"
+        fi
+
+        if [ "$${CC_STATUS}" = "CC_EXISTS=true" ]; then
+          echo "  comfy-complete:    ♻️  Reused existing (added commit tags)"
+        else
+          echo "  comfy-complete:    🔨 Built new image"
+        fi
+
+        echo ""
+        echo "Images available at:"
+        REGISTRY="us-central1-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}"
+        echo "  $${REGISTRY}/sam2:latest"
+        echo "  $${REGISTRY}/comfy-complete:latest"
+        echo "=========================================="
+
+images: []
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  env:
+    - DOCKER_BUILDKIT=1
+  pool:
+    name: projects/${PROJECT_ID}/locations/us-central1/workerPools/cicd-worker-pool
+
+timeout: 3600s

@@ -1,10 +1,7 @@
 # Comfy Complete - Version Lock
-#
-# Authoritative source for ComfyUI core, frontend, and workflow-template refs
-# bundled in this distribution. Consumers (cloud, local installs, downstream
-# builds) read these refs to clone matching ComfyUI components.
-#
-# Bumping a ref here is a deliberate PR — same review surface as a go.mod bump.
+# This file pins the exact versions of ComfyUI core components.
+# Update these versions when upgrading the distribution.
+# Resync: trigger object_info regeneration after v0.18.3 merge race
 
 pinned:
   comfyui:
@@ -15,3 +12,21 @@ pinned:
 
   comfyui_workflow_templates:
     ref: 0.9.75
+
+  # ----- Future: external comfy-complete pin (currently unused) -----
+  # When comfy-complete moves out of this repo and is built as an external
+  # artifact, set the pin below. The inference cloudbuilds (cc-resolve in
+  # cloudbuild.yaml / cloudbuild-pr.yaml / cloudbuild-release.yaml) will detect
+  # it and consume the pinned image directly, skipping the in-repo content-hash
+  # build path entirely.
+  #
+  # Bumping this is a deliberate PR (same review surface as a go.mod bump). A
+  # scheduled bot can open draft bump PRs analogous to sync-oss-openapi.yml.
+  #
+  # Pin both tag (human-readable) and digest (immutable). Builds resolve by
+  # digest; tag is informational only.
+  #
+  # comfy_complete:
+  #   image: us-central1-docker.pkg.dev/comfy-cloud-dev/comfy-inference/comfy-complete-base
+  #   tag: v1.2.3                    # informational
+  #   digest: sha256:abc123...       # what builds actually use
