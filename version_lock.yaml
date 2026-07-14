@@ -1,17 +1,16 @@
 # Comfy Complete - Version Lock
 # This file pins the exact versions of ComfyUI core components.
 # Update these versions when upgrading the distribution.
-# Resync: trigger object_info regeneration after v0.18.3 merge race
 
 pinned:
   comfyui:
-    ref: v0.21.1
+    ref: v0.27.0
 
   comfyui_frontend_package:
-    ref: 1.43.18
+    ref: 1.45.20
 
   comfyui_workflow_templates:
-    ref: 0.9.75
+    ref: 0.11.1
 
   # ----- Future: external comfy-complete pin (currently unused) -----
   # When comfy-complete moves out of this repo and is built as an external
