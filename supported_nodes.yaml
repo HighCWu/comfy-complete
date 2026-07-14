@@ -1105,3 +1105,9 @@ node_packs:
 
   - name: bfsnodes
     version: "1.10.8"
+
+  - name: WhatDreamsCost-ComfyUI
+    version: "2.0.5"
+
+  - name: licon-msr
+    version: "1.0.0"
