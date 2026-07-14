@@ -122,6 +122,18 @@ def install_comfyui_manager(comfy_path: str, pip_cmd: list[str]) -> bool:
     return True
 
 
+def _list_custom_node_dirs(comfy_path: str) -> set[str]:
+    """Return set of directory names in custom_nodes/."""
+    cn_dir = os.path.join(comfy_path, "custom_nodes")
+    if not os.path.exists(cn_dir):
+        return set()
+    return {
+        item
+        for item in os.listdir(cn_dir)
+        if os.path.isdir(os.path.join(cn_dir, item)) and not item.startswith(".")
+    }
+
+
 def install_custom_nodes(
     config: dict,
     comfy_cli_path: str,
@@ -152,15 +164,35 @@ def install_custom_nodes(
         print(f"Installing {name}...")
         print(f"  Command: {' '.join(cmd)}")
 
+        # Snapshot custom_nodes/ before install to detect silent failures
+        dirs_before = _list_custom_node_dirs(comfy_path)
+
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"  ERROR: {result.stderr}")
+            print(f"  ERROR (exit {result.returncode}): {result.stderr.strip()}")
             failed.append({"name": name, "version": version, "error": result.stderr})
-            # Exit on first failure to catch issues early
             sys.exit(1)
-        else:
-            print(f"  SUCCESS")
-            successful.append(name)
+
+        # Verify a new directory was actually created — comfy-cli may
+        # return exit 0 even when the install fails (registry miss,
+        # clone error, etc.).  Comparing before/after sets is robust
+        # regardless of what directory name comfy-cli chooses.
+        dirs_after = _list_custom_node_dirs(comfy_path)
+        new_dirs = dirs_after - dirs_before
+
+        if not new_dirs:
+            print(f"  ERROR: comfy-cli returned success but created no directory")
+            print(f"  stdout: {result.stdout.strip()[-800:]}")
+            print(f"  stderr: {result.stderr.strip()[-800:]}")
+            failed.append({
+                "name": name,
+                "version": version,
+                "error": f"Silent failure — no directory created. stdout={result.stdout}, stderr={result.stderr}",
+            })
+            sys.exit(1)
+
+        print(f"  SUCCESS (created: {', '.join(sorted(new_dirs))})")
+        successful.append(name)
 
     return successful, failed
 
@@ -195,8 +227,13 @@ def verify_installations(config: dict, comfy_path: str) -> list[str]:
             # Extract repo name from URL like https://github.com/user/repo@commit
             expected_dir = expected_dir.split("/")[-1].split("@")[0].lower()
 
+        # Normalize hyphens to underscores — comfy-cli may use either
+        # (e.g. registry ID "comfyui-bfsnodes" → dir "ComfyUI-BFSNodes"
+        # or "comfyui_bfsnodes" depending on the source).
+        norm_expected = expected_dir.replace("-", "_")
         found = any(
-            expected_dir in installed_dir or installed_dir in expected_dir
+            norm_expected in installed_dir.replace("-", "_")
+            or installed_dir.replace("-", "_") in norm_expected
             for installed_dir in installed_dirs
         )
 
