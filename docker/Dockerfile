@@ -175,6 +175,12 @@ RUN --mount=type=cache,target=/root/.cache/uv,id=uv-cache \
 COPY --chmod=644 supported_nodes.yaml /app/supported_nodes.yaml
 COPY --chmod=755 scripts/install_custom_nodes.py /app/install_custom_nodes.py
 
+# Fix ownership of XDG directories created by root's uv pip install in Layer 4.
+# uv writes its cache to $XDG_CACHE_HOME/uv, which is /app/comfyui/models/_xdgcache/uv.
+# Without this chown, the comfy user in Layer 5 gets "Permission denied" when uv
+# tries to initialize the cache during custom node installation.
+RUN chown -R comfy:comfy /app/comfyui/models/_xdgcache /app/comfyui/models/_xdgdata /app/comfyui/models/_xdgconfig
+
 # Switch to comfy user for custom nodes installation (files created with correct ownership)
 USER comfy
 
