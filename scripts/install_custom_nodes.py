@@ -28,7 +28,14 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+# Number of retries for transient network failures during node install.
+# Git clone / registry fetch can fail with "Remote end closed connection"
+# or similar errors that resolve on retry.
+MAX_INSTALL_RETRIES = 3
+RETRY_BASE_DELAY = 5  # seconds; doubled each retry
 
 # Check for yaml support
 try:
@@ -164,35 +171,55 @@ def install_custom_nodes(
         print(f"Installing {name}...")
         print(f"  Command: {' '.join(cmd)}")
 
-        # Snapshot custom_nodes/ before install to detect silent failures
-        dirs_before = _list_custom_node_dirs(comfy_path)
+        installed = False
+        # Snapshot once before all retry attempts — used to detect partial
+        # clones left behind by a failed attempt so they can be cleaned up.
+        original_dirs = _list_custom_node_dirs(comfy_path)
+        for attempt in range(1, MAX_INSTALL_RETRIES + 1):
+            result = subprocess.run(cmd, capture_output=True, text=True)
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  ERROR (exit {result.returncode}): {result.stderr.strip()}")
-            failed.append({"name": name, "version": version, "error": result.stderr})
+            # Verify a new directory was actually created — comfy-cli may
+            # return exit 0 even when the install fails (registry miss,
+            # clone error, etc.).  Comparing against the original snapshot
+            # (before any attempts) is robust across retries.
+            dirs_after = _list_custom_node_dirs(comfy_path)
+            new_dirs = dirs_after - original_dirs
+
+            if result.returncode == 0 and new_dirs:
+                print(f"  SUCCESS (created: {', '.join(sorted(new_dirs))})")
+                successful.append(name)
+                installed = True
+                break
+
+            # Install failed — clean up any partial directories before retry
+            partial_dirs = dirs_after - original_dirs
+            for d in partial_dirs:
+                partial_path = os.path.join(comfy_path, "custom_nodes", d)
+                print(f"  Cleaning up partial clone: {d}")
+                shutil.rmtree(partial_path, ignore_errors=True)
+
+            if result.returncode != 0:
+                print(f"  ERROR (exit {result.returncode}): {result.stderr.strip()[-800:]}")
+            else:
+                print(f"  ERROR: comfy-cli returned success but created no directory")
+                print(f"  stdout: {result.stdout.strip()[-800:]}")
+                print(f"  stderr: {result.stderr.strip()[-800:]}")
+
+            if attempt < MAX_INSTALL_RETRIES:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                print(f"  Retrying in {delay}s (attempt {attempt + 1}/{MAX_INSTALL_RETRIES})...")
+                time.sleep(delay)
+            else:
+                failed.append({
+                    "name": name,
+                    "version": version,
+                    "error": f"Failed after {MAX_INSTALL_RETRIES} attempts. stdout={result.stdout}, stderr={result.stderr}",
+                })
+                sys.exit(1)
+
+        if not installed:
+            # Should not reach here — sys.exit handles failure above
             sys.exit(1)
-
-        # Verify a new directory was actually created — comfy-cli may
-        # return exit 0 even when the install fails (registry miss,
-        # clone error, etc.).  Comparing before/after sets is robust
-        # regardless of what directory name comfy-cli chooses.
-        dirs_after = _list_custom_node_dirs(comfy_path)
-        new_dirs = dirs_after - dirs_before
-
-        if not new_dirs:
-            print(f"  ERROR: comfy-cli returned success but created no directory")
-            print(f"  stdout: {result.stdout.strip()[-800:]}")
-            print(f"  stderr: {result.stderr.strip()[-800:]}")
-            failed.append({
-                "name": name,
-                "version": version,
-                "error": f"Silent failure — no directory created. stdout={result.stdout}, stderr={result.stderr}",
-            })
-            sys.exit(1)
-
-        print(f"  SUCCESS (created: {', '.join(sorted(new_dirs))})")
-        successful.append(name)
 
     return successful, failed
 
