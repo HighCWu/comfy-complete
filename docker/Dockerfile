@@ -65,6 +65,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     jq \
     dumb-init \
+    libgomp1 \
+    espeak-ng \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user early (so we can create files owned by this user)
@@ -189,6 +191,31 @@ RUN touch ${COMFY_PATH}/custom_nodes/skip_download_model
 
 # Install custom nodes with --no-deps for production builds
 RUN cd ${COMFY_PATH} && ${PYTHON_PATH} /app/install_custom_nodes.py --no-deps
+
+# =============================================================================
+# Layer 5b: Pre-download models that nodes fetch at import time
+# =============================================================================
+# Some custom nodes download model files during __init__.py import, which
+# blocks ComfyUI startup and can hang in air-gapped environments.
+# Pre-bake these models into the image so startup is fast and reliable.
+
+# comfyui_face_parsing: downloads 339MB model + config at import time
+RUN mkdir -p ${COMFY_PATH}/models/face_parsing ${COMFY_PATH}/models/ultralytics/bbox && \
+    wget -q -O ${COMFY_PATH}/models/face_parsing/model.safetensors \
+        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/model.safetensors" && \
+    wget -q -O ${COMFY_PATH}/models/face_parsing/config.json \
+        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/config.json" && \
+    wget -q -O ${COMFY_PATH}/models/face_parsing/preprocessor_config.json \
+        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/preprocessor_config.json" && \
+    wget -q -O ${COMFY_PATH}/models/ultralytics/bbox/face_yolov8m.pt \
+        "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt"
+
+# onebuttonprompt: __init__.py expects dir named "OneButtonPrompt" but
+# comfy-cli installs as lowercase "onebuttonprompt"
+RUN if [ -d "${COMFY_PATH}/custom_nodes/onebuttonprompt" ] && \
+       [ ! -d "${COMFY_PATH}/custom_nodes/OneButtonPrompt" ]; then \
+        ln -s onebuttonprompt ${COMFY_PATH}/custom_nodes/OneButtonPrompt; \
+    fi
 
 # =============================================================================
 # Layer 6: Post-install configuration (build config options)
