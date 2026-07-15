@@ -107,13 +107,22 @@ def install_comfyui_manager(comfy_path: str, pip_cmd: list[str]) -> bool:
         return True
 
     print("ComfyUI Manager not found, installing...")
-    result = subprocess.run(
-        ["git", "clone", "https://github.com/ltdrdata/ComfyUI-Manager.git", manager_path],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"Error cloning ComfyUI Manager: {result.stderr}")
+    for attempt in range(1, MAX_INSTALL_RETRIES + 1):
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1",
+             "https://github.com/ltdrdata/ComfyUI-Manager.git", manager_path],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            break
+        print(f"Error cloning ComfyUI Manager (attempt {attempt}/{MAX_INSTALL_RETRIES}): {result.stderr.strip()[-400:]}")
+        shutil.rmtree(manager_path, ignore_errors=True)
+        if attempt < MAX_INSTALL_RETRIES:
+            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            print(f"Retrying in {delay}s...")
+            time.sleep(delay)
+    else:
         return False
 
     # Install requirements if they exist

@@ -186,6 +186,10 @@ RUN chown -R comfy:comfy /app/comfyui/models/_xdgcache /app/comfyui/models/_xdgd
 # Switch to comfy user for custom nodes installation (files created with correct ownership)
 USER comfy
 
+# Git settings: abort stalled connections so retry logic kicks in faster
+ENV GIT_HTTP_LOW_SPEED_LIMIT=1000
+ENV GIT_HTTP_LOW_SPEED_TIME=20
+
 # Create the skip_download_model file to prevent model downloads during install
 RUN touch ${COMFY_PATH}/custom_nodes/skip_download_model
 
