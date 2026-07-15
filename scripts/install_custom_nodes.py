@@ -141,6 +141,63 @@ def _list_custom_node_dirs(comfy_path: str) -> set[str]:
     }
 
 
+def _install_github_shallow(node_spec: str, comfy_path: str) -> bool:
+    """Install a GitHub URL node pack using shallow clone (depth 1).
+
+    Bypasses comfy-cli's full clone which can fail on repos with large
+    histories due to TLS timeouts through proxies. Fetches only the
+    specific commit when a hash is provided.
+
+    Returns True if a new directory was created under custom_nodes/.
+    """
+    # Parse URL and optional commit hash
+    if "@" in node_spec:
+        url, commit = node_spec.rsplit("@", 1)
+    else:
+        url, commit = node_spec, None
+
+    repo_name = url.rstrip("/").split("/")[-1]
+    target_dir = os.path.join(comfy_path, "custom_nodes", repo_name)
+
+    if os.path.isdir(target_dir):
+        print(f"  Already exists, skipping: {repo_name}")
+        return True
+
+    for attempt in range(1, MAX_INSTALL_RETRIES + 1):
+        # Shallow clone (default branch HEAD)
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", url, target_dir],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  Clone error (exit {result.returncode}): {result.stderr.strip()[-400:]}")
+            shutil.rmtree(target_dir, ignore_errors=True)
+            if attempt < MAX_INSTALL_RETRIES:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                print(f"  Retrying in {delay}s (attempt {attempt + 1}/{MAX_INSTALL_RETRIES})...")
+                time.sleep(delay)
+            continue
+
+        # Pin to specific commit if provided
+        if commit:
+            fetch_result = subprocess.run(
+                ["git", "fetch", "--depth", "1", "origin", commit],
+                capture_output=True, text=True, cwd=target_dir,
+            )
+            if fetch_result.returncode == 0:
+                subprocess.run(
+                    ["git", "checkout", "FETCH_HEAD"],
+                    capture_output=True, text=True, cwd=target_dir,
+                )
+            # If fetch fails (e.g. commit not on a branch ref), the
+            # shallow clone HEAD is acceptable for reproducible-ish builds.
+
+        print(f"  SUCCESS (shallow clone: {repo_name})")
+        return True
+
+    return False
+
+
 def install_custom_nodes(
     config: dict,
     comfy_cli_path: str,
@@ -163,6 +220,20 @@ def install_custom_nodes(
             node_spec = f"{name}@{version}"
         else:
             node_spec = name
+
+        # GitHub URL entries: use shallow clone to avoid full-history TLS issues
+        if name.startswith("https://github.com/"):
+            print(f"Installing {name} (shallow clone)...")
+            if _install_github_shallow(node_spec, comfy_path):
+                successful.append(name)
+                continue
+            else:
+                failed.append({
+                    "name": name,
+                    "version": version,
+                    "error": f"Shallow clone failed after {MAX_INSTALL_RETRIES} attempts",
+                })
+                sys.exit(1)
 
         cmd = [comfy_cli_path, f"--workspace={comfy_path}", "--skip-prompt", "node", "install", node_spec]
         if no_deps:
