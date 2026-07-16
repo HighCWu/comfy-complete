@@ -12,12 +12,31 @@ env:
 jobs:
   build-sageattn:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
-    outputs:
-      skipped: ${{ steps.check.outputs.skipped }}
     steps:
+      - name: Free disk space and move Docker data to /mnt
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/share/edge \
+            /usr/local/share/firefox
+          docker system prune -af --volumes || true
+          sudo systemctl stop docker
+          sudo rm -rf /var/lib/docker
+          sudo mkdir -p /mnt/docker-data
+          sudo ln -s /mnt/docker-data /var/lib/docker
+          sudo systemctl start docker
+          echo "=== Disk space after cleanup ==="
+          df -h / /mnt /var/lib/docker
+
       - uses: actions/checkout@v4
 
       - name: Set image name (lowercase)
@@ -41,35 +60,22 @@ jobs:
             echo "Image not found — will build"
           fi
 
-      - name: Free disk space
-        if: steps.check.outputs.skipped != 'true'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/share/powershell
-          docker system prune -af --volumes || true
-          echo "=== Disk space ==="
-          df -h /
-
-      - uses: docker/setup-buildx-action@v3
-        if: steps.check.outputs.skipped != 'true'
-
       - name: Build and push sageattn wheels
         if: steps.check.outputs.skipped != 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/sageattn.Dockerfile
-          push: true
-          tags: |
-            ${{ steps.img.outputs.name }}:${{ env.SAGEATTN_VERSION }}
-            ${{ steps.img.outputs.name }}:latest
-          cache-from: type=gha,scope=sageattn
-          cache-to: type=gha,scope=sageattn,mode=max
-          build-args: SAGEATTN_VERSION=${{ env.SAGEATTN_VERSION }}
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            -f docker/sageattn.Dockerfile \
+            --build-arg SAGEATTN_VERSION=${{ env.SAGEATTN_VERSION }} \
+            -t ${{ steps.img.outputs.name }}:${{ env.SAGEATTN_VERSION }} \
+            -t ${{ steps.img.outputs.name }}:latest \
+            .
+          docker push ${{ steps.img.outputs.name }}:${{ env.SAGEATTN_VERSION }}
+          docker push ${{ steps.img.outputs.name }}:latest
 
   build-base:
     needs: build-sageattn
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -121,6 +127,7 @@ jobs:
   build-runpod:
     needs: build-base
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
