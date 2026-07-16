@@ -15,8 +15,6 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
@@ -27,6 +25,8 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
           remove-docker-images: 'true'
+
+      - uses: actions/checkout@v4
 
       - name: Check disk space
         run: df -h
@@ -63,8 +63,6 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
@@ -75,6 +73,8 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
           remove-docker-images: 'true'
+
+      - uses: actions/checkout@v4
 
       - name: Check disk space
         run: df -h
