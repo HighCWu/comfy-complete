@@ -1,7 +1,7 @@
 # SageAttention multi-arch wheel builder
 #
 # Builds a single wheel with CUDA kernels for ALL supported GPU architectures
-# (sm_80, sm_86, sm_89, sm_90, sm_120). Run on CI without GPU — v2.2.0+
+# (sm_80, sm_86, sm_89, sm_90). Run on CI without GPU — v2.2.0+
 # setup.py reads TORCH_CUDA_ARCH_LIST env var natively.
 #
 # Output: scratch image containing only /wheels/*.whl
@@ -21,9 +21,12 @@ FROM ${BASE_IMAGE} AS builder
 ENV PYTHONDONTWRITEBYTECODE=1
 ARG SAGEATTN_VERSION=2.2.0
 
-# Target GPU architectures (Ampere/Ada/Hopper/Blackwell)
-# v2.2.0+ setup.py reads TORCH_CUDA_ARCH_LIST — no patching needed.
-ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"
+# Target GPU architectures (Ampere/Ada/Hopper)
+# sm_120 (Blackwell) excluded: v2.2.0's sm90 kernel uses wgmma inline PTX
+# guarded by `#if __CUDA_ARCH__ >= 900`, which wrongly includes sm_120 (1200).
+# sm_120 doesn't support wgmma → ptxas fatal error. RTX 50xx falls back to
+# PyTorch native attention. Revisit when SageAttention fixes sm_120 support.
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
 # Cap build parallelism for CI runners (2 vCPU / 7 GB RAM).
 # v2.2.0 hardcodes nvcc --threads=8 and defaults to MAX_JOBS=32, which
@@ -54,8 +57,8 @@ RUN git clone --depth 1 --branch v${SAGEATTN_VERSION} \
     https://github.com/thu-ml/SageAttention.git /sageattn
 
 # Build wheel — no build isolation so it reuses torch/CUDA from the base image
-# Compiles for sm_80 + sm_86 + sm_89 + sm_90 + sm_120.
-# With MAX_JOBS=2 + --threads=1 on a 2-vCPU runner: ~20-40 min, zero swap.
+# Compiles for sm_80 + sm_86 + sm_89 + sm_90.
+# With MAX_JOBS=2 + --threads=1 on a 2-vCPU runner: ~20-30 min, zero swap.
 RUN cd /sageattn && \
     pip wheel --no-build-isolation --no-deps . -w /wheels
 
