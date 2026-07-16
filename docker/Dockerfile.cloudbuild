@@ -162,15 +162,14 @@ RUN cd ${COMFY_PATH} && ${PYTHON_PATH} -u /app/install_custom_nodes.py --no-deps
 
 # Pre-bake models that custom nodes fetch at import time (would block startup)
 # comfyui_face_parsing: downloads 339MB model + config at import time
+# huggingface-cli has built-in retry + CDN awareness (wget was unreliable on CI runners)
 RUN mkdir -p ${COMFY_PATH}/models/face_parsing ${COMFY_PATH}/models/ultralytics/bbox && \
-    wget -q --tries=3 --retry-connrefused --waitretry=5 -O ${COMFY_PATH}/models/face_parsing/model.safetensors \
-        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/model.safetensors" && \
-    wget -q --tries=3 --retry-connrefused --waitretry=5 -O ${COMFY_PATH}/models/face_parsing/config.json \
-        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/config.json" && \
-    wget -q --tries=3 --retry-connrefused --waitretry=5 -O ${COMFY_PATH}/models/face_parsing/preprocessor_config.json \
-        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/preprocessor_config.json" && \
-    wget -q --tries=3 --retry-connrefused --waitretry=5 -O ${COMFY_PATH}/models/ultralytics/bbox/face_yolov8m.pt \
-        "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt"
+    huggingface-cli download jonathandinu/face-parsing \
+        model.safetensors config.json preprocessor_config.json \
+        --local-dir ${COMFY_PATH}/models/face_parsing && \
+    huggingface-cli download Bingsu/adetailer \
+        face_yolov8m.pt \
+        --local-dir ${COMFY_PATH}/models/ultralytics/bbox
 
 # onebuttonprompt: __init__.py expects "OneButtonPrompt" but comfy-cli installs lowercase
 RUN if [ -d "${COMFY_PATH}/custom_nodes/onebuttonprompt" ] && \
