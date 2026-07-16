@@ -26,12 +26,23 @@ ARG SAGEATTN_VERSION=2.2.0
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"
 
 # Cap build parallelism for CI runners (2 vCPU / 7 GB RAM).
-# v2.2.0 defaults to MAX_JOBS=32 which spawns 32 parallel nvcc processes,
-# exhausting all memory + swap -> runner loses communication (exit 143).
-# EXT_PARALLEL=1: serialize C extension builds
-# MAX_JOBS=4: max 4 parallel nvcc invocations (~4-8 GB peak, fits in 7 GB + swap)
+# v2.2.0 hardcodes nvcc --threads=8 and defaults to MAX_JOBS=32, which
+# exhausts all memory + swap on GitHub runners → "runner lost contact".
+#
+# Three previous CI attempts all died from memory/CPU starvation:
+#   - parallel=4, MAX_JOBS=32: killed after 6 min
+#   - EXT_PARALLEL=1, MAX_JOBS=32: killed after 56 min
+#   - EXT_PARALLEL=1, MAX_JOBS=4: killed after 60 min (--threads=8 still OOMs)
+#
+# The real memory driver is nvcc's --threads=8 (8 parallel .cu compilations
+# per invocation). MAX_JOBS alone can't control it. Override via
+# NVCC_APPEND_FLAGS="--threads=1" to force single-threaded nvcc.
+#
+# Final config: 2 parallel nvcc invocations × 1 thread each = ~2-4 GB peak.
+# Fits in 7 GB RAM with zero swap pressure.
 ENV EXT_PARALLEL=1
-ENV MAX_JOBS=4
+ENV MAX_JOBS=2
+ENV NVCC_APPEND_FLAGS="--threads=1"
 
 # Install git (not in pytorch:devel base) + ca-certificates for HTTPS
 RUN apt-get update && \
@@ -43,8 +54,8 @@ RUN git clone --depth 1 --branch v${SAGEATTN_VERSION} \
     https://github.com/thu-ml/SageAttention.git /sageattn
 
 # Build wheel — no build isolation so it reuses torch/CUDA from the base image
-# Compiles for sm_80 + sm_86 + sm_89 + sm_90 + sm_120 (CI: ~40-60 min with
-# MAX_JOBS=4 on 2-vCPU runner; one-time cost, reused until version bump)
+# Compiles for sm_80 + sm_86 + sm_89 + sm_90 + sm_120.
+# With MAX_JOBS=2 + --threads=1 on a 2-vCPU runner: ~20-40 min, zero swap.
 RUN cd /sageattn && \
     pip wheel --no-build-isolation --no-deps . -w /wheels
 
