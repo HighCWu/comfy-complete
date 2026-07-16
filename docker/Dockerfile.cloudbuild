@@ -171,6 +171,15 @@ RUN mkdir -p ${COMFY_PATH}/models/face_parsing ${COMFY_PATH}/models/ultralytics/
         face_yolov8m.pt \
         --local-dir ${COMFY_PATH}/models/ultralytics/bbox
 
+# comfyui_face_parsing: __init__.py reads requirements.txt at import time and
+# pip-installs anything "missing". Its requirements.txt says opencv-contrib-python-headless
+# but we ship opencv-contrib-python (non-headless, needed for guidedFilter). Patch to match
+# so the runtime check finds it satisfied and skips the pip install.
+RUN if [ -f "${COMFY_PATH}/custom_nodes/comfyui_face_parsing/requirements.txt" ]; then \
+        sed -i 's/opencv-contrib-python-headless/opencv-contrib-python/' \
+            ${COMFY_PATH}/custom_nodes/comfyui_face_parsing/requirements.txt; \
+    fi
+
 # onebuttonprompt: __init__.py expects "OneButtonPrompt" but comfy-cli installs lowercase
 RUN if [ -d "${COMFY_PATH}/custom_nodes/onebuttonprompt" ] && \
        [ ! -d "${COMFY_PATH}/custom_nodes/OneButtonPrompt" ]; then \
