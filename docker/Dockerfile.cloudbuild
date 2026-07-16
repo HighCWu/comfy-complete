@@ -38,6 +38,12 @@ RUN pip wheel --no-build-isolation --no-deps \
     "SAM-2 @ https://github.com/facebookresearch/sam2/archive/2b90b9f5ceec907a1c18123530e92e794ad901a4.tar.gz" \
     -w /wheels
 
+# Stage 0b: SageAttention pre-built wheels from ghcr.io
+# Built separately via docker/sageattn.Dockerfile. ARG before FROM is the
+# standard way to parameterize image refs (COPY --from doesn't expand ARGs).
+ARG SAGEATTN_VERSION=2.2.0
+FROM ghcr.io/highcwu/comfy-complete-sageattn:${SAGEATTN_VERSION} AS sageattn-wheels
+
 # Stage 1: Python environment setup
 # pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6 AS base
@@ -156,8 +162,7 @@ RUN uv pip install --no-deps \
 # SageAttention: multi-arch CUDA wheel (sm_80/sm_86/sm_89/sm_90)
 # Pre-built separately via docker/sageattn.Dockerfile and pushed to ghcr.io.
 # Reused as long as SAGEATTN_VERSION doesn't change — no recompilation needed.
-ARG SAGEATTN_VERSION=2.2.0
-COPY --from=ghcr.io/highcwu/comfy-complete-sageattn:${SAGEATTN_VERSION} /wheels/*.whl /tmp/sageattn-wheels/
+COPY --from=sageattn-wheels /wheels/*.whl /tmp/sageattn-wheels/
 RUN uv pip install --no-deps /tmp/sageattn-wheels/*.whl && rm -rf /tmp/sageattn-wheels
 
 # Layer 5: Custom nodes (change most frequently)
