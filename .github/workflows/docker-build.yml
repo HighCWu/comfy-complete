@@ -124,6 +124,7 @@ jobs:
         run: |
           DOCKER_BUILDKIT=1 docker build \
             -f docker/Dockerfile.cloudbuild \
+            --build-arg SAGEATTN_VERSION=${{ env.SAGEATTN_VERSION }} \
             --target base \
             -t ${{ steps.img.outputs.base }}:latest \
             -t ${{ steps.img.outputs.base }}:${{ github.sha }} \
