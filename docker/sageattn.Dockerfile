@@ -32,7 +32,7 @@ RUN git clone --depth 1 --branch v${SAGEATTN_VERSION} \
 
 # Patch setup.py: replace GPU auto-detection with hardcoded arch list
 # (CI runners have no GPU → torch.cuda.device_count() returns 0 → RuntimeError)
-COPY patch_sageattn.py /tmp/patch_sageattn.py
+COPY docker/patch_sageattn.py /tmp/patch_sageattn.py
 RUN python /tmp/patch_sageattn.py /sageattn/setup.py
 
 # Build wheel — no build isolation so it reuses torch/CUDA from the base image
