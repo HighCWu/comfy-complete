@@ -34,8 +34,15 @@ jobs:
           sudo mkdir -p /mnt/docker-data
           sudo ln -s /mnt/docker-data /var/lib/docker
           sudo systemctl start docker
+          # Add swap to prevent OOM during CUDA compilation (5-arch nvcc is memory-heavy)
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
           echo "=== Disk space after cleanup ==="
           df -h / /mnt /var/lib/docker
+          echo "=== Memory ==="
+          free -h
 
       - uses: actions/checkout@v4
 
