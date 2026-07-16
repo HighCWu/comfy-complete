@@ -163,13 +163,13 @@ RUN cd ${COMFY_PATH} && ${PYTHON_PATH} -u /app/install_custom_nodes.py --no-deps
 # Pre-bake models that custom nodes fetch at import time (would block startup)
 # comfyui_face_parsing: downloads 339MB model + config at import time
 RUN mkdir -p ${COMFY_PATH}/models/face_parsing ${COMFY_PATH}/models/ultralytics/bbox && \
-    wget -q -O ${COMFY_PATH}/models/face_parsing/model.safetensors \
+    wget -q --tries=3 --retry-connrefused --waitretry=5 -O ${COMFY_PATH}/models/face_parsing/model.safetensors \
         "https://huggingface.co/jonathandinu/face-parsing/resolve/main/model.safetensors" && \
-    wget -q -O ${COMFY_PATH}/models/face_parsing/config.json \
+    wget -q --tries=3 --retry-connrefused --waitretry=5 -O ${COMFY_PATH}/models/face_parsing/config.json \
         "https://huggingface.co/jonathandinu/face-parsing/resolve/main/config.json" && \
-    wget -q -O ${COMFY_PATH}/models/face_parsing/preprocessor_config.json \
+    wget -q --tries=3 --retry-connrefused --waitretry=5 -O ${COMFY_PATH}/models/face_parsing/preprocessor_config.json \
         "https://huggingface.co/jonathandinu/face-parsing/resolve/main/preprocessor_config.json" && \
-    wget -q -O ${COMFY_PATH}/models/ultralytics/bbox/face_yolov8m.pt \
+    wget -q --tries=3 --retry-connrefused --waitretry=5 -O ${COMFY_PATH}/models/ultralytics/bbox/face_yolov8m.pt \
         "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt"
 
 # onebuttonprompt: __init__.py expects "OneButtonPrompt" but comfy-cli installs lowercase
@@ -195,26 +195,3 @@ RUN chmod 755 /app/entrypoint.sh
 EXPOSE ${COMFY_PORT}
 WORKDIR ${COMFY_PATH}
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/entrypoint.sh"]
-
-# =============================================================================
-# Stage: runpod — RunPod serverless handler layer on top of base
-# =============================================================================
-FROM base AS runpod
-
-RUN apt-get -o Acquire::Retries=3 update && \
-    apt-get install -y --no-install-recommends openssh-server \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-RUN uv pip install "runpod~=1.7.12" websocket-client boto3
-
-COPY --chmod=755 docker/runpod/start.sh /start.sh
-COPY --chmod=644 docker/runpod/handler.py /handler.py
-COPY --chmod=644 docker/runpod/network_volume.py /network_volume.py
-COPY --chmod=644 docker/runpod/extra_model_paths.yaml /app/comfyui/extra_model_paths.yaml
-COPY --chmod=755 docker/runpod/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
-COPY --chmod=755 docker/runpod/comfy-node-install.sh /usr/local/bin/comfy-node-install
-
-RUN ln -sfn /app/comfyui /comfyui
-
-WORKDIR /app/comfyui
-ENTRYPOINT ["/usr/bin/dumb-init", "--", "/start.sh"]
