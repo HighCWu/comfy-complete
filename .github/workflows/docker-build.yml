@@ -35,26 +35,25 @@ jobs:
         id: img
         run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
 
-      - uses: docker/setup-buildx-action@v3
-
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push base
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.cloudbuild
-          target: base
-          push: true
-          tags: |
-            ${{ steps.img.outputs.base }}:latest
-            ${{ steps.img.outputs.base }}:${{ github.sha }}
-          cache-from: type=gha,scope=base
-          cache-to: type=gha,scope=base,mode=max
+      - name: Build base image
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            -f docker/Dockerfile.cloudbuild \
+            --target base \
+            -t ${{ steps.img.outputs.base }}:latest \
+            -t ${{ steps.img.outputs.base }}:${{ github.sha }} \
+            .
+
+      - name: Push base image
+        run: |
+          docker push ${{ steps.img.outputs.base }}:latest
+          docker push ${{ steps.img.outputs.base }}:${{ github.sha }}
 
   build-runpod:
     needs: build-base
@@ -83,25 +82,22 @@ jobs:
         id: img
         run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
 
-      - uses: docker/setup-buildx-action@v3
-
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push runpod
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.cloudbuild
-          target: runpod
-          push: true
-          tags: |
-            ${{ steps.img.outputs.base }}-runpod:latest
-            ${{ steps.img.outputs.base }}-runpod:${{ github.sha }}
-          cache-from: |
-            type=gha,scope=base
-            type=gha,scope=runpod
-          cache-to: type=gha,scope=runpod,mode=max
+      - name: Build runpod image
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            -f docker/Dockerfile.cloudbuild \
+            --target runpod \
+            -t ${{ steps.img.outputs.base }}-runpod:latest \
+            -t ${{ steps.img.outputs.base }}-runpod:${{ github.sha }} \
+            .
+
+      - name: Push runpod image
+        run: |
+          docker push ${{ steps.img.outputs.base }}-runpod:latest
+          docker push ${{ steps.img.outputs.base }}-runpod:${{ github.sha }}
