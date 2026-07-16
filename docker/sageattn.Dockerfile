@@ -22,10 +22,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ARG SAGEATTN_VERSION=2.2.0
 
 # Target GPU architectures (Ampere/Ada/Hopper)
-# sm_120 (Blackwell) excluded: v2.2.0's sm90 kernel uses wgmma inline PTX
-# guarded by `#if __CUDA_ARCH__ >= 900`, which wrongly includes sm_120 (1200).
-# sm_120 doesn't support wgmma → ptxas fatal error. RTX 50xx falls back to
-# PyTorch native attention. Revisit when SageAttention fixes sm_120 support.
+# sm_120 (Blackwell) excluded: wgmma unsupported on that arch (see patch below).
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
 # Cap build parallelism for CI runners (2 vCPU / 7 GB RAM).
@@ -55,6 +52,19 @@ RUN apt-get update && \
 # Clone SageAttention source at pinned tag
 RUN git clone --depth 1 --branch v${SAGEATTN_VERSION} \
     https://github.com/thu-ml/SageAttention.git /sageattn
+
+# Patch: v2.2.0 setup.py passes ALL TORCH_CUDA_ARCH_LIST archs to ALL extensions.
+# The _qattn_sm90 kernel uses Hopper-only wgmma instructions without arch guards,
+# so compiling it for sm_80/86/89 causes ptxas fatal errors.
+# Fix: give _qattn_sm90 ONLY sm_90a gencode (identified by its extra_link_args).
+RUN cd /sageattn && python3 -c "\
+with open('setup.py') as f: s = f.read(); \
+old = '\"nvcc\": NVCC_FLAGS},\n                extra_link_args'; \
+assert old in s, 'patch target not found'; \
+new = '\"nvcc\": NVCC_FLAGS[:NVCC_FLAGS.index(\"-gencode\")] + [\"-gencode\", \"arch=compute_90a,code=sm_90a\"]},\n                extra_link_args'; \
+s = s.replace(old, new); \
+open('setup.py', 'w').write(s); \
+print('Patched: _qattn_sm90 now compiles for sm_90a only')"
 
 # Build wheel — no build isolation so it reuses torch/CUDA from the base image
 # Compiles for sm_80 + sm_86 + sm_89 + sm_90.
