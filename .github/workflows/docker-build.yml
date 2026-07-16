@@ -140,6 +140,27 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Free disk space and move Docker data to /mnt
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/share/edge \
+            /usr/local/share/firefox \
+            /opt/hostedtoolcache/CodeQL
+          docker system prune -af --volumes || true
+          sudo systemctl stop docker
+          sudo rm -rf /var/lib/docker
+          sudo mkdir -p /mnt/docker-data
+          sudo ln -s /mnt/docker-data /var/lib/docker
+          sudo systemctl start docker
+          echo "=== Disk space after cleanup ==="
+          df -h / /mnt /var/lib/docker
+
       - uses: actions/checkout@v4
 
       - name: Set image base (lowercase)
