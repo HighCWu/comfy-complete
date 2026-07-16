@@ -34,11 +34,15 @@ jobs:
           sudo mkdir -p /mnt/docker-data
           sudo ln -s /mnt/docker-data /var/lib/docker
           sudo systemctl start docker
-          # Add swap as safety net during CUDA compilation
-          sudo fallocate -l 16G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
+          # Add swap as safety net during CUDA compilation.
+          # Tolerant: newer ubuntu-latest images sometimes ship a pre-active
+          # swapfile at /mnt/swapfile → ETXTBSY. Skip silently if so.
+          if ! swapon --show --name=swapfile 2>/dev/null | grep -q swapfile; then
+            sudo fallocate -l 16G /mnt/swapfile 2>/dev/null || true
+            sudo chmod 600 /mnt/swapfile 2>/dev/null || true
+            sudo mkswap /mnt/swapfile 2>/dev/null || true
+            sudo swapon /mnt/swapfile 2>/dev/null || true
+          fi
           echo "=== Disk space after cleanup ==="
           df -h / /mnt /var/lib/docker
           echo "=== Memory ==="
