@@ -153,7 +153,7 @@ RUN uv pip install --no-deps "flash-attn==2.8.3.post1" \
 RUN uv pip install --no-deps \
     "llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.42-cu128-linux-20260712/llama_cpp_python-0.3.42+cu128-cp311-cp311-linux_x86_64.whl"
 
-# SageAttention: multi-arch CUDA wheel (sm_80/sm_86/sm_89/sm_90/sm_120)
+# SageAttention: multi-arch CUDA wheel (sm_80/sm_86/sm_89/sm_90)
 # Pre-built separately via docker/sageattn.Dockerfile and pushed to ghcr.io.
 # Reused as long as SAGEATTN_VERSION doesn't change — no recompilation needed.
 ARG SAGEATTN_VERSION=2.2.0
