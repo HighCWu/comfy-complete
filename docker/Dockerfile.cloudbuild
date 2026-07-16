@@ -30,6 +30,11 @@
 #   5b. comfy-env pixi envs (GeometryPack CGAL/igl/bpy, SAM3)
 # ======================================================
 
+# Global ARG: SAGEATTN_VERSION must be declared before ALL FROM instructions
+# to be usable in FROM parameters (BuildKit requires this). The value here is a
+# fallback; CI passes --build-arg SAGEATTN_VERSION=... to override.
+ARG SAGEATTN_VERSION=2.2.0
+
 # Stage 0: SAM2 wheel builder (cached separately)
 # pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6 AS sam2-builder
@@ -39,9 +44,8 @@ RUN pip wheel --no-build-isolation --no-deps \
     -w /wheels
 
 # Stage 0b: SageAttention pre-built wheels from ghcr.io
-# Built separately via docker/sageattn.Dockerfile. ARG before FROM is the
-# standard way to parameterize image refs (COPY --from doesn't expand ARGs).
-ARG SAGEATTN_VERSION=2.2.0
+# Built separately via docker/sageattn.Dockerfile and pushed to ghcr.io.
+# SAGEATTN_VERSION is the global ARG from the top of this file.
 FROM ghcr.io/highcwu/comfy-complete-sageattn:${SAGEATTN_VERSION} AS sageattn-wheels
 
 # Stage 1: Python environment setup
