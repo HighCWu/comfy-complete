@@ -21,6 +21,11 @@ FROM ${BASE_IMAGE} AS builder
 ENV PYTHONDONTWRITEBYTECODE=1
 ARG SAGEATTN_VERSION=2.2.0
 
+# Install git (not in pytorch:devel base) + ca-certificates for HTTPS
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 # Clone SageAttention source at pinned tag
 RUN git clone --depth 1 --branch v${SAGEATTN_VERSION} \
     https://github.com/thu-ml/SageAttention.git /sageattn

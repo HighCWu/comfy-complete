@@ -21,7 +21,7 @@
 # Layer order optimized for caching (least to most
 # frequently changing):
 #   0. SAM2 wheel builder (rarely changes)
-#   0b. SageAttention multi-arch wheel builder (rarely changes)
+#   0b. SageAttention wheels pulled from ghcr.io (built via sageattn.Dockerfile)
 #   1. System dependencies
 #   2. Base tools (uv, comfy-cli, yq)
 #   3. ComfyUI clone at pinned ref
@@ -37,20 +37,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN pip wheel --no-build-isolation --no-deps \
     "SAM-2 @ https://github.com/facebookresearch/sam2/archive/2b90b9f5ceec907a1c18123530e92e794ad901a4.tar.gz" \
     -w /wheels
-
-# Stage 0b: SageAttention multi-arch wheel builder (cached separately)
-# Compiles CUDA kernels for sm_80/sm_86/sm_89/sm_90/sm_120 in a single wheel.
-# setup.py is patched to skip GPU auto-detection (CI runners have no GPU).
-# pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6 AS sageattn-builder
-ARG SAGEATTN_VERSION=2.2.0
-ENV PYTHONDONTWRITEBYTECODE=1
-COPY docker/patch_sageattn.py /tmp/patch_sageattn.py
-RUN git clone --depth 1 --branch v${SAGEATTN_VERSION} \
-        https://github.com/thu-ml/SageAttention.git /sageattn && \
-    python /tmp/patch_sageattn.py /sageattn/setup.py && \
-    cd /sageattn && \
-    pip wheel --no-build-isolation --no-deps . -w /wheels
 
 # Stage 1: Python environment setup
 # pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
@@ -168,8 +154,10 @@ RUN uv pip install --no-deps \
     "llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.42-cu128-linux-20260712/llama_cpp_python-0.3.42+cu128-cp311-cp311-linux_x86_64.whl"
 
 # SageAttention: multi-arch CUDA wheel (sm_80/sm_86/sm_89/sm_90/sm_120)
-# Pre-built in sageattn-builder stage; provides attention speedup when enabled
-COPY --from=sageattn-builder /wheels/*.whl /tmp/sageattn-wheels/
+# Pre-built separately via docker/sageattn.Dockerfile and pushed to ghcr.io.
+# Reused as long as SAGEATTN_VERSION doesn't change — no recompilation needed.
+ARG SAGEATTN_VERSION=2.2.0
+COPY --from=ghcr.io/highcwu/comfy-complete-sageattn:${SAGEATTN_VERSION} /wheels/*.whl /tmp/sageattn-wheels/
 RUN uv pip install --no-deps /tmp/sageattn-wheels/*.whl && rm -rf /tmp/sageattn-wheels
 
 # Layer 5: Custom nodes (change most frequently)
