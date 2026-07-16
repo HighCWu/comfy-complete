@@ -38,7 +38,7 @@ RUN pip wheel --no-build-isolation --no-deps \
 
 # Stage 1: Python environment setup
 # pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
-FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6 AS base
 
 ARG COMFYUI_REPO_URL=https://github.com/Comfy-Org/ComfyUI.git
 
@@ -74,6 +74,8 @@ RUN apt-get -o Acquire::Retries=3 update && \
   sox \
   libsox-fmt-all \
   libzbar0 \
+  dumb-init \
+  espeak-ng \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Layer 2: Base tools
@@ -137,6 +139,16 @@ RUN grep -Ev '^(SAM-2 @|nvidia-vfx==)' /app/comfyui-requirements.txt > /tmp/base
 # Installed separately to avoid exposing all packages to the extra index (dependency confusion risk)
 RUN uv pip install --no-deps --extra-index-url https://pypi.nvidia.com/ nvidia-vfx==0.1.0.1
 
+# flash-attn: official prebuilt wheel (torch 2.8 + cu12 + py311 + cxx11abiTRUE)
+# https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.3.post1
+RUN uv pip install --no-deps "flash-attn==2.8.3.post1" \
+    --find-links https://github.com/Dao-AILab/flash-attention/releases/expanded_assets/v2.8.3.post1
+
+# llama-cpp-python: JamePeng prebuilt CUDA 12.8 wheel (cp311, dynamically links system CUDA)
+# https://github.com/JamePeng/llama-cpp-python/releases/tag/v0.3.42-cu128-linux-20260712
+RUN uv pip install --no-deps \
+    "llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.42-cu128-linux-20260712/llama_cpp_python-0.3.42+cu128-cp311-cp311-linux_x86_64.whl"
+
 # Layer 5: Custom nodes (change most frequently)
 COPY supported_nodes.yaml /app/supported_nodes.yaml
 COPY scripts/install_custom_nodes.py /app/install_custom_nodes.py
@@ -148,6 +160,24 @@ RUN touch ${COMFY_PATH}/custom_nodes/skip_download_model
 # -u: unbuffered stdout so build logs show incremental progress
 RUN cd ${COMFY_PATH} && ${PYTHON_PATH} -u /app/install_custom_nodes.py --no-deps --comfy-path ${COMFY_PATH}
 
+# Pre-bake models that custom nodes fetch at import time (would block startup)
+# comfyui_face_parsing: downloads 339MB model + config at import time
+RUN mkdir -p ${COMFY_PATH}/models/face_parsing ${COMFY_PATH}/models/ultralytics/bbox && \
+    wget -q -O ${COMFY_PATH}/models/face_parsing/model.safetensors \
+        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/model.safetensors" && \
+    wget -q -O ${COMFY_PATH}/models/face_parsing/config.json \
+        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/config.json" && \
+    wget -q -O ${COMFY_PATH}/models/face_parsing/preprocessor_config.json \
+        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/preprocessor_config.json" && \
+    wget -q -O ${COMFY_PATH}/models/ultralytics/bbox/face_yolov8m.pt \
+        "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt"
+
+# onebuttonprompt: __init__.py expects "OneButtonPrompt" but comfy-cli installs lowercase
+RUN if [ -d "${COMFY_PATH}/custom_nodes/onebuttonprompt" ] && \
+       [ ! -d "${COMFY_PATH}/custom_nodes/OneButtonPrompt" ]; then \
+        ln -s onebuttonprompt ${COMFY_PATH}/custom_nodes/OneButtonPrompt; \
+    fi
+
 # Create non-root user (UID/GID 1000) to match K8s securityContext runAsUser
 # and chown the runtime tree so the base image is usable as a standalone
 # artifact. Anyone pulling comfy-complete-base directly will run under
@@ -157,3 +187,42 @@ RUN cd ${COMFY_PATH} && ${PYTHON_PATH} -u /app/install_custom_nodes.py --no-deps
 RUN groupadd --gid 1000 comfy \
     && useradd --uid 1000 --gid 1000 -M --home-dir ${COMFY_PATH} --shell /usr/sbin/nologin comfy \
     && chown -R 1000:1000 ${COMFY_PATH}
+
+# Entrypoint for standalone usage (cloud K8s overrides command directly)
+COPY docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod 755 /app/entrypoint.sh
+
+EXPOSE ${COMFY_PORT}
+WORKDIR ${COMFY_PATH}
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/entrypoint.sh"]
+
+# =============================================================================
+# Stage: runpod-source — clone runpod-worker files from GitHub
+# =============================================================================
+FROM alpine/git:latest AS runpod-source
+ARG RUNPOD_WORKER_REF=main
+RUN git clone --depth 1 --branch ${RUNPOD_WORKER_REF} \
+    https://github.com/HighCWu/runpod-worker-comfyui.git /runpod-worker
+
+# =============================================================================
+# Stage: runpod — RunPod serverless handler layer on top of base
+# =============================================================================
+FROM base AS runpod
+
+RUN apt-get -o Acquire::Retries=3 update && \
+    apt-get install -y --no-install-recommends openssh-server \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN uv pip install "runpod~=1.7.12" websocket-client boto3
+
+COPY --from=runpod-source --chmod=755 /runpod-worker/src/start.sh /start.sh
+COPY --from=runpod-source --chmod=644 /runpod-worker/handler.py /handler.py
+COPY --from=runpod-source --chmod=644 /runpod-worker/src/network_volume.py /network_volume.py
+COPY --from=runpod-source --chmod=644 /runpod-worker/src/extra_model_paths.yaml /app/comfyui/extra_model_paths.yaml
+COPY --from=runpod-source --chmod=755 /runpod-worker/scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
+COPY --from=runpod-source --chmod=755 /runpod-worker/scripts/comfy-node-install.sh /usr/local/bin/comfy-node-install
+
+RUN ln -sfn /app/comfyui /comfyui
+
+WORKDIR /app/comfyui
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/start.sh"]
