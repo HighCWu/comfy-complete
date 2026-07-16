@@ -7,7 +7,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/comfy-complete
 
 jobs:
   build-base:
@@ -17,6 +16,10 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set image base (lowercase)
+        id: img
+        run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
 
       - uses: docker/setup-buildx-action@v3
 
@@ -34,8 +37,8 @@ jobs:
           target: base
           push: true
           tags: |
-            ${{ env.IMAGE_BASE }}:latest
-            ${{ env.IMAGE_BASE }}:${{ github.sha }}
+            ${{ steps.img.outputs.base }}:latest
+            ${{ steps.img.outputs.base }}:${{ github.sha }}
           cache-from: type=gha,scope=base
           cache-to: type=gha,scope=base,mode=max
 
@@ -47,6 +50,10 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set image base (lowercase)
+        id: img
+        run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
 
       - uses: docker/setup-buildx-action@v3
 
@@ -64,8 +71,8 @@ jobs:
           target: runpod
           push: true
           tags: |
-            ${{ env.IMAGE_BASE }}-runpod:latest
-            ${{ env.IMAGE_BASE }}-runpod:${{ github.sha }}
+            ${{ steps.img.outputs.base }}-runpod:latest
+            ${{ steps.img.outputs.base }}-runpod:${{ github.sha }}
           cache-from: |
             type=gha,scope=base
             type=gha,scope=runpod
