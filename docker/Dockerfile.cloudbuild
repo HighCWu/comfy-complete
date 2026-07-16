@@ -21,11 +21,13 @@
 # Layer order optimized for caching (least to most
 # frequently changing):
 #   0. SAM2 wheel builder (rarely changes)
+#   0b. SageAttention multi-arch wheel builder (rarely changes)
 #   1. System dependencies
 #   2. Base tools (uv, comfy-cli, yq)
 #   3. ComfyUI clone at pinned ref
 #   4. Python requirements (changes less than nodes)
 #   5. Custom nodes (changes most frequently)
+#   5b. comfy-env pixi envs (GeometryPack CGAL/igl/bpy, SAM3)
 # ======================================================
 
 # Stage 0: SAM2 wheel builder (cached separately)
@@ -35,6 +37,20 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN pip wheel --no-build-isolation --no-deps \
     "SAM-2 @ https://github.com/facebookresearch/sam2/archive/2b90b9f5ceec907a1c18123530e92e794ad901a4.tar.gz" \
     -w /wheels
+
+# Stage 0b: SageAttention multi-arch wheel builder (cached separately)
+# Compiles CUDA kernels for sm_80/sm_86/sm_89/sm_90/sm_120 in a single wheel.
+# setup.py is patched to skip GPU auto-detection (CI runners have no GPU).
+# pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
+FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel@sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6 AS sageattn-builder
+ARG SAGEATTN_VERSION=2.2.0
+ENV PYTHONDONTWRITEBYTECODE=1
+COPY docker/patch_sageattn.py /tmp/patch_sageattn.py
+RUN git clone --depth 1 --branch v${SAGEATTN_VERSION} \
+        https://github.com/thu-ml/SageAttention.git /sageattn && \
+    python /tmp/patch_sageattn.py /sageattn/setup.py && \
+    cd /sageattn && \
+    pip wheel --no-build-isolation --no-deps . -w /wheels
 
 # Stage 1: Python environment setup
 # pytorch/pytorch tag: 2.8.0-cuda12.8-cudnn9-devel
@@ -49,6 +65,8 @@ ENV PYTHON_PATH=/opt/conda/bin/python
 ENV COMFY_PATH=/app/comfyui
 ENV COMFY_PORT=8188
 ENV UV_PYTHON=/opt/conda/bin/python
+# comfy-env workspace: keep pixi envs under COMFY_PATH so chown covers them
+ENV COMFY_ENV_ROOT=/app/comfyui/.ce
 
 # Don't persist uv cache in the image
 ARG UV_NO_CACHE=1
@@ -149,6 +167,11 @@ RUN uv pip install --no-deps "flash-attn==2.8.3.post1" \
 RUN uv pip install --no-deps \
     "llama-cpp-python @ https://github.com/JamePeng/llama-cpp-python/releases/download/v0.3.42-cu128-linux-20260712/llama_cpp_python-0.3.42+cu128-cp311-cp311-linux_x86_64.whl"
 
+# SageAttention: multi-arch CUDA wheel (sm_80/sm_86/sm_89/sm_90/sm_120)
+# Pre-built in sageattn-builder stage; provides attention speedup when enabled
+COPY --from=sageattn-builder /wheels/*.whl /tmp/sageattn-wheels/
+RUN uv pip install --no-deps /tmp/sageattn-wheels/*.whl && rm -rf /tmp/sageattn-wheels
+
 # Layer 5: Custom nodes (change most frequently)
 COPY supported_nodes.yaml /app/supported_nodes.yaml
 COPY scripts/install_custom_nodes.py /app/install_custom_nodes.py
@@ -185,6 +208,17 @@ RUN if [ -d "${COMFY_PATH}/custom_nodes/onebuttonprompt" ] && \
        [ ! -d "${COMFY_PATH}/custom_nodes/OneButtonPrompt" ]; then \
         ln -s onebuttonprompt ${COMFY_PATH}/custom_nodes/OneButtonPrompt; \
     fi
+
+# comfy-env: materialize pixi envs for nodes with isolated dependencies
+# ComfyUI-GeometryPack: cgal/igl/bpy/pymeshlab (~4GB for 3D mesh processing)
+# comfyui-sam3: cc_torch/torch_generic_nms (video tracking)
+# COMFY_ENV_ROOT points into COMFY_PATH so the chown below covers pixi envs
+# Cache mount: rattler repodata (~200MB) reused across builds without bloating image
+RUN --mount=type=cache,target=${COMFY_PATH}/models/_xdgcache/rattler \
+    cd ${COMFY_PATH} && \
+    uv pip install tomli-w && \
+    comfy-env init && \
+    comfy-env install
 
 # Create non-root user (UID/GID 1000) to match K8s securityContext runAsUser
 # and chown the runtime tree so the base image is usable as a standalone

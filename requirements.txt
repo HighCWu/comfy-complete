@@ -72,6 +72,7 @@ decord==0.6.0
 demucs==4.0.1
 diffusers==0.38.0
 dill==0.4.0
+diskcache==5.6.1
 distro==1.9.0
 dnspython==2.7.0
 docutils==0.22
