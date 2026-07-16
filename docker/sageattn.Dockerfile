@@ -24,8 +24,6 @@ ARG SAGEATTN_VERSION=2.2.0
 # Target GPU architectures (Ampere/Ada/Hopper/Blackwell)
 # v2.2.0+ setup.py reads TORCH_CUDA_ARCH_LIST — no patching needed.
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0"
-# Serialize extension builds to reduce peak memory during compilation
-ENV EXT_PARALLEL=1
 
 # Install git (not in pytorch:devel base) + ca-certificates for HTTPS
 RUN apt-get update && \
