@@ -90,6 +90,8 @@ RUN apt-get -o Acquire::Retries=3 update && \
   libzbar0 \
   dumb-init \
   espeak-ng \
+  ffmpeg \
+  libavcodec-extra58 \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Layer 2: Base tools
