@@ -61,7 +61,7 @@ ENV PYTHON_PATH=/opt/conda/bin/python
 ENV COMFY_PATH=/app/comfyui
 ENV COMFY_PORT=8188
 ENV UV_PYTHON=/opt/conda/bin/python
-# comfy-env workspace: keep pixi envs under COMFY_PATH so chown covers them
+# comfy-env workspace: under COMFY_PATH so runtime (user 1000) can access envs
 ENV COMFY_ENV_ROOT=/app/comfyui/.ce
 
 # Don't persist uv cache in the image
@@ -139,15 +139,31 @@ RUN cd ${COMFY_PATH} && \
     models/_xdgconfig
 
 # Layer 4: Python requirements FIRST (change less frequently than nodes)
+# Split into 3 sub-layers so each stays under 5GB — registry mirrors (e.g.
+# ghcr.nju.edu.cn) have an ~8GB-per-layer hard limit and get unreliable past
+# that. Sizes measured from actual install footprint:
+#   L1 ~4.48GB: tensorrt_cu13_libs alone (single biggest package, 54% of total)
+#   L2  ~1.5GB: 10 medium packages (onnxruntime-gpu, jaxlib, pymeshlab, ...)
+#   L3  ~2.3GB: remaining ~290 small packages
+# Order = least-changing first (tensorrt version rarely bumps → strong cache).
 COPY requirements.txt /app/comfyui-requirements.txt
 COPY --from=sam2-builder /wheels/*.whl /tmp/wheels/
 RUN uv pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
-# Filter out SAM-2 (already installed from prebuilt wheel above) and nvidia-vfx
-# (installed separately below from NVIDIA's PyPI index) to avoid re-fetching from
-# Git and to keep nvidia-vfx off the default PyPI index.
-RUN grep -Ev '^(SAM-2 @|nvidia-vfx==)' /app/comfyui-requirements.txt > /tmp/base-requirements.txt && \
-    uv pip install --no-deps -r /tmp/base-requirements.txt && \
-    rm -f /tmp/base-requirements.txt
+
+# Prepare filtered requirements (exclude SAM-2 and nvidia-vfx, installed separately)
+RUN grep -Ev '^(SAM-2 @|nvidia-vfx==)' /app/comfyui-requirements.txt > /tmp/req-all.txt
+
+# L1: TensorRT cu13 libs (4.48GB single package — would dominate any combined layer)
+RUN grep '^tensorrt_cu13_libs==' /tmp/req-all.txt > /tmp/req-l1.txt && \
+    uv pip install --no-deps -r /tmp/req-l1.txt && rm /tmp/req-l1.txt
+
+# L2: Medium packages (~1.5GB) — top 10 by size after tensorrt
+RUN grep -E '^(onnxruntime-gpu|jaxlib|pymeshlab|cupy-cuda12x|bitsandbytes|llvmlite|taichi|polars-runtime-32|av|scipy)==' /tmp/req-all.txt > /tmp/req-l2.txt && \
+    uv pip install --no-deps -r /tmp/req-l2.txt && rm /tmp/req-l2.txt
+
+# L3: Remaining ~290 packages (~2.3GB)
+RUN grep -Ev '^(tensorrt_cu13_libs|onnxruntime-gpu|jaxlib|pymeshlab|cupy-cuda12x|bitsandbytes|llvmlite|taichi|polars-runtime-32|av|scipy)==' /tmp/req-all.txt > /tmp/req-l3.txt && \
+    uv pip install --no-deps -r /tmp/req-l3.txt && rm -f /tmp/req-all.txt /tmp/req-l3.txt
 
 # Install nvidia-vfx from NVIDIA's PyPI index (binary wheel includes Maxine VFX SDK libs)
 # Installed separately to avoid exposing all packages to the extra index (dependency confusion risk)
@@ -206,26 +222,51 @@ RUN if [ -d "${COMFY_PATH}/custom_nodes/onebuttonprompt" ] && \
         ln -s onebuttonprompt ${COMFY_PATH}/custom_nodes/OneButtonPrompt; \
     fi
 
-# comfy-env: materialize pixi envs for nodes with isolated dependencies
-# ComfyUI-GeometryPack: cgal/igl/bpy/pymeshlab (~4GB for 3D mesh processing)
-# comfyui-sam3: cc_torch/torch_generic_nms (video tracking)
-# COMFY_ENV_ROOT points into COMFY_PATH so the chown below covers pixi envs
-# Cache mount: rattler repodata (~200MB) reused across builds without bloating image
-RUN --mount=type=cache,target=${COMFY_PATH}/models/_xdgcache/rattler \
-    cd ${COMFY_PATH} && \
-    uv pip install tomli-w && \
-    comfy-env init && \
-    comfy-env install
+# tomli-w: required by comfy-env for pixi.toml manifest generation
+RUN uv pip install tomli-w
 
-# Create non-root user (UID/GID 1000) to match K8s securityContext runAsUser
-# and chown the runtime tree so the base image is usable as a standalone
-# artifact. Anyone pulling comfy-complete-base directly will run under
-# runAsUser: 1000.
-# Note: no USER instruction -- consumers (e.g. cloud's K8s securityContext)
-# enforce runAsUser: 1000 at runtime.
+# Create user 1000 EARLY — before pixi envs are created.
+# Running comfy-env as user 1000 ensures the ~9GB of pixi envs are born
+# with correct ownership. This eliminates the chown -R that previously
+# duplicated ALL pixi files in a single 11.57GB compressed layer.
+# The chown below covers only the pre-existing content (ComfyUI clone +
+# custom nodes + models, ~3GB uncompressed) — the pixi envs created
+# in subsequent layers are already 1000:1000 owned.
 RUN groupadd --gid 1000 comfy \
     && useradd --uid 1000 --gid 1000 -M --home-dir ${COMFY_PATH} --shell /usr/sbin/nologin comfy \
     && chown -R 1000:1000 ${COMFY_PATH}
+
+# comfy-env: materialize pixi envs for nodes with isolated dependencies.
+# Two nodes have comfy-env.toml:
+#   ComfyUI-GeometryPack: bpy + torch + cgal/igl/pymeshlab (~6-7GB compressed)
+#   comfyui-sam3:          torch + cc_torch (~2-3GB compressed)
+# Install in SEPARATE RUN layers so each stays under the registry mirror's
+# ~8GB per-layer hard limit (ghcr.nju.edu.cn gets unreliable past 8GB,
+# causing "unexpected EOF" on pull). Previously both envs were installed
+# in a single 9.32GB layer.
+#
+# Layer 1: GeometryPack env (biggest — bpy ~2-3GB + torch ~2-3GB).
+# Temporarily hide sam3's config so comfy-env processes geometrypack only.
+# The install.hash is removed afterwards so the next layer doesn't skip.
+RUN --mount=type=cache,target=${COMFY_PATH}/models/_xdgcache/rattler,uid=1000,gid=1000 \
+    cd ${COMFY_PATH} && \
+    if [ -f custom_nodes/comfyui-sam3/comfy-env.toml ]; then \
+        mv custom_nodes/comfyui-sam3/comfy-env.toml /tmp/sam3-env.toml.bak; \
+    fi && \
+    runuser -u comfy -- /opt/conda/bin/comfy-env init && \
+    runuser -u comfy -- /opt/conda/bin/comfy-env install && \
+    if [ -f /tmp/sam3-env.toml.bak ]; then \
+        mv /tmp/sam3-env.toml.bak custom_nodes/comfyui-sam3/comfy-env.toml; \
+    fi && \
+    rm -f ${COMFY_ENV_ROOT}/install.hash
+
+# Layer 2: SAM3 env (~2-3GB compressed).
+# GeometryPack env already installed; pixi detects it as up-to-date and
+# only materializes the new sam3 env. comfy-env rewrites the install.hash
+# covering both configs at the end of this layer.
+RUN --mount=type=cache,target=${COMFY_PATH}/models/_xdgcache/rattler,uid=1000,gid=1000 \
+    cd ${COMFY_PATH} && \
+    runuser -u comfy -- /opt/conda/bin/comfy-env install
 
 # Entrypoint for standalone usage (cloud K8s overrides command directly)
 COPY docker/entrypoint.sh /app/entrypoint.sh
