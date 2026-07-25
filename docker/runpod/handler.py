@@ -218,7 +218,7 @@ def upload_to_r2(file_bytes, r2_key, content_type):
                              dev:  http://localhost:3080/r2 (Worker route)
       R2_ACCESS_KEY_ID     — R2 access key (real token in prod, dummy in dev)
       R2_SECRET_ACCESS_KEY — R2 secret key
-      R2_BUCKET            — laimon-comfy-storage
+      R2_BUCKET            — laimon-storage
 
     Returns r2_key on success, None on failure (caller falls back to base64).
     """
