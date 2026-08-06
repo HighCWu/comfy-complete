@@ -187,3 +187,91 @@ jobs:
             .
           docker push ${{ steps.img.outputs.base }}-runpod:latest
           docker push ${{ steps.img.outputs.base }}-runpod:${{ github.sha }}
+
+  # -----------------------------------------------------------------------
+  # seed-object-info: extract /object_info from the freshly built image
+  # and push it to the API so the frontend has node definitions on first
+  # load (no cold-start RunPod fetch needed).
+  #
+  # Secret setup (comfy-complete repo → Settings → Secrets and variables → Actions):
+  #   ADMIN_SECRET    — must match `wrangler secret put ADMIN_SECRET` on the API
+  #   API_BASE_URL    — e.g. https://laimon.ai (no trailing slash)
+  #
+  # Both secrets are injected as step-level `env:` vars — they NEVER enter
+  # the Docker image (no --build-arg, no ENV). GitHub masks them in logs.
+  # -----------------------------------------------------------------------
+  seed-object-info:
+    needs: build-base
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image base (lowercase)
+        id: img
+        run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull base image
+        run: docker pull ${{ steps.img.outputs.base }}:${{ github.sha }}
+
+      - name: Start ComfyUI in CPU mode
+        run: |
+          docker run -d --name comfy-extractor \
+            -p 8188:8188 \
+            -e COMFY_EXTRA_ARGS="--cpu" \
+            ${{ steps.img.outputs.base }}:${{ github.sha }}
+
+      - name: Wait for ComfyUI /object_info
+        run: |
+          echo "Waiting for ComfyUI to serve /object_info..."
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8188/object_info -o /tmp/object_info.json 2>/dev/null; then
+              SIZE=$(stat -c %s /tmp/object_info.json 2>/dev/null || stat -f %z /tmp/object_info.json)
+              NODES=$(python3 -c "import json; print(len(json.load(open('/tmp/object_info.json'))))" 2>/dev/null || echo "?")
+              if [ "$NODES" != "?" ] && [ "$NODES" -gt 0 ]; then
+                echo "ComfyUI ready — $NODES nodes, ${SIZE} bytes"
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo "ERROR: ComfyUI did not serve /object_info within timeout"
+          docker logs comfy-extractor 2>&1 | tail -100
+          exit 1
+
+      - name: Push object_info to API
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+        run: |
+          if [ -z "$ADMIN_SECRET" ] || [ -z "$API_BASE_URL" ]; then
+            echo "WARNING: ADMIN_SECRET or API_BASE_URL not set — skipping seed (set these in repo secrets to enable)"
+            exit 0
+          fi
+          echo "Pushing object_info to ${API_BASE_URL}/api/admin/object-info"
+          HTTP_CODE=$(curl -s -o /tmp/seed-response.json -w "%{http_code}" \
+            -X POST \
+            -H "X-Admin-Secret: ${ADMIN_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/object_info.json \
+            "${API_BASE_URL}/api/admin/object-info")
+          echo "API response (HTTP ${HTTP_CODE}):"
+          cat /tmp/seed-response.json
+          echo ""
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: seed failed with HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f comfy-extractor || true
