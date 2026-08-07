@@ -871,15 +871,13 @@ def handler(job):
                     subfolder = file_info.get("subfolder", "")
                     file_type = file_info.get("type")
 
-                    # [laimon] skip temp outputs unless INCLUDE_TEMP_IMAGES is set.
-                    # PreviewImage and similar nodes output type "temp" — our cloud
-                    # platform needs them for real-time preview UX.
-                    if file_type == "temp" and not os.environ.get("INCLUDE_TEMP_IMAGES"):
-                        print(
-                            f"worker-comfyui - Skipping {filename} because type is 'temp'"
-                        )
-                        continue
-
+                    # [laimon] Temp outputs (PreviewImage and similar) MUST be
+                    # surfaced — the cloud platform surfaces them as ephemeral
+                    # previews. Consumer (queues/workflow.ts) routes them to KV
+                    # with TTL (small temps, base64 path) or R2 at the handler's
+                    # key (large temps, r2_key path that would otherwise exceed
+                    # RunPod's 10 MB output cap). Do NOT reintroduce an
+                    # INCLUDE_TEMP_IMAGES gate here — that was a regression.
                     if not filename:
                         warn_msg = f"Skipping {category} in node {node_id} due to missing filename: {file_info}"
                         print(f"worker-comfyui - {warn_msg}")
