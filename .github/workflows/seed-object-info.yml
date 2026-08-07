@@ -1,0 +1,138 @@
+name: Seed object_info
+
+# Standalone seed workflow. Decoupled from docker-build.yml so the image
+# (which takes 60-90 min to build) doesn't need to be rebuilt just to
+# re-seed object_info to a new API endpoint / after a secret rotation /
+# after a Worker-side bug fix.
+#
+# Three paths in:
+#   1. workflow_dispatch (manual)  — uses input.image_tag (default: latest)
+#   2. workflow_run (auto)         — fires after Docker Build completes
+#                                    successfully on main; uses the SHA
+#                                    that triggered docker-build (matches
+#                                    the image build-base just pushed)
+#   3. (image missing)             — fails fast with a pointer to Docker
+#                                    Build, instead of a confusing pull
+#                                    error 60 seconds in
+#
+# Required secrets on HighCWu/comfy-complete (repo → Settings → Secrets):
+#   ADMIN_SECRET    — must match the Worker's `wrangler secret put ADMIN_SECRET`
+#   API_BASE_URL    — Worker origin (e.g. https://laimon-api.hecongw.workers.dev
+#                     or https://laimon.ai), no trailing slash
+# Both are injected as step-level env: vars and never enter the image.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to seed from (sha, 'latest', or explicit tag)"
+        required: false
+        default: "latest"
+  workflow_run:
+    workflows: ["Docker Build"]
+    types: [completed]
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  seed:
+    # `workflow_run` fires on every conclusion (success/failure/cancelled).
+    # Gate to success-only; manual dispatch always runs.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # Use the SHA that triggered docker-build — build-base pushed
+            # that exact tag. More precise than :latest, which could in
+            # theory be raced by a concurrent build.
+            echo "value=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set image name
+        id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check image exists (fail fast with guidance)
+        run: |
+          IMAGE="${{ steps.img.outputs.name }}:${{ steps.tag.outputs.value }}"
+          echo "Checking ${IMAGE}..."
+          if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "::error::Image ${IMAGE} not found in ghcr.io."
+            echo "::error::First-deploy setup: run the 'Docker Build' workflow to build+push the image."
+            echo "::error::Once build-base succeeds, this workflow auto-fires (workflow_run) — no need to re-trigger manually."
+            exit 1
+          fi
+          echo "Image exists."
+
+      - name: Pull image
+        run: docker pull ${{ steps.img.outputs.name }}:${{ steps.tag.outputs.value }}
+
+      - name: Start ComfyUI in CPU mode
+        run: |
+          docker run -d --name comfy-extractor \
+            -p 8188:8188 \
+            -e COMFY_EXTRA_ARGS="--cpu" \
+            ${{ steps.img.outputs.name }}:${{ steps.tag.outputs.value }}
+
+      - name: Wait for ComfyUI /object_info
+        run: |
+          echo "Waiting for ComfyUI to serve /object_info..."
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8188/object_info -o /tmp/object_info.json 2>/dev/null; then
+              SIZE=$(stat -c %s /tmp/object_info.json 2>/dev/null || stat -f %z /tmp/object_info.json)
+              NODES=$(python3 -c "import json; print(len(json.load(open('/tmp/object_info.json'))))" 2>/dev/null || echo "?")
+              if [ "$NODES" != "?" ] && [ "$NODES" -gt 0 ]; then
+                echo "ComfyUI ready — $NODES nodes, ${SIZE} bytes"
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo "ERROR: ComfyUI did not serve /object_info within timeout"
+          docker logs comfy-extractor 2>&1 | tail -100
+          exit 1
+
+      - name: Push object_info to API
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+        run: |
+          if [ -z "$ADMIN_SECRET" ] || [ -z "$API_BASE_URL" ]; then
+            echo "::error::ADMIN_SECRET or API_BASE_URL not set in repo secrets."
+            echo "::error::Set both at https://github.com/${{ github.repository }}/settings/secrets/actions"
+            exit 1
+          fi
+          echo "Pushing object_info to ${API_BASE_URL}/api/admin/object-info"
+          HTTP_CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
+            -X POST \
+            -H "X-Admin-Secret: ${ADMIN_SECRET}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/object_info.json \
+            "${API_BASE_URL}/api/admin/object-info")
+          echo "API response (HTTP ${HTTP_CODE}):"
+          cat /tmp/resp.json
+          echo ""
+          [ "$HTTP_CODE" = "200" ] || exit 1
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f comfy-extractor || true
