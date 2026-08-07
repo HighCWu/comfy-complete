@@ -188,6 +188,59 @@ jobs:
           docker push ${{ steps.img.outputs.base }}-runpod:latest
           docker push ${{ steps.img.outputs.base }}-runpod:${{ github.sha }}
 
+      # ---------------------------------------------------------------------
+      # Auto-deploy: PATCH the RunPod serverless endpoint to point at the
+      # freshly-built image. Fires only on main (the same image tag is
+      # pushed for branch builds, but we don't want every WIP branch
+      # moving production). PATCHes ONLY the image field — env vars set
+      # via RunPod dashboard survive (partial update, not full replace).
+      #
+      # Requires repo secrets:
+      #   RUNPOD_API_KEY      — long-lived API key (user-generated)
+      #   RUNPOD_ENDPOINT_ID  — e.g. 0wwzielp9onxfh
+      #
+      # Verification: parses the PATCH response, asserts the returned
+      # image matches what we sent. Anything else (key revoked, endpoint
+      # deleted, RunPod 5xx) fails the step loudly so a silently-stale
+      # endpoint can't ship.
+      # ---------------------------------------------------------------------
+      - name: Update RunPod endpoint to new image
+        if: github.ref == 'refs/heads/main'
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_ENDPOINT_ID: ${{ secrets.RUNPOD_ENDPOINT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNPOD_API_KEY}" ] || [ -z "${RUNPOD_ENDPOINT_ID}" ]; then
+            echo "SKIP: RUNPOD_API_KEY or RUNPOD_ENDPOINT_ID secret not set"
+            exit 0
+          fi
+          # steps.img.outputs.base already includes the registry + repo
+          # (e.g. "ghcr.io/highcwu/comfy-complete") — just append the
+          # "-runpod" suffix + SHA tag.
+          IMAGE="${{ steps.img.outputs.base }}-runpod:${{ github.sha }}"
+          echo "PATCHing endpoint ${RUNPOD_ENDPOINT_ID} → ${IMAGE}"
+          RESP=$(curl -sS -X PATCH \
+            "https://api.runpod.io/v2/serverless/${RUNPOD_ENDPOINT_ID}" \
+            -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -m 240 \
+            -d "{\"image\": \"${IMAGE}\"}")
+          echo "Response: ${RESP}"
+          ACTUAL=$(echo "${RESP}" | python3 -c \
+            'import sys, json
+          try:
+            d = json.load(sys.stdin)
+            print(d.get("image", ""))
+          except Exception:
+            print("")')
+          if [ "${ACTUAL}" != "${IMAGE}" ]; then
+            echo "ERROR: endpoint image did not update to ${IMAGE}" >&2
+            echo "Got: ${ACTUAL}" >&2
+            exit 1
+          fi
+          echo "OK: endpoint ${RUNPOD_ENDPOINT_ID} now at ${ACTUAL}"
+
   # -----------------------------------------------------------------------
   # NOTE: object_info seeding used to live here as a `seed-object-info` job
   # chained off build-base. It has been extracted to a standalone workflow:
