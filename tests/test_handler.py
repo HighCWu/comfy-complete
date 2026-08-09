@@ -51,6 +51,36 @@ import handler  # noqa: E402
 # validate_input
 # ---------------------------------------------------------------------------
 
+
+class TestStreamSafeErrorChunks(unittest.TestCase):
+    """RunPod SDK must not swallow terminal handler details."""
+
+    def test_error_chunk_avoids_reserved_top_level_error_key(self):
+        chunk = handler.error_chunk("ComfyUI failed", ["detail"])
+        self.assertEqual(chunk["type"], "error")
+        self.assertEqual(chunk["message"], "ComfyUI failed")
+        self.assertEqual(chunk["details"], ["detail"])
+        self.assertNotIn("error", chunk)
+
+    def test_handler_validation_error_is_stream_safe(self):
+        chunks = list(handler.handler({"id": "job-1", "input": None}))
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["type"], "error")
+        self.assertIn("Please provide input", chunks[0]["message"])
+        self.assertNotIn("error", chunks[0])
+
+    @patch("handler.check_server", return_value=False)
+    def test_handler_startup_error_is_stream_safe(self, _check_server):
+        chunks = list(
+            handler.handler(
+                {"id": "job-2", "input": {"workflow": {"1": {}}}}
+            )
+        )
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("not reachable", chunks[0]["message"])
+        self.assertNotIn("error", chunks[0])
+
+
 class TestValidateInput(unittest.TestCase):
     """validate_input is the first line of defense against malformed jobs."""
 
