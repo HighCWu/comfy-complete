@@ -59,6 +59,22 @@ COMFY_HOST = "127.0.0.1:8188"
 # see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
 
+
+def error_chunk(message, details=None):
+    """Build a stream-safe terminal error chunk.
+
+    runpod-python 1.7.x treats any generator output whose top-level payload
+    contains a truthy ``error`` key as the handler's platform-level failure.
+    It stops iteration and sends that value only to the final job status,
+    so the chunk never appears in ``/stream`` and callers lose the actionable
+    ComfyUI error. Keep the semantic type as ``error`` but carry the text in
+    ``message``; the API consumer accepts both shapes during rollout.
+    """
+    chunk = {"type": "error", "message": str(message)}
+    if details:
+        chunk["details"] = details
+    return chunk
+
 # ---------------------------------------------------------------------------
 # Helper: quick reachability probe of ComfyUI HTTP endpoint (port 8188)
 # ---------------------------------------------------------------------------
@@ -661,7 +677,7 @@ def handler(job):
     # Make sure that the input is valid
     validated_data, error_message = validate_input(job_input)
     if error_message:
-        yield {"type": "error", "error": error_message}
+        yield error_chunk(error_message)
         return
 
     # Extract validated data
@@ -676,21 +692,19 @@ def handler(job):
         COMFY_API_AVAILABLE_MAX_RETRIES,
         COMFY_API_AVAILABLE_INTERVAL_MS,
     ):
-        yield {
-            "type": "error",
-            "error": f"ComfyUI server ({COMFY_HOST}) not reachable after multiple retries.",
-        }
+        yield error_chunk(
+            f"ComfyUI server ({COMFY_HOST}) not reachable after multiple retries."
+        )
         return
 
     # Upload input images if they exist
     if input_images:
         upload_result = upload_images(input_images)
         if upload_result["status"] == "error":
-            yield {
-                "type": "error",
-                "error": "Failed to upload one or more input images",
-                "details": upload_result["details"],
-            }
+            yield error_chunk(
+                "Failed to upload one or more input images",
+                upload_result["details"],
+            )
             return
 
     ws = None
@@ -832,15 +846,14 @@ def handler(job):
             error_msg = f"Prompt ID {prompt_id} not found in history after execution."
             print(f"worker-comfyui - {error_msg}")
             if not errors:
-                yield {"type": "error", "error": error_msg}
+                yield error_chunk(error_msg)
                 return
             else:
                 errors.append(error_msg)
-                yield {
-                    "type": "error",
-                    "error": "Job processing failed, prompt ID not found in history.",
-                    "details": errors,
-                }
+                yield error_chunk(
+                    "Job processing failed, prompt ID not found in history.",
+                    errors,
+                )
                 return
 
         prompt_history = history.get(prompt_id, {})
@@ -1024,22 +1037,22 @@ def handler(job):
     except websocket.WebSocketException as e:
         print(f"worker-comfyui - WebSocket Error: {e}")
         print(traceback.format_exc())
-        yield {"type": "error", "error": f"WebSocket communication error: {e}"}
+        yield error_chunk(f"WebSocket communication error: {e}")
         return
     except requests.RequestException as e:
         print(f"worker-comfyui - HTTP Request Error: {e}")
         print(traceback.format_exc())
-        yield {"type": "error", "error": f"HTTP communication error with ComfyUI: {e}"}
+        yield error_chunk(f"HTTP communication error with ComfyUI: {e}")
         return
     except ValueError as e:
         print(f"worker-comfyui - Value Error: {e}")
         print(traceback.format_exc())
-        yield {"type": "error", "error": str(e)}
+        yield error_chunk(str(e))
         return
     except Exception as e:
         print(f"worker-comfyui - Unexpected Handler Error: {e}")
         print(traceback.format_exc())
-        yield {"type": "error", "error": f"An unexpected error occurred: {e}"}
+        yield error_chunk(f"An unexpected error occurred: {e}")
         return
     finally:
         if ws and ws.connected:
@@ -1057,11 +1070,7 @@ def handler(job):
 
     if not output_data and errors:
         print(f"worker-comfyui - Job failed with no output images.")
-        yield {
-            "type": "error",
-            "error": "Job processing failed",
-            "details": errors,
-        }
+        yield error_chunk("Job processing failed", errors)
         return
     elif not output_data and not errors:
         print(
