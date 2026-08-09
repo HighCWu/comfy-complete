@@ -4,6 +4,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      force_base_rebuild:
+        description: "Rebuild the full base even when its content-hash tag exists"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -87,6 +97,8 @@ jobs:
     needs: build-sageattn
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      base_tag: ${{ steps.base.outputs.tag }}
     permissions:
       contents: read
       packages: write
@@ -118,23 +130,68 @@ jobs:
         id: img
         run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
 
+      - name: Calculate base content hash
+        id: base
+        run: |
+          HASH=$({
+            printf 'SAGEATTN_VERSION=%s\n' "${{ env.SAGEATTN_VERSION }}"
+            sha256sum \
+              docker/Dockerfile.cloudbuild \
+              docker/entrypoint.sh \
+              requirements.txt \
+              scripts/install_custom_nodes.py \
+              supported_nodes.yaml \
+              version_lock.yaml
+          } | sha256sum | cut -d' ' -f1)
+          echo "tag=base-${HASH:0:16}" >> "$GITHUB_OUTPUT"
+          echo "Base content tag: base-${HASH:0:16}"
+
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check for reusable base image
+        id: existing
+        run: |
+          IMAGE="${{ steps.img.outputs.base }}:${{ steps.base.outputs.tag }}"
+          FORCE="${{ inputs.force_base_rebuild || false }}"
+          if [ "$FORCE" != "true" ] && docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing ${IMAGE}"
+          else
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+            echo "Building ${IMAGE}"
+          fi
+
       - name: Build and push base image
+        if: steps.existing.outputs.reuse != 'true'
         run: |
           DOCKER_BUILDKIT=1 docker build \
             -f docker/Dockerfile.cloudbuild \
             --build-arg SAGEATTN_VERSION=${{ env.SAGEATTN_VERSION }} \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --cache-from ${{ steps.img.outputs.base }}:latest \
             --target base \
             -t ${{ steps.img.outputs.base }}:latest \
+            -t ${{ steps.img.outputs.base }}:${{ steps.base.outputs.tag }} \
             -t ${{ steps.img.outputs.base }}:${{ github.sha }} \
             .
           docker push ${{ steps.img.outputs.base }}:latest
+          docker push ${{ steps.img.outputs.base }}:${{ steps.base.outputs.tag }}
           docker push ${{ steps.img.outputs.base }}:${{ github.sha }}
+
+      - name: Tag reusable base for this commit
+        if: steps.existing.outputs.reuse == 'true'
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Publish commit tags for reusable base
+        if: steps.existing.outputs.reuse == 'true'
+        run: |
+          SOURCE="${{ steps.img.outputs.base }}:${{ steps.base.outputs.tag }}"
+          crane tag "$SOURCE" "${{ github.sha }}"
+          crane tag "$SOURCE" latest
 
   build-runpod:
     needs: build-base
@@ -181,65 +238,31 @@ jobs:
         run: |
           DOCKER_BUILDKIT=1 docker build \
             -f docker/Dockerfile.runpod \
-            --build-arg BASE_IMAGE=${{ steps.img.outputs.base }}:${{ github.sha }} \
+            --build-arg BASE_IMAGE=${{ steps.img.outputs.base }}:${{ needs.build-base.outputs.base_tag }} \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --cache-from ${{ steps.img.outputs.base }}-runpod:latest \
             -t ${{ steps.img.outputs.base }}-runpod:latest \
             -t ${{ steps.img.outputs.base }}-runpod:${{ github.sha }} \
             .
           docker push ${{ steps.img.outputs.base }}-runpod:latest
           docker push ${{ steps.img.outputs.base }}-runpod:${{ github.sha }}
 
-      # ---------------------------------------------------------------------
-      # Auto-deploy: PATCH the RunPod serverless endpoint to point at the
-      # freshly-built image. Fires only on main (the same image tag is
-      # pushed for branch builds, but we don't want every WIP branch
-      # moving production). PATCHes ONLY the image field — env vars set
-      # via RunPod dashboard survive (partial update, not full replace).
-      #
-      # Requires repo secrets:
-      #   RUNPOD_API_KEY      — long-lived API key (user-generated)
-      #   RUNPOD_ENDPOINT_ID  — e.g. 0wwzielp9onxfh
-      #
-      # Verification: parses the PATCH response, asserts the returned
-      # image matches what we sent. Anything else (key revoked, endpoint
-      # deleted, RunPod 5xx) fails the step loudly so a silently-stale
-      # endpoint can't ship.
-      # ---------------------------------------------------------------------
-      - name: Update RunPod endpoint to new image
-        if: github.ref == 'refs/heads/main'
+      - name: Optionally dispatch isolated staging verification
+        if: github.ref == 'refs/heads/main' && vars.AUTO_STAGING_ROLLOUT == 'true'
         env:
-          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          RUNPOD_ENDPOINT_ID: ${{ secrets.RUNPOD_ENDPOINT_ID }}
+          DISPATCH_TOKEN: ${{ secrets.LAIMON_REPOSITORY_DISPATCH_TOKEN }}
         run: |
-          set -euo pipefail
-          if [ -z "${RUNPOD_API_KEY}" ] || [ -z "${RUNPOD_ENDPOINT_ID}" ]; then
-            echo "SKIP: RUNPOD_API_KEY or RUNPOD_ENDPOINT_ID secret not set"
-            exit 0
-          fi
-          # steps.img.outputs.base already includes the registry + repo
-          # (e.g. "ghcr.io/highcwu/comfy-complete") — just append the
-          # "-runpod" suffix + SHA tag.
-          IMAGE="${{ steps.img.outputs.base }}-runpod:${{ github.sha }}"
-          echo "PATCHing endpoint ${RUNPOD_ENDPOINT_ID} → ${IMAGE}"
-          RESP=$(curl -sS -X PATCH \
-            "https://api.runpod.io/v2/serverless/${RUNPOD_ENDPOINT_ID}" \
-            -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -m 240 \
-            -d "{\"image\": \"${IMAGE}\"}")
-          echo "Response: ${RESP}"
-          ACTUAL=$(echo "${RESP}" | python3 -c \
-            'import sys, json
-          try:
-            d = json.load(sys.stdin)
-            print(d.get("image", ""))
-          except Exception:
-            print("")')
-          if [ "${ACTUAL}" != "${IMAGE}" ]; then
-            echo "ERROR: endpoint image did not update to ${IMAGE}" >&2
-            echo "Got: ${ACTUAL}" >&2
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "::error::AUTO_STAGING_ROLLOUT is true but LAIMON_REPOSITORY_DISPATCH_TOKEN is missing"
             exit 1
           fi
-          echo "OK: endpoint ${RUNPOD_ENDPOINT_ID} now at ${ACTUAL}"
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/HighCWu/laimon/dispatches \
+            -d '{"event_type":"comfy-image-built","client_payload":{"comfy_complete_sha":"${{ github.sha }}"}}'
 
   # -----------------------------------------------------------------------
   # NOTE: object_info seeding used to live here as a `seed-object-info` job
