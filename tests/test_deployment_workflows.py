@@ -17,11 +17,10 @@ def test_docker_build_never_mutates_runpod_endpoints():
     assert "RUNPOD_ENDPOINT_ID" not in text
 
 
-def test_automatic_staging_dispatch_is_explicitly_opt_in():
+def test_docker_build_does_not_need_cross_repository_credentials():
     text = DOCKER_BUILD.read_text()
-    assert "vars.AUTO_STAGING_ROLLOUT == 'true'" in text
-    assert "LAIMON_REPOSITORY_DISPATCH_TOKEN" in text
-    assert '"event_type":"comfy-image-built"' in text
+    assert "repository_dispatch" not in text
+    assert "LAIMON_REPOSITORY_DISPATCH_TOKEN" not in text
 
 
 def test_base_content_hash_covers_every_local_copy_input():
