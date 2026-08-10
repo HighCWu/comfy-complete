@@ -1,0 +1,28 @@
+# ======================================================
+# RunPod Pod runtime — thin, authenticated wrapper around comfy-complete.
+#
+# The heavy CUDA / ComfyUI / custom-node layers live in BASE_IMAGE and are
+# shared with the Serverless image.  This layer only adds the Pod supervisor,
+# authenticated reverse proxy, and network-volume model path mapping.
+# ======================================================
+
+ARG BASE_IMAGE=ghcr.io/highcwu/comfy-complete:latest
+FROM ${BASE_IMAGE}
+
+USER root
+
+COPY --chmod=755 docker/pod/start.sh /start-pod.sh
+COPY --chmod=644 docker/pod/gateway.py /pod-gateway.py
+COPY --chmod=644 docker/runpod/extra_model_paths.yaml /app/comfyui/extra_model_paths.yaml
+COPY --chmod=755 docker/runpod/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
+
+RUN ln -sfn /app/comfyui /comfyui
+
+ENV COMFY_INTERNAL_HOST=127.0.0.1 \
+    COMFY_INTERNAL_PORT=8188 \
+    LAIMON_POD_PORT=8189 \
+    COMFY_LOG_LEVEL=INFO
+
+EXPOSE 8189
+WORKDIR /app/comfyui
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/start-pod.sh"]
