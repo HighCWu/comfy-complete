@@ -9,6 +9,7 @@ Run with: pytest tests/test_requirements.py -v
 
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -70,7 +71,7 @@ def test_requirements_resolvable_with_uv():
         venv_path = os.path.join(tmpdir, ".venv")
 
         result = subprocess.run(
-            ["uv", "venv", venv_path],
+            ["uv", "venv", venv_path, "--python", sys.executable],
             capture_output=True,
             text=True,
         )
