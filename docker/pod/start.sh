@@ -70,6 +70,7 @@ python -u /pod-model-bootstrap.py \
     --instance-root "${instance_root}" \
     --config "${model_paths_config}" \
     --comfy-model-root /app/comfyui/models
+python -u /pod-asset-sync.py restore --instance-root "${instance_root}"
 comfy_args+=(
     --input-directory "${instance_root}/input"
     --output-directory "${instance_root}/output"
@@ -89,13 +90,18 @@ fi
 python -u /comfyui/main.py "${comfy_args[@]}" &
 comfy_pid=$!
 gateway_pid=""
+asset_sync_pid=""
 
 cleanup() {
     if [ -n "${gateway_pid}" ]; then
         kill "${gateway_pid}" 2>/dev/null || true
     fi
+    if [ -n "${asset_sync_pid}" ]; then
+        kill "${asset_sync_pid}" 2>/dev/null || true
+    fi
     kill "${comfy_pid}" 2>/dev/null || true
     wait "${gateway_pid}" 2>/dev/null || true
+    wait "${asset_sync_pid}" 2>/dev/null || true
     wait "${comfy_pid}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -130,10 +136,12 @@ fi
 echo "laimon-pod: starting authenticated gateway on 0.0.0.0:${LAIMON_POD_PORT}"
 python -u /pod-gateway.py &
 gateway_pid=$!
+python -u /pod-asset-sync.py watch --instance-root "${instance_root}" &
+asset_sync_pid=$!
 
 # The container is healthy only while both processes remain alive. Exiting when
 # either child dies lets RunPod surface the failure instead of leaving a paid,
 # unreachable Pod running indefinitely.
-wait -n "${comfy_pid}" "${gateway_pid}"
+wait -n "${comfy_pid}" "${gateway_pid}" "${asset_sync_pid}"
 echo "laimon-pod: a supervised process exited; stopping Pod container" >&2
 exit 1
