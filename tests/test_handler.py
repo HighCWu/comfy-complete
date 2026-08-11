@@ -6,6 +6,7 @@ added when the worker was forked from upstream runpod-worker-comfyui:
 
   - validate_input                (input shape + userId/promptId extraction)
   - upload_to_r2                  (R2 direct upload + env gating + fallback)
+  - persist_terminal_result       (compact R2 result redundancy)
   - _get_comfyui_pid              (PID file parsing)
   - _is_comfyui_process_alive     (os.kill signal-0 probe)
   - _comfy_server_status          (HTTP reachability probe)
@@ -34,6 +35,7 @@ Docker image. No new test-only dependencies.
 
 import sys
 import os
+import json
 import unittest
 from unittest.mock import patch, MagicMock, mock_open, Mock
 
@@ -232,6 +234,58 @@ class TestUploadToR2(unittest.TestCase):
             result = handler.upload_to_r2(self.BYTES, self.KEY, self.CT)
 
         self.assertIsNone(result)
+
+
+class TestTerminalResultManifest(unittest.TestCase):
+    def test_key_is_user_isolated_and_rejects_path_injection(self):
+        self.assertEqual(
+            handler.terminal_manifest_key("user-abc", "prompt_xyz"),
+            "temp/user-abc/runpod-results/prompt_xyz.json",
+        )
+        self.assertIsNone(handler.terminal_manifest_key("../user", "prompt"))
+        self.assertIsNone(handler.terminal_manifest_key("user", "prompt/other"))
+
+    @patch("handler.upload_to_r2", return_value="temp/user/runpod-results/prompt.json")
+    def test_persists_compact_r2_result(self, upload):
+        chunk = {
+            "type": "result",
+            "images": [{
+                "filename": "out.png",
+                "type": "r2_key",
+                "data": "output/user/prompt/out.png",
+            }],
+        }
+
+        result = handler.persist_terminal_result("user", "prompt", chunk)
+
+        self.assertEqual(result, "temp/user/runpod-results/prompt.json")
+        upload.assert_called_once()
+        body, key, content_type = upload.call_args.args
+        self.assertEqual(key, "temp/user/runpod-results/prompt.json")
+        self.assertEqual(content_type, "application/json")
+        decoded = json.loads(body.decode("utf-8"))
+        self.assertEqual(decoded["version"], 1)
+        self.assertEqual(decoded["promptId"], "prompt")
+        self.assertEqual(decoded["result"], chunk)
+
+    @patch("handler.upload_to_r2")
+    def test_skips_non_r2_results(self, upload):
+        for output_type in ("base64", "s3_url"):
+            with self.subTest(output_type=output_type):
+                result = handler.persist_terminal_result(
+                    "user",
+                    "prompt",
+                    {
+                        "type": "result",
+                        "images": [{
+                            "filename": "out.png",
+                            "type": output_type,
+                            "data": "AAAA",
+                        }],
+                    },
+                )
+                self.assertIsNone(result)
+        upload.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

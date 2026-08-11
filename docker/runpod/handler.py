@@ -276,6 +276,69 @@ def upload_to_r2(file_bytes, r2_key, content_type):
 # approaches this limit, switch remaining temps to R2 direct upload.
 TEMP_R2_FALLBACK_THRESHOLD = 8 * 1024 * 1024  # 8 MB (leaves 2 MB margin)
 
+# RunPod's Python SDK deliberately swallows failures from its per-chunk
+# streaming webhook after three retries, then still reports the generator job
+# as COMPLETED. Keep a compact copy of the terminal result in private R2 so the
+# control plane can recover when the final /stream chunk is missing. The
+# manifest lives under temp/<user>/ and is deleted as soon as D1 reaches a
+# terminal state; account deletion already sweeps that prefix as a backstop.
+TERMINAL_MANIFEST_MAX_BYTES = 256 * 1024
+
+
+def terminal_manifest_key(user_id, prompt_id):
+    """Return the deterministic private R2 key for a terminal result."""
+    if not isinstance(user_id, str) or not isinstance(prompt_id, str):
+        return None
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+    if not user_id or not prompt_id:
+        return None
+    if any(char not in allowed for char in user_id + prompt_id):
+        return None
+    return f"temp/{user_id}/runpod-results/{prompt_id}.json"
+
+
+def persist_terminal_result(user_id, prompt_id, result_chunk):
+    """Best-effort R2 redundancy for a compact terminal result chunk.
+
+    Base64 outputs are intentionally excluded: duplicating them can exceed
+    both RunPod's output limit and the bounded manifest size. Production output
+    files use r2_key; zero-image results are also compact. Presigned S3 URLs
+    are excluded because their expiry makes them unsuitable for retry recovery.
+    """
+    key = terminal_manifest_key(user_id, prompt_id)
+    if key is None or not isinstance(result_chunk, dict):
+        return None
+
+    images = result_chunk.get("images", [])
+    if not isinstance(images, list):
+        return None
+    if any(
+        not isinstance(image, dict) or image.get("type") != "r2_key"
+        for image in images
+    ):
+        return None
+
+    manifest = {
+        "version": 1,
+        "promptId": prompt_id,
+        "result": result_chunk,
+    }
+    encoded = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    if len(encoded) > TERMINAL_MANIFEST_MAX_BYTES:
+        print(
+            f"worker-comfyui - [laimon] Terminal manifest too large for {prompt_id}: {len(encoded)} bytes"
+        )
+        return None
+
+    uploaded = upload_to_r2(encoded, key, "application/json")
+    if uploaded:
+        print(
+            f"worker-comfyui - [laimon] Persisted terminal result manifest for {prompt_id}"
+        )
+    return uploaded
+
 
 def _get_comfyui_pid():
     """Read the ComfyUI process PID from the PID file written by start.sh."""
@@ -1080,7 +1143,9 @@ def handler(job):
         final_result["images"] = []
 
     print(f"worker-comfyui - Job completed. Yielding result with {len(output_data)} image(s).")
-    yield {"type": "result", **final_result}
+    result_chunk = {"type": "result", **final_result}
+    persist_terminal_result(user_id, input_prompt_id, result_chunk)
+    yield result_chunk
 
 
 if __name__ == "__main__":
