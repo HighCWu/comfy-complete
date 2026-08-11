@@ -228,7 +228,52 @@ def write_extra_model_paths(
     os.replace(temporary, config_path)
 
 
-def bootstrap(instance_root: Path, config_path: Path) -> dict[str, int | str]:
+def publish_comfy_model_links(
+    comfy_model_root: Path,
+    instance_model_root: Path,
+    items: list[dict[str, object]],
+) -> None:
+    """Expose verified instance models through ComfyUI's default folders.
+
+    The instance directory remains the authoritative disposable cache.  These
+    links are container-local compatibility entries: some ComfyUI loaders take
+    their initial filename list from the default model directory even when an
+    equivalent extra search path is configured.
+    """
+    for item in items:
+        folder = str(item["folder"])
+        filename = str(item["filename"])
+        target = (instance_model_root / folder / filename).resolve(strict=True)
+        link_dir = comfy_model_root / folder
+        link_dir.mkdir(parents=True, exist_ok=True)
+        link = link_dir / filename
+        if link.is_symlink():
+            try:
+                if link.resolve(strict=True) == target:
+                    continue
+            except FileNotFoundError:
+                pass
+            raise BootstrapError(
+                f"ComfyUI model link collision for {folder}/{filename}"
+            )
+        if link.exists():
+            raise BootstrapError(
+                f"ComfyUI model path collision for {folder}/{filename}"
+            )
+        temporary = link.with_name(f".{link.name}.laimon-link")
+        temporary.unlink(missing_ok=True)
+        try:
+            temporary.symlink_to(target)
+            os.replace(temporary, link)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def bootstrap(
+    instance_root: Path,
+    config_path: Path,
+    comfy_model_root: Path,
+) -> dict[str, int | str]:
     token = required_env("LAIMON_POD_TOKEN")
     instance_id = required_env("LAIMON_INSTANCE_ID")
     control_plane = required_env("LAIMON_CONTROL_PLANE_URL")
@@ -258,6 +303,7 @@ def bootstrap(instance_root: Path, config_path: Path) -> dict[str, int | str]:
         instance_root,
         {str(item["folder"]) for item in items},
     )
+    publish_comfy_model_links(comfy_model_root, model_root, items)
     return {
         "status": str(manifest.get("status", "ready")),
         "item_count": len(items),
@@ -269,8 +315,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--instance-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--comfy-model-root", type=Path, required=True)
     args = parser.parse_args()
-    result = bootstrap(args.instance_root, args.config)
+    result = bootstrap(args.instance_root, args.config, args.comfy_model_root)
     print("laimon-pod: model bootstrap complete — " + json.dumps(result), flush=True)
 
 

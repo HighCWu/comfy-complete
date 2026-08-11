@@ -103,13 +103,16 @@ class PodModelBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "instance"
             config = Path(directory) / "extra-model-paths.json"
+            comfy_models = Path(directory) / "comfy-models"
             with patch.dict(os.environ, env, clear=False), patch.object(
                 module, "load_manifest", return_value=manifest
             ), patch.object(module, "download_model") as download:
-                result = module.bootstrap(root, config)
+                with patch.object(module, "publish_comfy_model_links") as publish:
+                    result = module.bootstrap(root, config, comfy_models)
 
             self.assertEqual(result, {"status": "ready", "item_count": 1, "total_bytes": 4})
             download.assert_called_once()
+            publish.assert_called_once()
             self.assertEqual(
                 json.loads(config.read_text(encoding="utf-8")),
                 {
@@ -119,6 +122,60 @@ class PodModelBootstrapTests(unittest.TestCase):
                     }
                 },
             )
+
+    def test_publishes_verified_models_into_comfy_default_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            instance_models = root / "instance-models"
+            target = instance_models / "upscale_models" / "model.pth"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"verified")
+            comfy_models = root / "comfy-models"
+            item = {"folder": "upscale_models", "filename": "model.pth"}
+
+            module.publish_comfy_model_links(comfy_models, instance_models, [item])
+
+            link = comfy_models / "upscale_models" / "model.pth"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(strict=True), target.resolve(strict=True))
+            module.publish_comfy_model_links(comfy_models, instance_models, [item])
+
+    def test_rejects_comfy_default_model_path_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            instance_models = root / "instance-models"
+            target = instance_models / "checkpoints" / "model.safetensors"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"verified")
+            comfy_models = root / "comfy-models"
+            collision = comfy_models / "checkpoints" / "model.safetensors"
+            collision.parent.mkdir(parents=True)
+            collision.write_bytes(b"base-image-model")
+
+            with self.assertRaisesRegex(module.BootstrapError, "path collision"):
+                module.publish_comfy_model_links(
+                    comfy_models,
+                    instance_models,
+                    [{"folder": "checkpoints", "filename": "model.safetensors"}],
+                )
+
+    def test_rejects_broken_comfy_model_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            instance_models = root / "instance-models"
+            target = instance_models / "vae" / "model.safetensors"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"verified")
+            link = root / "comfy-models" / "vae" / "model.safetensors"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(root / "missing-model.safetensors")
+
+            with self.assertRaisesRegex(module.BootstrapError, "link collision"):
+                module.publish_comfy_model_links(
+                    root / "comfy-models",
+                    instance_models,
+                    [{"folder": "vae", "filename": "model.safetensors"}],
+                )
 
 
 if __name__ == "__main__":

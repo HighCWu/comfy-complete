@@ -68,7 +68,8 @@ mkdir -p \
 model_paths_config="/tmp/laimon-extra-model-paths.json"
 python -u /pod-model-bootstrap.py \
     --instance-root "${instance_root}" \
-    --config "${model_paths_config}"
+    --config "${model_paths_config}" \
+    --comfy-model-root /app/comfyui/models
 comfy_args+=(
     --input-directory "${instance_root}/input"
     --output-directory "${instance_root}/output"
