@@ -5,6 +5,10 @@ if [ -z "${LAIMON_POD_TOKEN:-}" ]; then
     echo "laimon-pod: LAIMON_POD_TOKEN is required" >&2
     exit 1
 fi
+if [ -z "${LAIMON_CONTROL_PLANE_URL:-}" ]; then
+    echo "laimon-pod: LAIMON_CONTROL_PLANE_URL is required" >&2
+    exit 1
+fi
 
 : "${COMFY_INTERNAL_HOST:=127.0.0.1}"
 : "${COMFY_INTERNAL_PORT:=8188}"
@@ -45,28 +49,33 @@ comfy_args=(
     --log-stdout
 )
 
-# A network volume is optional for local image testing, but production Pods
-# mount one at /runpod-volume. Keep each logical instance's mutable ComfyUI
-# state in its own directory so terminating the paid Pod does not discard
-# outputs, inputs, user workflows, or temp previews. Models remain shared at
-# /runpod-volume/models through extra_model_paths.yaml.
+# A network volume is optional. R2 remains the source of truth; the mounted
+# volume or Pod disk is a disposable per-instance cache populated from the
+# active start quote before ComfyUI becomes ready.
 if [ -n "${LAIMON_INSTANCE_ID:-}" ] && mountpoint -q /runpod-volume; then
     instance_root="/runpod-volume/instances/${LAIMON_INSTANCE_ID}"
-    mkdir -p \
-        "${instance_root}/input" \
-        "${instance_root}/output" \
-        "${instance_root}/temp" \
-        "${instance_root}/user"
-    comfy_args+=(
-        --input-directory "${instance_root}/input"
-        --output-directory "${instance_root}/output"
-        --temp-directory "${instance_root}/temp"
-        --user-directory "${instance_root}/user"
-    )
     echo "laimon-pod: persistent instance state at ${instance_root}"
 else
-    echo "laimon-pod: no network volume mounted; outputs are ephemeral" >&2
+    instance_root="/workspace/laimon/instances/${LAIMON_INSTANCE_ID}"
+    echo "laimon-pod: using Pod-disk instance cache at ${instance_root}" >&2
 fi
+
+mkdir -p \
+    "${instance_root}/input" \
+    "${instance_root}/output" \
+    "${instance_root}/temp" \
+    "${instance_root}/user"
+model_paths_config="/tmp/laimon-extra-model-paths.json"
+python -u /pod-model-bootstrap.py \
+    --instance-root "${instance_root}" \
+    --config "${model_paths_config}"
+comfy_args+=(
+    --input-directory "${instance_root}/input"
+    --output-directory "${instance_root}/output"
+    --temp-directory "${instance_root}/temp"
+    --user-directory "${instance_root}/user"
+    --extra-model-paths-config "${model_paths_config}"
+)
 
 if [ -n "${COMFY_EXTRA_ARGS:-}" ]; then
     # Operator-controlled image configuration, never user input. Word splitting

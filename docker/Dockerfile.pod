@@ -13,7 +13,7 @@ USER root
 
 COPY --chmod=755 docker/pod/start.sh /start-pod.sh
 COPY --chmod=644 docker/pod/gateway.py /pod-gateway.py
-COPY --chmod=644 docker/runpod/extra_model_paths.yaml /app/comfyui/extra_model_paths.yaml
+COPY --chmod=644 docker/pod/model_bootstrap.py /pod-model-bootstrap.py
 COPY --chmod=755 docker/runpod/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 
 RUN ln -sfn /app/comfyui /comfyui
