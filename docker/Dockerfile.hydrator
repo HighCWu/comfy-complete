@@ -1,0 +1,8 @@
+FROM python:3.12-slim
+
+RUN useradd --create-home --uid 10001 hydrator
+COPY --chmod=555 docker/hydrator/model_hydrator.py /model_hydrator.py
+
+USER hydrator
+WORKDIR /home/hydrator
+ENTRYPOINT ["python", "-u", "/model_hydrator.py"]
