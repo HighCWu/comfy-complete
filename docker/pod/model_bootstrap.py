@@ -24,6 +24,7 @@ from typing import Any
 TOKEN_HEADER = "X-Laimon-Pod-Token"
 SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
 SAFE_FOLDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+SAFE_SHARED_PATH = re.compile(r"^shared/models/objects/[a-f0-9]{2}/[a-f0-9]{64}/[A-Za-z0-9._-]+$")
 CHUNK_BYTES = 4 * 1024 * 1024
 MANIFEST_WAIT_SECONDS = 300
 
@@ -116,7 +117,10 @@ def validate_item(value: object) -> dict[str, object]:
     filename = value.get("filename")
     size_bytes = value.get("size_bytes")
     sha256 = value.get("sha256")
+    source = value.get("source")
     download_path = value.get("download_path")
+    shared_volume_path = value.get("shared_volume_path")
+    shared_marker_path = value.get("shared_marker_path")
     if (
         not isinstance(folder, str)
         or not SAFE_FOLDER.fullmatch(folder)
@@ -127,16 +131,34 @@ def validate_item(value: object) -> dict[str, object]:
         or size_bytes <= 0
         or not isinstance(sha256, str)
         or not SHA256_HEX.fullmatch(sha256)
-        or not isinstance(download_path, str)
-        or not download_path.startswith("/api/internal/pod-models/artifacts/")
+        or source not in {"r2", "shared_volume"}
     ):
         raise BootstrapError("model manifest item contains unsafe metadata")
+    if source == "r2" and (
+        not isinstance(download_path, str)
+        or not download_path.startswith("/api/internal/pod-models/artifacts/")
+        or shared_volume_path is not None
+        or shared_marker_path is not None
+    ):
+        raise BootstrapError("R2 model manifest item contains unsafe metadata")
+    if source == "shared_volume" and (
+        download_path is not None
+        or not isinstance(shared_volume_path, str)
+        or not SAFE_SHARED_PATH.fullmatch(shared_volume_path)
+        or not isinstance(shared_marker_path, str)
+        or not SAFE_SHARED_PATH.fullmatch(shared_marker_path)
+        or shared_marker_path != shared_volume_path + ".laimon.json"
+    ):
+        raise BootstrapError("shared model manifest item contains unsafe metadata")
     return {
         "folder": folder,
         "filename": filename,
         "size_bytes": size_bytes,
         "sha256": sha256,
+        "source": source,
         "download_path": download_path,
+        "shared_volume_path": shared_volume_path,
+        "shared_marker_path": shared_marker_path,
     }
 
 
@@ -212,6 +234,54 @@ def download_model(
             time.sleep(attempt * 2)
 
 
+def link_shared_model(
+    shared_volume_root: Path,
+    model_root: Path,
+    item: dict[str, object],
+) -> None:
+    folder = str(item["folder"])
+    filename = str(item["filename"])
+    expected_size = int(item["size_bytes"])
+    expected_sha256 = str(item["sha256"])
+    relative_path = str(item["shared_volume_path"])
+    relative_marker = str(item["shared_marker_path"])
+    source = (shared_volume_root / relative_path).resolve(strict=True)
+    marker = (shared_volume_root / relative_marker).resolve(strict=True)
+    shared_root = shared_volume_root.resolve(strict=True)
+    if not source.is_relative_to(shared_root) or not marker.is_relative_to(shared_root):
+        raise BootstrapError("shared model path escaped the mounted volume")
+    if source.stat().st_size != expected_size:
+        raise BootstrapError(f"shared model size mismatch for {folder}/{filename}")
+    try:
+        with marker.open("r", encoding="utf-8") as handle:
+            published = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise BootstrapError(f"shared model marker is invalid for {folder}/{filename}") from error
+    if not isinstance(published, dict) or (
+        published.get("version") != 1
+        or published.get("sha256") != expected_sha256
+        or published.get("size_bytes") != expected_size
+        or published.get("artifact_path") != relative_path
+    ):
+        raise BootstrapError(f"shared model marker does not match {folder}/{filename}")
+
+    target_dir = model_root / folder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / filename
+    if target.is_symlink() and target.resolve(strict=True) == source:
+        return
+    if target.exists() or target.is_symlink():
+        raise BootstrapError(f"shared model target collision for {folder}/{filename}")
+    temporary = target.with_name(f".{target.name}.laimon-shared-link")
+    temporary.unlink(missing_ok=True)
+    try:
+        temporary.symlink_to(source)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    print(f"laimon-pod: shared model ready — {folder}/{filename}", flush=True)
+
+
 def write_extra_model_paths(
     config_path: Path,
     instance_root: Path,
@@ -273,6 +343,7 @@ def bootstrap(
     instance_root: Path,
     config_path: Path,
     comfy_model_root: Path,
+    shared_volume_root: Path,
 ) -> dict[str, int | str]:
     token = required_env("LAIMON_POD_TOKEN")
     instance_id = required_env("LAIMON_INSTANCE_ID")
@@ -297,7 +368,10 @@ def bootstrap(
     model_root = instance_root / "models"
     model_root.mkdir(parents=True, exist_ok=True)
     for item in items:
-        download_model(control_plane, token, model_root, item)
+        if item["source"] == "shared_volume":
+            link_shared_model(shared_volume_root, model_root, item)
+        else:
+            download_model(control_plane, token, model_root, item)
     write_extra_model_paths(
         config_path,
         instance_root,
@@ -316,8 +390,14 @@ def main() -> None:
     parser.add_argument("--instance-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--comfy-model-root", type=Path, required=True)
+    parser.add_argument("--shared-volume-root", type=Path, required=True)
     args = parser.parse_args()
-    result = bootstrap(args.instance_root, args.config, args.comfy_model_root)
+    result = bootstrap(
+        args.instance_root,
+        args.config,
+        args.comfy_model_root,
+        args.shared_volume_root,
+    )
     print("laimon-pod: model bootstrap complete — " + json.dumps(result), flush=True)
 
 

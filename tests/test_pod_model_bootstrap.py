@@ -45,6 +45,7 @@ class PodModelBootstrapTests(unittest.TestCase):
                     "filename": "../private.safetensors",
                     "size_bytes": 1,
                     "sha256": "a" * 64,
+                    "source": "r2",
                     "download_path": "/api/internal/pod-models/artifacts/" + "a" * 64,
                 }
             )
@@ -57,6 +58,7 @@ class PodModelBootstrapTests(unittest.TestCase):
             "filename": "model.pth",
             "size_bytes": len(payload),
             "sha256": sha256,
+            "source": "r2",
             "download_path": f"/api/internal/pod-models/artifacts/{sha256}?instance_id=inst_test",
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -91,6 +93,7 @@ class PodModelBootstrapTests(unittest.TestCase):
                     "filename": "model.safetensors",
                     "size_bytes": 4,
                     "sha256": "b" * 64,
+                    "source": "r2",
                     "download_path": "/api/internal/pod-models/artifacts/" + "b" * 64,
                 }
             ],
@@ -108,7 +111,12 @@ class PodModelBootstrapTests(unittest.TestCase):
                 module, "load_manifest", return_value=manifest
             ), patch.object(module, "download_model") as download:
                 with patch.object(module, "publish_comfy_model_links") as publish:
-                    result = module.bootstrap(root, config, comfy_models)
+                    result = module.bootstrap(
+                        root,
+                        config,
+                        comfy_models,
+                        Path(directory) / "shared-volume",
+                    )
 
             self.assertEqual(result, {"status": "ready", "item_count": 1, "total_bytes": 4})
             download.assert_called_once()
@@ -122,6 +130,56 @@ class PodModelBootstrapTests(unittest.TestCase):
                     }
                 },
             )
+
+    def test_links_a_published_shared_model_without_downloading(self) -> None:
+        payload = b"shared-model"
+        sha256 = module.hashlib.sha256(payload).hexdigest()
+        relative = f"shared/models/objects/{sha256[:2]}/{sha256}/artifact"
+        manifest = {
+            "version": 1,
+            "instance_id": "inst_test",
+            "status": "ready",
+            "item_count": 1,
+            "total_bytes": len(payload),
+            "items": [{
+                "folder": "checkpoints",
+                "filename": "shared.safetensors",
+                "size_bytes": len(payload),
+                "sha256": sha256,
+                "source": "shared_volume",
+                "shared_volume_path": relative,
+                "shared_marker_path": relative + ".laimon.json",
+            }],
+        }
+        env = {
+            "LAIMON_POD_TOKEN": "token",
+            "LAIMON_INSTANCE_ID": "inst_test",
+            "LAIMON_CONTROL_PLANE_URL": "https://laimon.ai",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runtime"
+            shared = Path(directory) / "network-volume"
+            artifact = shared / relative
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(payload)
+            marker = shared / (relative + ".laimon.json")
+            marker.write_text(json.dumps({
+                "version": 1,
+                "sha256": sha256,
+                "size_bytes": len(payload),
+                "artifact_path": relative,
+            }), encoding="utf-8")
+            config = Path(directory) / "extra-model-paths.json"
+            comfy_models = Path(directory) / "comfy-models"
+            with patch.dict(os.environ, env, clear=False), patch.object(
+                module, "load_manifest", return_value=manifest
+            ), patch.object(module, "download_model") as download:
+                module.bootstrap(root, config, comfy_models, shared)
+
+            download.assert_not_called()
+            link = root / "models" / "checkpoints" / "shared.safetensors"
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(strict=True), artifact.resolve(strict=True))
 
     def test_publishes_verified_models_into_comfy_default_folders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

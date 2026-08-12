@@ -49,16 +49,12 @@ comfy_args=(
     --log-stdout
 )
 
-# A network volume is optional. R2 remains the source of truth; the mounted
-# volume or Pod disk is a disposable per-instance cache populated from the
-# active start quote before ComfyUI becomes ready.
-if [ -n "${LAIMON_INSTANCE_ID:-}" ] && mountpoint -q /runpod-volume; then
-    instance_root="/runpod-volume/instances/${LAIMON_INSTANCE_ID}"
-    echo "laimon-pod: persistent instance state at ${instance_root}"
-else
-    instance_root="/workspace/laimon/instances/${LAIMON_INSTANCE_ID}"
-    echo "laimon-pod: using Pod-disk instance cache at ${instance_root}" >&2
-fi
+# User inputs, outputs, temporary files, and ComfyUI state are disposable
+# runtime data. They stay on the container disk and are mirrored to R2 where
+# persistence is required. A mounted network volume is reserved exclusively
+# for platform-managed, content-addressed public models.
+instance_root="/tmp/laimon-runtime/${LAIMON_INSTANCE_ID}"
+echo "laimon-pod: disposable instance runtime at ${instance_root}"
 
 mkdir -p \
     "${instance_root}/input" \
@@ -69,7 +65,8 @@ model_paths_config="/tmp/laimon-extra-model-paths.json"
 python -u /pod-model-bootstrap.py \
     --instance-root "${instance_root}" \
     --config "${model_paths_config}" \
-    --comfy-model-root /app/comfyui/models
+    --comfy-model-root /app/comfyui/models \
+    --shared-volume-root /runpod-volume
 python -u /pod-asset-sync.py restore --instance-root "${instance_root}"
 comfy_args+=(
     --input-directory "${instance_root}/input"
