@@ -69,8 +69,8 @@ class ModelHydratorTests(unittest.TestCase):
     def test_publishes_artifact_then_immutable_marker(self) -> None:
         payload = b"small-public-model"
         with tempfile.TemporaryDirectory() as directory, patch.object(
-            module.urllib.request,
-            "urlopen",
+            module.urllib.request.OpenerDirector,
+            "open",
             return_value=FakeResponse(payload),
         ):
             root = Path(directory)
@@ -108,7 +108,7 @@ class ModelHydratorTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            with patch.object(module.urllib.request, "urlopen") as request:
+            with patch.object(module.urllib.request.OpenerDirector, "open") as request:
                 result = module.hydrate(root, first_manifest)
             request.assert_not_called()
             self.assertEqual(result["status"], "already_ready")
@@ -121,10 +121,25 @@ class ModelHydratorTests(unittest.TestCase):
             module,
             "capacity",
             return_value={"total_bytes": 1_000, "free_bytes": 50},
-        ), patch.object(module.urllib.request, "urlopen") as request:
+        ), patch.object(module.urllib.request.OpenerDirector, "open") as request:
             with self.assertRaisesRegex(module.HydrationError, "required"):
                 module.hydrate(Path(directory), value)
             request.assert_not_called()
+
+    def test_rejects_huggingface_redirect_to_an_untrusted_host(self) -> None:
+        handler = module.TrustedRedirectHandler()
+        request = module.urllib.request.Request(
+            "https://huggingface.co/owner/repo/resolve/main/model.bin"
+        )
+        with self.assertRaisesRegex(module.HydrationError, "untrusted"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "https://attacker.example/model.bin",
+            )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,39 @@ MAX_MANIFEST_BYTES = 64 * 1024
 MAX_ERROR_BYTES = 2 * 1024
 
 
+def trusted_huggingface_host(hostname: str) -> bool:
+    return (
+        hostname == "huggingface.co"
+        or hostname.endswith(".hf.co")
+        or hostname.endswith(".huggingface.co")
+    )
+
+
+class TrustedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Allow source redirects only to HTTPS Hugging Face infrastructure."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        parsed = urllib.parse.urlsplit(new_url)
+        if parsed.scheme != "https" or not parsed.hostname or not trusted_huggingface_host(
+            parsed.hostname
+        ):
+            raise HydrationError(
+                "source_redirect_untrusted",
+                "Hugging Face redirected to an untrusted download host",
+            )
+        return super().redirect_request(
+            request, file_pointer, code, message, headers, new_url
+        )
+
+
 class HydrationError(RuntimeError):
     """Terminal, low-cardinality hydration failure."""
 
@@ -138,11 +171,7 @@ def validate_manifest(value: dict[str, Any]) -> dict[str, object]:
         raise HydrationError("manifest_invalid", "hydration source URL is invalid") from error
     if parsed_url.scheme != "https" or not parsed_url.hostname:
         raise HydrationError("manifest_invalid", "hydration source must use HTTPS")
-    if kind == "huggingface" and not (
-        parsed_url.hostname == "huggingface.co"
-        or parsed_url.hostname.endswith(".hf.co")
-        or parsed_url.hostname.endswith(".huggingface.co")
-    ):
+    if kind == "huggingface" and not trusted_huggingface_host(parsed_url.hostname):
         raise HydrationError("manifest_invalid", "Hugging Face source host is not trusted")
     return {
         "sha256": sha256,
@@ -212,8 +241,13 @@ def download(
     if offset:
         headers["Range"] = f"bytes={offset}-"
     request = urllib.request.Request(url, headers=headers)
+    opener = (
+        urllib.request.build_opener(TrustedRedirectHandler())
+        if source_kind == "huggingface"
+        else urllib.request.build_opener()
+    )
     try:
-        response = urllib.request.urlopen(request, timeout=120)
+        response = opener.open(request, timeout=120)
     except urllib.error.HTTPError as error:
         raise HydrationError("source_rejected", f"model source returned HTTP {error.code}") from error
     with response:
