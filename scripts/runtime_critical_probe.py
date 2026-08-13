@@ -29,6 +29,9 @@ if str(AUDIT_SCRIPT.parent) not in sys.path:
 
 from runtime_portability_audit import (  # noqa: E402
     CRITICAL_IMPORT_ALLOWLIST,
+    CRITICAL_IMPORT_PROFILES,
+    CRITICAL_PROFILE_POLICIES,
+    CRITICAL_PROFILE_IMPORTS,
     CRITICAL_POLICY,
     CRITICAL_PROBE_VERSION,
     MAX_CRITICAL_SOURCE_BYTES,
@@ -103,7 +106,7 @@ def _classify_shared_objects(paths: list[str]) -> dict[str, list[str]]:
     }
 
 
-def _import_one(module: str, required: bool) -> dict[str, Any]:
+def _import_one(module: str, required: bool, profile: str = "cpu") -> dict[str, Any]:
     if module not in CRITICAL_IMPORT_ALLOWLIST:
         raise RuntimeAuditError(f"module is not allowlisted: {module}")
     stdout = io.StringIO()
@@ -136,6 +139,7 @@ def _import_one(module: str, required: bool) -> dict[str, Any]:
     return {
         "module": module,
         "required": required,
+        "profile": profile,
         "status": status,
         "duration_ms": int((time.monotonic() - started) * 1000),
         "before_shared_objects": before_shared_objects,
@@ -149,6 +153,30 @@ def _import_one(module: str, required: bool) -> dict[str, Any]:
         "new_mapped_files": new_mapped,
         "stderr": _truncate(stderr.getvalue()),
         "stdout": _truncate(stdout.getvalue()),
+    }
+
+
+def _not_executed(module: str, required: bool, profile: str) -> dict[str, Any]:
+    """Record a deliberately skipped profile check without claiming success."""
+
+    return {
+        "module": module,
+        "required": required,
+        "profile": profile,
+        "status": "not_executed",
+        "duration_ms": 0,
+        "reason_code": "environment_unavailable",
+        "before_shared_objects": [],
+        "before_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+        "before_mapped_files": [],
+        "cumulative_shared_objects": [],
+        "cumulative_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+        "cumulative_mapped_files": [],
+        "new_shared_objects": [],
+        "new_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+        "new_mapped_files": [],
+        "stderr": "",
+        "stdout": "",
     }
 
 
@@ -169,10 +197,18 @@ def _compile_main_script(config: dict[str, Any]) -> dict[str, Any]:
     return {"path": str(path), "status": "pass", "source_bytes": len(source)}
 
 
-def run_probe(config: dict[str, Any]) -> dict[str, Any]:
+def run_probe(config: dict[str, Any], probe_profile: str | None = None) -> dict[str, Any]:
+    selected_profile = probe_profile or config["default_probe_profile"]
+    if selected_profile not in CRITICAL_IMPORT_PROFILES:
+        raise RuntimeAuditError(f"unsupported critical probe profile: {selected_profile}")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     os.environ["PYTHONNOUSERSITE"] = "1"
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    if selected_profile == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    # A GPU smoke caller owns device selection. Do not create or overwrite
+    # CUDA_VISIBLE_DEVICES for that profile: an inherited restriction remains
+    # evidence, while an absent variable leaves the provider-visible devices
+    # available to the import checks.
     # Do not inherit a potentially read-only image home or an image-provided
     # user site/PYTHONPATH.  The runtime itself is limited to /tmp for
     # temporary writes; /audit is the dedicated evidence sink mounted by CI.
@@ -192,14 +228,28 @@ def run_probe(config: dict[str, Any]) -> dict[str, Any]:
 
     main_script_compile = _compile_main_script(config)
     imports = [item for item in config["imports"] if item["module"] in CRITICAL_IMPORT_ALLOWLIST]
-    results = [_import_one(item["module"], item["required"]) for item in imports]
-    required_failed = main_script_compile["status"] != "pass" or any(item["required"] and item["status"] != "pass" for item in results)
+    runnable_profiles = CRITICAL_PROFILE_IMPORTS[selected_profile]
+    results: list[dict[str, Any]] = []
+    for item in imports:
+        if item["profile"] in runnable_profiles:
+            result = _import_one(item["module"], item["required"], item["profile"])
+        else:
+            result = _not_executed(item["module"], item["required"], item["profile"])
+        results.append(result)
+    required_failed = main_script_compile["status"] != "pass" or any(
+        item["required"] and item["status"] != "pass"
+        for item in results
+        if item["profile"] in runnable_profiles
+    )
+    has_unexecuted = any(item["status"] == "not_executed" for item in results)
     return {
         "schema_version": CRITICAL_PROBE_VERSION,
         "profile": config["profile"],
+        "probe_profile": selected_profile,
         "config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
-        "status": "blocker" if required_failed else "pass",
-        "policy": POLICY,
+        "status": "blocker" if required_failed else "partial" if has_unexecuted else "pass",
+        "coverage": "partial" if has_unexecuted else "complete",
+        "policy": CRITICAL_PROFILE_POLICIES[selected_profile],
         "main_script_compile": main_script_compile,
         "import_review": config["import_review"],
         "imports": results,
@@ -210,6 +260,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--profile", choices=("cpu", "gpu_required"))
     return parser
 
 
@@ -218,15 +269,17 @@ def main(argv: list[str] | None = None) -> int:
     report: dict[str, Any]
     try:
         config = load_critical_config(args.config)
-        report = run_probe(config)
-        exit_code = 1 if report["status"] != "pass" else 0
+        report = run_probe(config, args.profile)
+        exit_code = 1 if report["status"] == "blocker" else 0
     except (RuntimeAuditError, OSError) as error:
         report = {
             "schema_version": CRITICAL_PROBE_VERSION,
             "profile": "base",
+            "probe_profile": args.profile or "cpu",
             "config_sha256": "0" * 64,
             "status": "blocker",
-            "policy": POLICY,
+            "coverage": "incomplete",
+            "policy": CRITICAL_PROFILE_POLICIES.get(args.profile or "cpu", POLICY),
             "main_script_compile": {"path": "/app/comfyui/main.py", "status": "failed", "source_bytes": 0, "error": str(error)},
             "import_review": [],
             "imports": [],

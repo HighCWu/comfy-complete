@@ -26,10 +26,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
-AUDIT_VERSION = "runtime-portability/v1"
-CRITICAL_CONFIG_VERSION = 2
-CRITICAL_PROBE_VERSION = 2
+SCHEMA_VERSION = 2
+AUDIT_VERSION = "runtime-portability/v2"
+CRITICAL_CONFIG_VERSION = 3
+CRITICAL_PROBE_VERSION = 3
 DEFAULT_TARGETS = ("/opt/conda", "/app/comfyui")
 DEFAULT_EXCLUDES = (
     "/app/comfyui/output",
@@ -56,6 +56,14 @@ MAX_CRITICAL_SOURCE_BYTES = 4 * 1024 * 1024
 CRITICAL_IMPORT_ALLOWLIST = frozenset(
     {"torch", "numpy", "PIL", "aiohttp", "folder_paths", "comfy", "server", "execution"}
 )
+CRITICAL_PROFILES = ("cpu", "gpu_required")
+CRITICAL_IMPORT_PROFILES = frozenset(CRITICAL_PROFILES)
+CRITICAL_PROFILE_IMPORTS = {
+    "cpu": frozenset({"cpu"}),
+    "gpu_required": frozenset({"cpu", "gpu_required"}),
+}
+CRITICAL_IMPORT_STATUSES = frozenset({"pass", "failed", "timeout", "not_executed"})
+CRITICAL_SKIP_REASON = "environment_unavailable"
 CRITICAL_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 CRITICAL_POLICY = {
     "network": "none",
@@ -63,6 +71,13 @@ CRITICAL_POLICY = {
     "writable_paths": ["/tmp", "/audit"],
     "execution": "allowlisted-interpreter-only",
     "gpu": "CUDA_VISIBLE_DEVICES-empty-no-explicit-init",
+}
+CRITICAL_PROFILE_POLICIES = {
+    "cpu": dict(CRITICAL_POLICY),
+    "gpu_required": {
+        **CRITICAL_POLICY,
+        "gpu": "CUDA_VISIBLE_DEVICES-provided-gpu-smoke",
+    },
 }
 SEVERITIES = ("blocker", "warning", "info")
 SEVERITY_ORDER = {value: index for index, value in enumerate(SEVERITIES)}
@@ -234,11 +249,25 @@ def validate_critical_config(value: object) -> dict[str, Any]:
 
     if not isinstance(value, dict):
         raise RuntimeAuditError("critical runtime config must be an object")
-    required = {"schema_version", "profile", "probe_policy", "interpreter", "working_directory", "main_script", "entrypoints", "launcher_contract", "imports", "import_review"}
+    required = {
+        "schema_version", "profile", "probe_profiles", "default_probe_profile",
+        "probe_policy", "interpreter", "working_directory", "main_script",
+        "entrypoints", "launcher_contract", "imports", "import_review",
+    }
     if set(value) != required:
         raise RuntimeAuditError("critical runtime config has an invalid shape")
     if value["schema_version"] != CRITICAL_CONFIG_VERSION or value["profile"] != "base":
         raise RuntimeAuditError("unsupported critical runtime config version or profile")
+    probe_profiles = value["probe_profiles"]
+    if (
+        not isinstance(probe_profiles, list)
+        or probe_profiles != list(CRITICAL_PROFILES)
+        or len(set(probe_profiles)) != len(probe_profiles)
+    ):
+        raise RuntimeAuditError("critical probe_profiles must declare cpu and gpu_required exactly once")
+    default_probe_profile = value["default_probe_profile"]
+    if default_probe_profile not in CRITICAL_IMPORT_PROFILES:
+        raise RuntimeAuditError("critical default_probe_profile is invalid")
     probe_policy = value["probe_policy"]
     if probe_policy != CRITICAL_POLICY:
         raise RuntimeAuditError("critical probe policy is invalid")
@@ -329,36 +358,45 @@ def validate_critical_config(value: object) -> dict[str, Any]:
     imports: list[dict[str, Any]] = []
     seen_modules: set[str] = set()
     for index, raw in enumerate(raw_imports):
-        if not isinstance(raw, dict) or set(raw) != {"module", "required"}:
+        if not isinstance(raw, dict) or set(raw) != {"module", "required", "profile"}:
             raise RuntimeAuditError(f"critical imports[{index}] has an invalid shape")
         module = _critical_module(raw["module"], f"critical imports[{index}].module")
         if module in seen_modules:
             raise RuntimeAuditError(f"duplicate critical import: {module}")
         if not isinstance(raw["required"], bool):
             raise RuntimeAuditError(f"critical imports[{index}].required must be boolean")
+        if raw["profile"] not in CRITICAL_IMPORT_PROFILES:
+            raise RuntimeAuditError(f"critical imports[{index}].profile is invalid")
         seen_modules.add(module)
-        imports.append({"module": module, "required": raw["required"]})
+        imports.append({"module": module, "required": raw["required"], "profile": raw["profile"]})
     raw_review = value["import_review"]
     if not isinstance(raw_review, list) or len(raw_review) != len(imports):
         raise RuntimeAuditError("critical import_review must contain one entry per import")
     review: list[dict[str, Any]] = []
     review_modules: set[str] = set()
     for index, raw in enumerate(raw_review):
-        if not isinstance(raw, dict) or set(raw) != {"module", "safe_import", "reason"}:
+        if not isinstance(raw, dict) or set(raw) != {"module", "safe_import", "profile", "reason"}:
             raise RuntimeAuditError(f"critical import_review[{index}] has an invalid shape")
         module = _critical_module(raw["module"], f"critical import_review[{index}].module")
         if module in review_modules or module not in seen_modules:
             raise RuntimeAuditError(f"critical import_review[{index}] does not match imports")
         if not isinstance(raw["safe_import"], bool) or not raw["safe_import"]:
             raise RuntimeAuditError(f"critical import_review[{index}].safe_import must be true")
+        if raw["profile"] not in CRITICAL_IMPORT_PROFILES:
+            raise RuntimeAuditError(f"critical import_review[{index}].profile is invalid")
+        expected_profile = next(item["profile"] for item in imports if item["module"] == module)
+        if raw["profile"] != expected_profile:
+            raise RuntimeAuditError(f"critical import_review[{index}].profile does not match imports")
         reason = _text(raw["reason"], f"critical import_review[{index}].reason", limit=MAX_CRITICAL_PROBE_OUTPUT)
         review_modules.add(module)
-        review.append({"module": module, "safe_import": True, "reason": reason})
+        review.append({"module": module, "safe_import": True, "profile": raw["profile"], "reason": reason})
     if review_modules != seen_modules:
         raise RuntimeAuditError("critical import_review must exactly match imports")
     return {
         "schema_version": CRITICAL_CONFIG_VERSION,
         "profile": "base",
+        "probe_profiles": list(CRITICAL_PROFILES),
+        "default_probe_profile": default_probe_profile,
         "probe_policy": dict(CRITICAL_POLICY),
         "interpreter": interpreter,
         "working_directory": working_directory,
@@ -390,17 +428,24 @@ def load_critical_probe(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeAuditError(f"critical probe JSON is invalid: {error}") from error
-    required_report_fields = {"schema_version", "profile", "config_sha256", "status", "policy", "main_script_compile", "import_review", "imports"}
+    required_report_fields = {
+        "schema_version", "profile", "probe_profile", "config_sha256", "status",
+        "coverage", "policy", "main_script_compile", "import_review", "imports",
+    }
     allowed_report_fields = required_report_fields | {"error"}
     if not isinstance(value, dict) or not set(value).issubset(allowed_report_fields) or not required_report_fields.issubset(value):
         raise RuntimeAuditError("critical probe report has an invalid shape")
     if value["schema_version"] != CRITICAL_PROBE_VERSION or value["profile"] != "base":
         raise RuntimeAuditError("unsupported critical probe version or profile")
+    if value["probe_profile"] not in CRITICAL_IMPORT_PROFILES:
+        raise RuntimeAuditError("critical probe profile is invalid")
     digest = value["config_sha256"]
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise RuntimeAuditError("critical probe config_sha256 is invalid")
-    if value["status"] not in {"pass", "blocker", "limited"}:
+    if value["status"] not in {"pass", "partial", "blocker", "limited"}:
         raise RuntimeAuditError("critical probe status is invalid")
+    if value["coverage"] not in {"complete", "partial", "incomplete"}:
+        raise RuntimeAuditError("critical probe coverage is invalid")
     if "error" in value and (not isinstance(value["error"], str) or len(value["error"]) > MAX_CRITICAL_PROBE_OUTPUT or _control(value["error"])):
         raise RuntimeAuditError("critical probe error is invalid")
     compile_report = value["main_script_compile"]
@@ -416,14 +461,21 @@ def load_critical_probe(path: Path) -> dict[str, Any]:
         raise RuntimeAuditError("critical import_review is invalid")
     review_modules: set[str] = set()
     for index, item in enumerate(import_review):
-        if not isinstance(item, dict) or set(item) != {"module", "safe_import", "reason"}:
+        if not isinstance(item, dict) or set(item) != {"module", "safe_import", "profile", "reason"}:
             raise RuntimeAuditError(f"critical probe import_review[{index}] is invalid")
         module = _critical_module(item["module"], f"critical probe import_review[{index}].module")
-        if module in review_modules or not item["safe_import"] or not isinstance(item["reason"], str) or not item["reason"]:
+        if (
+            module in review_modules
+            or not item["safe_import"]
+            or item["profile"] not in CRITICAL_IMPORT_PROFILES
+            or not isinstance(item["reason"], str)
+            or not item["reason"]
+        ):
             raise RuntimeAuditError(f"critical probe import_review[{index}] is invalid")
         review_modules.add(module)
     policy = value["policy"]
-    if not isinstance(policy, dict) or policy != CRITICAL_POLICY:
+    expected_policy = CRITICAL_PROFILE_POLICIES[value["probe_profile"]]
+    if not isinstance(policy, dict) or policy != expected_policy:
         raise RuntimeAuditError("critical probe policy is invalid")
     imports = value["imports"]
     if not isinstance(imports, list) or len(imports) > MAX_CRITICAL_PATHS:
@@ -431,20 +483,25 @@ def load_critical_probe(path: Path) -> dict[str, Any]:
     seen_modules: set[str] = set()
     for index, item in enumerate(imports):
         required_fields = {
-            "module", "required", "status", "duration_ms",
+            "module", "required", "profile", "status", "duration_ms",
             "before_shared_objects", "before_shared_object_classification", "before_mapped_files",
             "cumulative_shared_objects", "cumulative_shared_object_classification", "cumulative_mapped_files",
             "new_shared_objects", "new_shared_object_classification", "new_mapped_files",
             "stderr", "stdout",
         }
-        if not isinstance(item, dict) or not set(item).issubset(required_fields) or not required_fields.issubset(item):
+        if not isinstance(item, dict) or not set(item).issubset(required_fields | {"reason_code"}) or not required_fields.issubset(item):
             raise RuntimeAuditError(f"critical probe imports[{index}] has an invalid shape")
         module = _critical_module(item["module"], f"critical probe imports[{index}].module")
         if module in seen_modules:
             raise RuntimeAuditError(f"duplicate critical probe import: {module}")
         seen_modules.add(module)
-        if not isinstance(item["required"], bool) or item["status"] not in {"pass", "failed", "timeout"}:
+        if not isinstance(item["required"], bool) or item["profile"] not in CRITICAL_IMPORT_PROFILES or item["status"] not in CRITICAL_IMPORT_STATUSES:
             raise RuntimeAuditError(f"critical probe imports[{index}] has invalid status metadata")
+        if item["status"] == "not_executed":
+            if item["profile"] != "gpu_required" or item.get("reason_code") != CRITICAL_SKIP_REASON:
+                raise RuntimeAuditError(f"critical probe imports[{index}] has an invalid not_executed reason")
+        elif "reason_code" in item:
+            raise RuntimeAuditError(f"critical probe imports[{index}] has an unexpected reason_code")
         if not isinstance(item["duration_ms"], int) or item["duration_ms"] < 0:
             raise RuntimeAuditError(f"critical probe imports[{index}].duration_ms is invalid")
         for field in ("before_shared_objects", "cumulative_shared_objects", "new_shared_objects", "before_mapped_files", "cumulative_mapped_files", "new_mapped_files"):
@@ -487,6 +544,15 @@ def load_critical_probe(path: Path) -> dict[str, Any]:
                 raise RuntimeAuditError(f"critical probe imports[{index}].{field} is invalid")
     if review_modules != seen_modules:
         raise RuntimeAuditError("critical probe import_review must exactly match imports")
+    has_unexecuted = any(item["status"] == "not_executed" for item in imports)
+    if value["coverage"] == "partial" and not has_unexecuted:
+        raise RuntimeAuditError("critical probe partial coverage has no not_executed import evidence")
+    if value["coverage"] == "complete" and has_unexecuted:
+        raise RuntimeAuditError("critical probe complete coverage contains not_executed imports")
+    if value["status"] == "partial" and value["coverage"] != "partial":
+        raise RuntimeAuditError("critical probe partial status requires partial coverage")
+    if value["status"] == "pass" and value["coverage"] != "complete":
+        raise RuntimeAuditError("critical probe pass status requires complete coverage")
     return value
 
 
@@ -803,30 +869,79 @@ def _critical_closure(config: Mapping[str, Any], selected: Mapping[str, Record],
     return {"elfs": sorted(reports, key=lambda value: value["path"]), "visited": sorted(visited)}, findings, limited
 
 
-def _critical_report(config: Mapping[str, Any], source_root: Path, selected: Mapping[str, Record], inventory: LauncherInventory, limits: Limits, probe: Mapping[str, Any] | None) -> dict[str, Any]:
+def _critical_report(config: Mapping[str, Any], source_root: Path, selected: Mapping[str, Record], inventory: LauncherInventory, limits: Limits, probe: Mapping[str, Any] | None, probe_profile: str | None = None) -> dict[str, Any]:
     findings = _critical_entrypoint_findings(config, source_root, selected, inventory)
     closure, closure_findings, closure_limited = _critical_closure(config, selected, inventory, limits)
     findings.extend(closure_findings)
     imports = [] if probe is None else list(probe["imports"])
     expected_probe_digest = hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    expected_probe_profile = probe_profile or str(config["default_probe_profile"])
+    if expected_probe_profile not in CRITICAL_IMPORT_PROFILES:
+        raise RuntimeAuditError("critical portability probe profile is invalid")
     if probe is None:
         _add(findings, "critical_probe_missing", "blocker", "critical import probe report was not supplied")
-    elif probe["status"] != "pass":
+    elif probe["probe_profile"] != expected_probe_profile:
+        _add(
+            findings,
+            "critical_probe_profile_mismatch",
+            "blocker",
+            "critical import probe profile does not match the configured portability profile",
+            str(probe["probe_profile"]),
+            {"expected": expected_probe_profile},
+        )
+    elif probe["status"] in {"blocker", "limited"}:
         _add(findings, "critical_probe_failed", "blocker", "critical import probe did not pass")
+    elif probe["status"] == "partial" and expected_probe_profile != "cpu":
+        _add(findings, "critical_probe_partial_not_allowed", "blocker", "GPU-required critical probe must execute every configured import")
     elif probe["config_sha256"] != expected_probe_digest:
         _add(findings, "critical_probe_config_mismatch", "blocker", "critical import probe was generated from a different config")
     else:
-        expected_imports = {str(item["module"]): bool(item["required"]) for item in config["imports"]}
+        expected_imports = {
+            str(item["module"]): {
+                "required": bool(item["required"]),
+                "profile": str(item["profile"]),
+            }
+            for item in config["imports"]
+        }
+        runnable_profiles = CRITICAL_PROFILE_IMPORTS[expected_probe_profile]
         actual_imports: dict[str, Mapping[str, Any]] = {}
         for item in imports:
             module = str(item["module"])
             if module in actual_imports:
                 _add(findings, "critical_probe_duplicate_import", "blocker", "critical import probe contains a duplicate module", module)
             actual_imports[module] = item
-            if module not in expected_imports or bool(item["required"]) != expected_imports[module]:
+            expected = expected_imports.get(module)
+            if expected is None or bool(item["required"]) != expected["required"] or item["profile"] != expected["profile"]:
                 _add(findings, "critical_probe_import_mismatch", "blocker", "critical import probe module metadata does not match config", module)
-            elif expected_imports[module] and item["status"] != "pass":
+                continue
+            if expected["profile"] not in runnable_profiles:
+                if item["status"] != "not_executed" or item.get("reason_code") != CRITICAL_SKIP_REASON:
+                    _add(
+                        findings,
+                        "critical_probe_profile_status_invalid",
+                        "blocker",
+                        "GPU-required import must be recorded as not_executed with environment_unavailable in a CPU probe",
+                        module,
+                    )
+            elif expected["required"] and item["status"] != "pass":
                 _add(findings, "critical_probe_required_import_failed", "blocker", "required critical import did not pass", module)
+            elif item["status"] == "pass":
+                external_mappings = sorted({
+                    path
+                    for category in ("launcher_or_system", "other")
+                    for path in item["cumulative_shared_object_classification"][category]
+                })
+                for mapped_path in external_mappings:
+                    if _resolve_inventory(mapped_path, inventory) == "provided" or posixpath.basename(mapped_path) in inventory.library_names:
+                        continue
+                    _add(
+                        findings,
+                        "critical_probe_unprovided_shared_object",
+                        "blocker",
+                        "executed critical import mapped a shared object outside the runtime archive that is absent from launcher inventory",
+                        module,
+                        {"mapped_path": mapped_path},
+                    )
         missing_imports = sorted(set(expected_imports) - set(actual_imports))
         for module in missing_imports:
             _add(findings, "critical_probe_import_missing", "blocker", "critical import is absent from probe report", module)
@@ -837,9 +952,12 @@ def _critical_report(config: Mapping[str, Any], source_root: Path, selected: Map
         findings.append({"code": "critical_finding_limit_exceeded", "severity": "blocker", "path": "", "detail": "critical finding limit exceeded; report is incomplete"})
     counts = {severity: sum(1 for value in findings if value["severity"] == severity) for severity in SEVERITIES}
     status = "blocker" if counts["blocker"] else "limited" if closure_limited or truncated else "pass"
+    if status == "pass" and probe is not None and probe.get("coverage") == "partial":
+        status = "partial"
     return {
         "status": status,
         "profile": config["profile"],
+        "probe_profile": expected_probe_profile,
         "config": config,
         "probe": probe,
         "entrypoints": config["entrypoints"],
@@ -1142,7 +1260,7 @@ def _sorted_findings(findings: Sequence[dict[str, Any]], limit: int) -> tuple[li
     return ordered[:limit], len(ordered) > limit
 
 
-def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS, app_files: Sequence[str] = (), exclusions: Sequence[str] = DEFAULT_EXCLUDES, launcher_inventory: LauncherInventory | None = None, limits: Limits | None = None, critical_config: Mapping[str, Any] | None = None, critical_probe: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS, app_files: Sequence[str] = (), exclusions: Sequence[str] = DEFAULT_EXCLUDES, launcher_inventory: LauncherInventory | None = None, limits: Limits | None = None, critical_config: Mapping[str, Any] | None = None, critical_probe: Mapping[str, Any] | None = None, critical_profile: str | None = None) -> dict[str, Any]:
     active_limits = limits or Limits()
     if active_limits.max_entries <= 0 or active_limits.max_findings <= 0 or active_limits.max_shebang_bytes <= 0:
         raise RuntimeAuditError("audit limits must be positive")
@@ -1176,7 +1294,23 @@ def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS
         "provided_launcher_inventory": {"system_paths": list(inventory.system_paths), "libraries": list(inventory.libraries), "library_paths": list(inventory.library_paths), "executable_paths": list(inventory.executable_paths), "symlinks": [{"path": source, "target": target} for source, target in inventory.symlinks]},
     }
     if critical_config is not None:
-        report["critical"] = _critical_report(critical_config, source_root, selected, inventory, active_limits, critical_probe)
+        report["critical"] = _critical_report(critical_config, source_root, selected, inventory, active_limits, critical_probe, critical_profile)
+        critical_status = report["critical"]["status"]
+        report["gate"] = {
+            "status": "pass" if critical_status in {"pass", "partial"} else critical_status,
+            "source": "critical",
+            "profile": report["critical"]["profile"],
+            "probe_profile": report["critical"]["probe_profile"],
+            "evidence_status": critical_status,
+        }
+    else:
+        report["gate"] = {
+            "status": status,
+            "source": "whole_rootfs",
+            "profile": None,
+            "probe_profile": None,
+            "evidence_status": status,
+        }
     return report
 
 
@@ -1194,6 +1328,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--launcher-inventory", type=Path)
     parser.add_argument("--critical-config", type=Path)
     parser.add_argument("--critical-probe", type=Path)
+    parser.add_argument("--critical-profile", choices=tuple(CRITICAL_PROFILES))
     parser.add_argument("--max-entries", type=int, default=MAX_ENTRIES)
     parser.add_argument("--max-shebang-bytes", type=int, default=MAX_TEXT)
     parser.add_argument("--max-findings", type=int, default=MAX_FINDINGS)
@@ -1210,14 +1345,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         critical_probe = load_critical_probe(args.critical_probe) if args.critical_probe else None
         if critical_probe is not None and critical_config is None:
             raise RuntimeAuditError("--critical-probe requires --critical-config")
-        report = audit_runtime(source_root=args.source_root, targets=policy["targets"], app_files=policy["include_app"], exclusions=policy["excludes"], launcher_inventory=inventory, limits=Limits(args.max_entries, args.max_shebang_bytes, args.max_findings), critical_config=critical_config, critical_probe=critical_probe)
+        report = audit_runtime(source_root=args.source_root, targets=policy["targets"], app_files=policy["include_app"], exclusions=policy["excludes"], launcher_inventory=inventory, limits=Limits(args.max_entries, args.max_shebang_bytes, args.max_findings), critical_config=critical_config, critical_probe=critical_probe, critical_profile=args.critical_profile)
         rendered = render_report(report)
         if args.output:
             args.output.write_text(rendered, encoding="utf-8")
         else:
             sys.stdout.write(rendered)
-        critical_status = report.get("critical", {}).get("status")
-        return 1 if report["status"] in ("blocker", "limited") or critical_status in ("blocker", "limited") else 0
+        return 1 if report["gate"]["status"] in ("blocker", "limited") else 0
     except (RuntimeAuditError, OSError) as error:
         print(f"runtime portability audit failed: {error}", file=sys.stderr)
         return 2

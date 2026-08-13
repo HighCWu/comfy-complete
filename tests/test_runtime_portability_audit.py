@@ -239,7 +239,10 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             after = sorted((path.relative_to(root).as_posix(), path.stat().st_mtime_ns) for path in root.rglob("*") if not path.is_symlink())
             self.assertEqual(first, second)
             self.assertEqual(before, after)
-            self.assertEqual(json.loads(first)["schema_version"], 1)
+            parsed = json.loads(first)
+            self.assertEqual(parsed["schema_version"], 2)
+            self.assertEqual(parsed["gate"]["source"], "whole_rootfs")
+            self.assertEqual(parsed["gate"]["status"], parsed["status"])
 
     def test_readelf_missing_is_explicitly_limited(self) -> None:
         with tempfile.TemporaryDirectory():
@@ -259,6 +262,88 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             with patch.object(audit.shutil, "which", return_value=None):
                 exit_code = audit.main(["--source-root", str(root), "--output", str(output)])
             self.assertNotEqual(exit_code, 0)
+
+    def test_critical_gate_can_pass_while_whole_rootfs_inventory_stays_blocked(self) -> None:
+        root = self.rootfs()
+        interpreter = root / "opt/conda/bin/python"
+        interpreter.write_bytes(Path("/bin/true").read_bytes())
+        interpreter.chmod(0o755)
+        (root / "app/comfyui/main.py").write_text("value = 1\n", encoding="utf-8")
+        optional = root / "app/comfyui/bin/optional-tool"
+        optional.write_text("#!/missing/optional-interpreter\n", encoding="utf-8")
+        optional.chmod(0o755)
+        config = audit.load_critical_config(ROOT / "ci/runtime-critical-entrypoints.json")
+        with patch.object(probe.os, "chdir"), patch.object(
+            probe,
+            "_compile_main_script",
+            return_value={"path": "/app/comfyui/main.py", "status": "pass", "source_bytes": 10},
+        ), patch.object(probe, "_import_one", side_effect=lambda module, required, profile: {
+            "module": module,
+            "required": required,
+            "profile": profile,
+            "status": "pass",
+            "duration_ms": 1,
+            "before_shared_objects": [],
+            "before_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+            "before_mapped_files": [],
+            "cumulative_shared_objects": [],
+            "cumulative_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+            "cumulative_mapped_files": [],
+            "new_shared_objects": [],
+            "new_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+            "new_mapped_files": [],
+            "stderr": "",
+            "stdout": "",
+        }):
+            critical_probe = probe.run_probe(config, "cpu")
+        metadata = audit._elf_metadata(
+            subprocess.run(
+                ["readelf", "-lW", "-dW", str(interpreter)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout
+        )
+        inventory = audit.LauncherInventory(
+            system_paths=(metadata["interpreter"],),
+            executable_paths=(metadata["interpreter"],),
+            libraries=tuple(metadata["needed"]),
+        )
+        report = audit.audit_runtime(
+            source_root=root,
+            targets=["/opt/conda", "/app/comfyui"],
+            exclusions=[],
+            launcher_inventory=inventory,
+            critical_config=config,
+            critical_probe=critical_probe,
+            critical_profile="cpu",
+        )
+        self.assertEqual(report["status"], "blocker")
+        self.assertEqual(report["critical"]["status"], "partial")
+        self.assertEqual(report["gate"], {
+            "status": "pass",
+            "source": "critical",
+            "profile": "base",
+            "probe_profile": "cpu",
+            "evidence_status": "partial",
+        })
+
+    def test_critical_blocker_controls_gate_even_when_whole_rootfs_passes(self) -> None:
+        root = self.rootfs()
+        config = audit.load_critical_config(ROOT / "ci/runtime-critical-entrypoints.json")
+        report = audit.audit_runtime(
+            source_root=root,
+            targets=["/opt/conda", "/app/comfyui"],
+            exclusions=[],
+            critical_config=config,
+            critical_probe=None,
+            critical_profile="cpu",
+        )
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["critical"]["status"], "blocker")
+        self.assertEqual(report["gate"]["status"], "blocker")
+        self.assertEqual(report["gate"]["source"], "critical")
 
     def test_empty_rpath_and_runpath_are_not_unresolved_paths(self) -> None:
         metadata = audit._elf_metadata(
@@ -313,13 +398,22 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
         with self.assertRaises(audit.RuntimeAuditError):
             audit.validate_critical_config(bad)
         bad = json.loads(json.dumps(config))
-        bad["imports"].append({"module": "torch", "required": True})
+        bad["imports"].append({"module": "torch", "required": True, "profile": "cpu"})
         with self.assertRaises(audit.RuntimeAuditError):
             audit.validate_critical_config(bad)
         bad = json.loads(json.dumps(config))
         bad["schema_version"] = 1
         with self.assertRaises(audit.RuntimeAuditError):
             audit.validate_critical_config(bad)
+
+        self.assertEqual(config["default_probe_profile"], "cpu")
+        profiles = {item["module"]: item["profile"] for item in validated["imports"]}
+        self.assertEqual(profiles["execution"], "gpu_required")
+        self.assertEqual(profiles["server"], "gpu_required")
+        self.assertEqual(
+            {item["module"] for item in validated["imports"] if item["profile"] == "cpu"},
+            {"PIL", "aiohttp", "comfy", "folder_paths", "numpy", "torch"},
+        )
 
     def test_critical_entrypoint_finds_real_root_files_outside_selection(self) -> None:
         with tempfile.TemporaryDirectory():
@@ -337,10 +431,12 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
 
     def test_critical_probe_schema_rejects_control_and_unapproved_imports(self) -> None:
         probe = {
-            "schema_version": 2,
+            "schema_version": 3,
             "profile": "base",
+            "probe_profile": "cpu",
             "config_sha256": "0" * 64,
             "status": "blocker",
+            "coverage": "incomplete",
             "policy": dict(audit.CRITICAL_POLICY),
             "main_script_compile": {"path": "/app/comfyui/main.py", "status": "failed", "source_bytes": 0, "error": "fixture"},
             "import_review": [],
@@ -374,11 +470,12 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
         config = json.loads((ROOT / "ci/runtime-critical-entrypoints.json").read_text(encoding="utf-8"))
         imported: list[tuple[str, bool]] = []
 
-        def fake_import(module: str, required: bool) -> dict[str, object]:
+        def fake_import(module: str, required: bool, profile: str) -> dict[str, object]:
             imported.append((module, required))
             return {
                 "module": module,
                 "required": required,
+                "profile": profile,
                 "status": "pass",
                 "duration_ms": 1,
                 "before_shared_objects": [],
@@ -398,10 +495,84 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             probe.os.environ, {}, clear=False
         ):
             report = probe.run_probe(config)
-        self.assertEqual(report["status"], "pass")
-        self.assertEqual(imported, [(item["module"], item["required"]) for item in config["imports"]])
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(
+            imported,
+            [(item["module"], item["required"]) for item in config["imports"] if item["profile"] == "cpu"],
+        )
+        self.assertEqual(
+            {item["module"] for item in report["imports"] if item["status"] == "not_executed"},
+            {"execution", "server"},
+        )
+        self.assertTrue(all(item["reason_code"] == "environment_unavailable" for item in report["imports"] if item["status"] == "not_executed"))
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["coverage"], "partial")
         self.assertEqual(report["main_script_compile"]["status"], "pass")
         self.assertEqual(report["config_sha256"], hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest())
+
+    def test_gpu_probe_preserves_provider_device_visibility(self) -> None:
+        config = json.loads((ROOT / "ci/runtime-critical-entrypoints.json").read_text(encoding="utf-8"))
+        with patch.object(probe.os, "chdir"), patch.object(
+            probe,
+            "_compile_main_script",
+            return_value={"path": "/app/comfyui/main.py", "status": "pass", "source_bytes": 1},
+        ), patch.object(probe, "_import_one", side_effect=lambda module, required, profile: {
+            "module": module,
+            "required": required,
+            "profile": profile,
+            "status": "pass",
+            "duration_ms": 1,
+            "before_shared_objects": [],
+            "before_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+            "before_mapped_files": [],
+            "cumulative_shared_objects": [],
+            "cumulative_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+            "cumulative_mapped_files": [],
+            "new_shared_objects": [],
+            "new_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+            "new_mapped_files": [],
+            "stderr": "",
+            "stdout": "",
+        }), patch.dict(probe.os.environ, {}, clear=True):
+            report = probe.run_probe(config, "gpu_required")
+            self.assertNotIn("CUDA_VISIBLE_DEVICES", probe.os.environ)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["coverage"], "complete")
+
+    def test_critical_probe_blocks_uninventoried_external_shared_objects(self) -> None:
+        root = self.rootfs()
+        config = audit.load_critical_config(ROOT / "ci/runtime-critical-entrypoints.json")
+        probe_report = {
+            "schema_version": 3,
+            "profile": "base",
+            "probe_profile": "cpu",
+            "config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "status": "partial",
+            "coverage": "partial",
+            "policy": dict(audit.CRITICAL_POLICY),
+            "main_script_compile": {"path": "/app/comfyui/main.py", "status": "pass", "source_bytes": 1},
+            "import_review": config["import_review"],
+            "imports": [],
+        }
+        for item in config["imports"]:
+            result = probe._not_executed(item["module"], item["required"], item["profile"])
+            if item["profile"] == "cpu":
+                result.update({
+                    "status": "pass",
+                    "reason_code": None,
+                    "cumulative_shared_objects": ["/usr/local/cuda/lib/libfixture.so"],
+                    "cumulative_shared_object_classification": {
+                        "runtime": [],
+                        "launcher_or_system": [],
+                        "other": ["/usr/local/cuda/lib/libfixture.so"],
+                    },
+                })
+                result.pop("reason_code")
+            probe_report["imports"].append(result)
+        report = audit._critical_report(config, root, {}, audit.LauncherInventory(), audit.Limits(), probe_report, "cpu")
+        findings = [item for item in report["findings"] if item["code"] == "critical_probe_unprovided_shared_object"]
+        self.assertEqual({item["path"] for item in findings}, {"PIL", "aiohttp", "comfy", "folder_paths", "numpy", "torch"})
+        self.assertTrue(all(item["evidence"]["mapped_path"] == "/usr/local/cuda/lib/libfixture.so" for item in findings))
 
     def test_critical_probe_schema_rejects_duplicate_imports_and_noncanonical_paths(self) -> None:
         config = json.loads((ROOT / "ci/runtime-critical-entrypoints.json").read_text(encoding="utf-8"))
@@ -412,6 +583,7 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             probe, "_import_one", return_value={
                 "module": "PIL",
                 "required": True,
+                "profile": "cpu",
                 "status": "pass",
                 "duration_ms": 1,
                 "before_shared_objects": [],
@@ -427,7 +599,7 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
                 "stdout": "",
             }
         ):
-            report = probe.run_probe({**config, "imports": [{"module": "PIL", "required": True}], "import_review": [config["import_review"][0]]})
+            report = probe.run_probe({**config, "imports": [{"module": "PIL", "required": True, "profile": "cpu"}], "import_review": [config["import_review"][0]]})
         with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
             json.dump(report, handle)
             handle.flush()
