@@ -182,7 +182,7 @@ def test_runtime_audit_launcher_inventory_is_the_evidence_backed_critical_closur
             "/usr/bin/dumb-init",
             "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
         ],
-        "libraries": ["libc.so.6", "libdl.so.2", "libm.so.6", "libpthread.so.0", "libutil.so.1"],
+        "libraries": ["libc.so.6", "libdl.so.2", "libm.so.6", "libpthread.so.0", "librt.so.1", "libutil.so.1"],
         "library_paths": [],
         "executable_paths": [
             "/bin/bash",
