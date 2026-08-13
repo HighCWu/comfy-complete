@@ -42,6 +42,17 @@ def test_docker_workflow_yaml_is_valid():
     assert "jobs" in parsed
 
 
+def test_sageattn_checks_manifest_before_expensive_setup():
+    workflow = DOCKER_BUILD.read_text()
+    block = workflow.split("  build-sageattn:\n", 1)[1].split("\n  build-base:", 1)[0]
+    check = block.index("Check if sageattn image already exists")
+    cleanup = block.index("Free disk space and move Docker data to /mnt")
+    checkout = block.index("actions/checkout@v7")
+    assert check < cleanup < checkout
+    setup = block[cleanup:]
+    assert "if: steps.check.outputs.skipped != 'true'" in setup
+
+
 def test_runtime_audit_job_reuses_published_base_and_is_read_only():
     workflow = DOCKER_BUILD.read_text()
     parsed = yaml.safe_load(workflow)

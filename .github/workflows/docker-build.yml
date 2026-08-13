@@ -27,7 +27,29 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Set image name (lowercase)
+        id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete-sageattn" >> $GITHUB_OUTPUT
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if sageattn image already exists
+        id: check
+        run: |
+          if docker manifest inspect ${{ steps.img.outputs.name }}:${{ env.SAGEATTN_VERSION }} >/dev/null 2>&1; then
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            echo "Image ${{ steps.img.outputs.name }}:${{ env.SAGEATTN_VERSION }} already exists — skipping build"
+          else
+            echo "skipped=false" >> $GITHUB_OUTPUT
+            echo "Image not found — will build"
+          fi
+
       - name: Free disk space and move Docker data to /mnt
+        if: steps.check.outputs.skipped != 'true'
         run: |
           sudo rm -rf \
             /usr/share/dotnet \
@@ -59,27 +81,7 @@ jobs:
           free -h
 
       - uses: actions/checkout@v7
-
-      - name: Set image name (lowercase)
-        id: img
-        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete-sageattn" >> $GITHUB_OUTPUT
-
-      - uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check if sageattn image already exists
-        id: check
-        run: |
-          if docker manifest inspect ${{ steps.img.outputs.name }}:${{ env.SAGEATTN_VERSION }} >/dev/null 2>&1; then
-            echo "skipped=true" >> $GITHUB_OUTPUT
-            echo "Image ${{ steps.img.outputs.name }}:${{ env.SAGEATTN_VERSION }} already exists — skipping build"
-          else
-            echo "skipped=false" >> $GITHUB_OUTPUT
-            echo "Image not found — will build"
-          fi
+        if: steps.check.outputs.skipped != 'true'
 
       - name: Build and push sageattn wheels
         if: steps.check.outputs.skipped != 'true'
