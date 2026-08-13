@@ -1,6 +1,8 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "profile": "base",
+  "probe_profiles": ["cpu", "gpu_required"],
+  "default_probe_profile": "cpu",
   "probe_policy": {
     "network": "none",
     "rootfs": "read-only",
@@ -48,23 +50,23 @@
     }
   ],
   "imports": [
-    {"module": "PIL", "required": true},
-    {"module": "aiohttp", "required": true},
-    {"module": "comfy", "required": true},
-    {"module": "execution", "required": true},
-    {"module": "folder_paths", "required": true},
-    {"module": "numpy", "required": true},
-    {"module": "server", "required": true},
-    {"module": "torch", "required": true}
+    {"module": "PIL", "required": true, "profile": "cpu"},
+    {"module": "aiohttp", "required": true, "profile": "cpu"},
+    {"module": "comfy", "required": true, "profile": "cpu"},
+    {"module": "execution", "required": true, "profile": "gpu_required"},
+    {"module": "folder_paths", "required": true, "profile": "cpu"},
+    {"module": "numpy", "required": true, "profile": "cpu"},
+    {"module": "server", "required": true, "profile": "gpu_required"},
+    {"module": "torch", "required": true, "profile": "cpu"}
   ],
   "import_review": [
-    {"module": "PIL", "safe_import": true, "reason": "Core image type imported by ComfyUI nodes and server; import performs no network or server startup."},
-    {"module": "aiohttp", "safe_import": true, "reason": "ComfyUI server dependency; importing the library does not open a listener or make a network request."},
-    {"module": "comfy", "safe_import": true, "reason": "ComfyUI core package required by main and execution; import is local module loading only."},
-    {"module": "execution", "safe_import": true, "reason": "main.py imports execution before startup; module defines execution machinery and does not run a workflow at import time."},
-    {"module": "folder_paths", "safe_import": true, "reason": "ComfyUI path registry required by main/server; its initialization is local and uses the configured runtime tree."},
-    {"module": "numpy", "safe_import": true, "reason": "Core tensor/image dependency imported by ComfyUI nodes; import does not download or launch services."},
-    {"module": "server", "safe_import": true, "reason": "main.py imports server before PromptServer construction; importing defines routes/classes but does not bind a socket."},
-    {"module": "torch", "safe_import": true, "reason": "Core inference dependency; CUDA visibility is explicitly empty and the probe never performs GPU initialization."}
+    {"module": "PIL", "safe_import": true, "profile": "cpu", "reason": "Core image type imported by ComfyUI nodes and server; import performs no network or server startup."},
+    {"module": "aiohttp", "safe_import": true, "profile": "cpu", "reason": "ComfyUI server dependency; importing the library does not open a listener or make a network request."},
+    {"module": "comfy", "safe_import": true, "profile": "cpu", "reason": "ComfyUI core package required by main and execution; import is local module loading only."},
+    {"module": "execution", "safe_import": true, "profile": "gpu_required", "reason": "main.py imports execution before startup; this module is classified gpu_required until a GPU-capable smoke environment executes it."},
+    {"module": "folder_paths", "safe_import": true, "profile": "cpu", "reason": "ComfyUI path registry required by main/server; its initialization is local and uses the configured runtime tree."},
+    {"module": "numpy", "safe_import": true, "profile": "cpu", "reason": "Core tensor/image dependency imported by ComfyUI nodes; import does not download or launch services."},
+    {"module": "server", "safe_import": true, "profile": "gpu_required", "reason": "main.py imports server before PromptServer construction; this module is classified gpu_required until a GPU-capable smoke environment executes it."},
+    {"module": "torch", "safe_import": true, "profile": "cpu", "reason": "Core inference dependency; CUDA visibility is explicitly empty and the probe never performs GPU initialization."}
   ]
 }

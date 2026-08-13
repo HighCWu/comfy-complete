@@ -1,6 +1,23 @@
 {
-  "system_paths": [],
-  "libraries": [],
+  "system_paths": [
+    "/bin/bash",
+    "/usr/bin/dumb-init",
+    "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+  ],
+  "libraries": [
+    "libc.so.6",
+    "libdl.so.2",
+    "libm.so.6",
+    "libpthread.so.0",
+    "libutil.so.1"
+  ],
   "library_paths": [],
-  "symlinks": {}
+  "executable_paths": [
+    "/bin/bash",
+    "/usr/bin/dumb-init",
+    "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+  ],
+  "symlinks": {
+    "/lib64/ld-linux-x86-64.so.2": "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+  }
 }

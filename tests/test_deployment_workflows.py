@@ -160,6 +160,10 @@ def test_runtime_audit_has_critical_probe_and_uploads_its_evidence():
     assert "critical-probe.log" in block
     assert "--critical-config" in block
     assert "--critical-probe" in block
+    assert "--profile cpu" in block
+    assert "--critical-profile cpu" in block
+    assert '"probe_profile": "cpu"' in block
+    assert '"coverage": "incomplete"' in block
     assert "--network none" in block
     assert "--read-only" in block
     assert "--cap-drop ALL" in block
@@ -170,13 +174,24 @@ def test_runtime_audit_has_critical_probe_and_uploads_its_evidence():
     assert "if: ${{ always() }}" in block
 
 
-def test_runtime_audit_uses_explicit_empty_inventory_without_claiming_success():
+def test_runtime_audit_launcher_inventory_is_the_evidence_backed_critical_closure():
     inventory = REPO_ROOT / "ci" / "runtime-launcher-inventory.json"
     assert yaml.safe_load(inventory.read_text()) == {
-        "system_paths": [],
-        "libraries": [],
+        "system_paths": [
+            "/bin/bash",
+            "/usr/bin/dumb-init",
+            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        ],
+        "libraries": ["libc.so.6", "libdl.so.2", "libm.so.6", "libpthread.so.0", "libutil.so.1"],
         "library_paths": [],
-        "symlinks": {},
+        "executable_paths": [
+            "/bin/bash",
+            "/usr/bin/dumb-init",
+            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        ],
+        "symlinks": {
+            "/lib64/ld-linux-x86-64.so.2": "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        },
     }
 
     policy = yaml.safe_load((REPO_ROOT / "ci" / "runtime-selection-policy.json").read_text())

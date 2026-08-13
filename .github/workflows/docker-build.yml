@@ -485,6 +485,7 @@ jobs:
             "${{ steps.audit-paths.outputs.image }}" \
             /runtime-audit/runtime_critical_probe.py \
             --config /runtime-audit/ci/runtime-critical-entrypoints.json \
+            --profile cpu \
             --output /audit/critical-probe.json
           set +e
           docker start -a "$PROBE_CONTAINER" 2>&1 | tee "$AUDIT_DIR/critical-probe.log"
@@ -583,10 +584,12 @@ jobs:
           Path(destination).write_text(
               json.dumps(
                   {
-                      "schema_version": 2,
+                      "schema_version": 3,
                       "profile": "base",
+                      "probe_profile": "cpu",
                       "config_sha256": digest,
                       "status": "blocker",
+                      "coverage": "incomplete",
                       "policy": {
                           "network": "none",
                           "rootfs": "read-only",
@@ -667,6 +670,7 @@ jobs:
             --launcher-inventory /runtime-audit/ci/runtime-launcher-inventory.json \
             --critical-config /runtime-audit/ci/runtime-critical-entrypoints.json \
             --critical-probe /audit-input/critical-probe.json \
+            --critical-profile cpu \
             --max-entries 500000 \
             --max-findings 50000 \
             --output /audit-output/runtime-portability.json
