@@ -441,14 +441,41 @@ def _readelf(path: Record, limits: Limits) -> tuple[str, bool] | None:
 
 
 def _elf_metadata(output: str) -> dict[str, Any]:
-    interpreter = re.search(r"Requesting program interpreter:\s*([^\]]+)\]", output)
-    needed = sorted(set(re.findall(r"Shared library:\s*\[([^\]]+)\]", output)))
-    rpaths = sorted(set(re.findall(r"\(RPATH\).*?Library rpath:\s*\[([^\]]*)\]", output)))
-    runpaths = sorted(set(re.findall(r"\(RUNPATH\).*?Library runpath:\s*\[([^\]]*)\]", output)))
-    values = [interpreter.group(1).strip() if interpreter else None, *needed, *rpaths, *runpaths]
-    if any(value is not None and (not value or len(value) > MAX_PATH or _control(value)) for value in values):
-        raise RuntimeAuditError("readelf metadata contains unsafe text")
-    return {"interpreter": values[0], "needed": needed, "rpath": rpaths, "runpath": runpaths}
+    interpreter = re.search(r"Requesting program interpreter:\s*([^\]]*)\]", output)
+    interpreter_value = interpreter.group(1).strip() if interpreter else None
+    if interpreter_value is not None and (
+        not interpreter_value or len(interpreter_value) > MAX_PATH or _control(interpreter_value)
+    ):
+        raise RuntimeAuditError("readelf metadata contains unsafe interpreter text")
+
+    needed: list[str] = []
+    for value in re.findall(r"Shared library:\s*\[([^\]]*)\]", output):
+        value = value.strip()
+        if not value or len(value) > MAX_PATH or _control(value):
+            raise RuntimeAuditError("readelf metadata contains unsafe library text")
+        needed.append(value)
+
+    def optional_search_paths(pattern: str) -> list[str]:
+        values: list[str] = []
+        for value in re.findall(pattern, output):
+            value = value.strip()
+            # readelf prints `[]` for an empty RPATH/RUNPATH. That means no
+            # search path and must not become a synthetic unresolved entry.
+            if not value:
+                continue
+            if len(value) > MAX_PATH or _control(value):
+                raise RuntimeAuditError("readelf metadata contains unsafe search-path text")
+            values.append(value)
+        return sorted(set(values))
+
+    rpaths = optional_search_paths(r"\(RPATH\).*?Library rpath:\s*\[([^\]]*)\]")
+    runpaths = optional_search_paths(r"\(RUNPATH\).*?Library runpath:\s*\[([^\]]*)\]")
+    return {
+        "interpreter": interpreter_value,
+        "needed": sorted(set(needed)),
+        "rpath": rpaths,
+        "runpath": runpaths,
+    }
 
 
 def _origin_path(raw: str, item: Record) -> str | None:
@@ -487,7 +514,16 @@ def check_elfs(records: Sequence[Record], selected: Mapping[str, Record], invent
             limited = True
             _add(findings, "readelf_unavailable_or_failed", "warning", "ELF metadata could not be inspected; audit is limited", item.path)
             continue
-        metadata = _elf_metadata(result[0])
+        try:
+            metadata = _elf_metadata(result[0])
+        except RuntimeAuditError as error:
+            # A single malformed or tool-hostile readelf record must not
+            # discard the report for every other selected ELF. Keep the audit
+            # fail-closed, but make the limitation visible in JSON and let the
+            # caller inspect the offending path.
+            limited = True
+            _add(findings, "readelf_metadata_invalid", "warning", str(error), item.path)
+            continue
         reports.append({"path": item.path, **metadata})
         interpreter = metadata["interpreter"]
         if interpreter:

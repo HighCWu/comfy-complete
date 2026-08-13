@@ -242,6 +242,34 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
                 exit_code = audit.main(["--source-root", str(root), "--output", str(output)])
             self.assertNotEqual(exit_code, 0)
 
+    def test_empty_rpath_and_runpath_are_not_unresolved_paths(self) -> None:
+        metadata = audit._elf_metadata(
+            """
+            Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
+            0x000000000000000f (RPATH)              Library rpath: []
+            0x000000000000001d (RUNPATH)            Library runpath: []
+            """
+        )
+        self.assertEqual(metadata["rpath"], [])
+        self.assertEqual(metadata["runpath"], [])
+
+    def test_empty_interpreter_and_needed_are_rejected(self) -> None:
+        with self.assertRaisesRegex(audit.RuntimeAuditError, "unsafe interpreter"):
+            audit._elf_metadata("Requesting program interpreter: ]")
+        with self.assertRaisesRegex(audit.RuntimeAuditError, "unsafe library"):
+            audit._elf_metadata("Shared library: []")
+
+    def test_invalid_readelf_metadata_is_reported_without_discarding_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.rootfs()
+            self.copy_true(root)
+            output = Path(directory) / "report.json"
+            with patch.object(audit, "_elf_metadata", side_effect=audit.RuntimeAuditError("unsafe fixture")):
+                exit_code = audit.main(["--source-root", str(root), "--output", str(output)])
+            self.assertNotEqual(exit_code, 0)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "limited")
+            self.assertTrue(any(item["code"] == "readelf_metadata_invalid" for item in report["findings"]))
 
 if __name__ == "__main__":
     unittest.main()
