@@ -82,6 +82,14 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
     assert "--read-only" in block
     assert "--pids-limit 256" in block
     assert "--network none" in block
+    assert "sudo chown 1000:1000" in block
+    assert "sudo chmod 0700" in block
+    assert "reclaim_probe_output" in block
+    assert "reclaim_audit_output" in block
+    assert "-v \"$PROBE_DIR:/audit-input:ro\"" in block
+    assert "-v \"$AUDIT_OUTPUT_DIR:/audit-output:rw\"" in block
+    assert "chmod 0777" not in block
+    assert "--user root" not in block
     assert "runtime_portability_audit.py:ro" in block
     assert "-v \"$PWD/ci:/runtime-audit/ci:ro\"" in block
     assert "--source-root ." not in block
