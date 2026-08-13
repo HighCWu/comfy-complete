@@ -160,8 +160,8 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             report = self.audit_root(root)
             elf = next(item for item in report["elf"]["files"] if item["path"].endswith("/runpath"))
             self.assertEqual(elf["runpath"], ["/launcher/missing"])
-            self.assertIn("/launcher/missing", report["launcher_image_requirements"]["library_search_paths"])
-            self.assertTrue(any(item["code"] == "missing_elf_search_path" for item in report["findings"]))
+            self.assertNotIn("/launcher/missing", report["launcher_image_requirements"]["library_search_paths"])
+            self.assertTrue(any(item["code"] == "missing_elf_search_path" and item["severity"] == "warning" for item in report["findings"]))
 
     def test_origin_relative_runpath_is_expanded_to_selected_directory(self) -> None:
         with tempfile.TemporaryDirectory():
@@ -182,7 +182,7 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             elf = next(item for item in report["elf"]["files"] if item["path"].endswith("/rpath"))
             self.assertEqual(elf["rpath"], ["/launcher/legacy"])
 
-    def test_same_named_library_in_unsearched_selected_directory_is_not_resolved(self) -> None:
+    def test_same_named_library_in_unsearched_selected_directory_is_runtime_unresolved(self) -> None:
         with tempfile.TemporaryDirectory():
             root = self.rootfs()
             self.copy_true(root)
@@ -194,7 +194,16 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
                     executable_paths=("/lib64/ld-linux-x86-64.so.2",),
                 ),
             )
+            self.assertTrue(any(item["code"] == "runtime_library_present_unresolved" and item["evidence"]["needed"] == "libc.so.6" for item in report["findings"]))
+            self.assertNotIn("libc.so.6", report["launcher_image_requirements"]["libraries"])
+
+    def test_missing_library_is_launcher_requirement_when_runtime_has_no_candidate(self) -> None:
+        with tempfile.TemporaryDirectory():
+            root = self.rootfs()
+            self.copy_true(root)
+            report = self.audit_root(root)
             self.assertTrue(any(item["code"] == "missing_elf_library" and item["evidence"]["needed"] == "libc.so.6" for item in report["findings"]))
+            self.assertIn("libc.so.6", report["launcher_image_requirements"]["libraries"])
 
     def test_selection_policy_excludes_mutable_tree_and_counts_symlink(self) -> None:
         with tempfile.TemporaryDirectory():
@@ -252,6 +261,21 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
         )
         self.assertEqual(metadata["rpath"], [])
         self.assertEqual(metadata["runpath"], [])
+
+    def test_empty_search_path_component_is_blocker_not_launcher_requirement(self) -> None:
+        with tempfile.TemporaryDirectory():
+            root = self.rootfs()
+            self.copy_true(root)
+            output = """
+                Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
+                0x000000000000000f (RPATH)              Library rpath: [/launcher/legacy:]
+                0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+            """
+            with patch.object(audit, "_readelf", return_value=(output, True)):
+                report = self.audit_root(root)
+            self.assertTrue(any(item["code"] == "implicit_cwd_elf_search_path" for item in report["findings"]))
+            self.assertNotIn("", report["launcher_image_requirements"]["library_search_paths"])
+            self.assertNotIn("/launcher/legacy", report["launcher_image_requirements"]["library_search_paths"])
 
     def test_empty_interpreter_and_needed_are_rejected(self) -> None:
         with self.assertRaisesRegex(audit.RuntimeAuditError, "unsafe interpreter"):
