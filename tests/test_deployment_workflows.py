@@ -80,6 +80,7 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
     assert "--max-entries 500000" in block
     assert "--max-findings 50000" in block
     assert "--read-only" in block
+    assert "--pids-limit 256" in block
     assert "--network none" in block
     assert "runtime_portability_audit.py:ro" in block
     assert "-v \"$PWD/ci:/runtime-audit/ci:ro\"" in block
@@ -87,6 +88,25 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
     assert "docker export" not in block
     assert "runtime.tar" not in block
     assert ".tar.zst" not in block
+
+
+def test_runtime_audit_has_critical_probe_and_uploads_its_evidence():
+    workflow = DOCKER_BUILD.read_text()
+    block = workflow.split("  audit-base-runtime:\n", 1)[1]
+    assert "runtime-critical-entrypoints.json" in block
+    assert "runtime_critical_probe.py" in block
+    assert "critical-probe.json" in block
+    assert "critical-probe.log" in block
+    assert "--critical-config" in block
+    assert "--critical-probe" in block
+    assert "--network none" in block
+    assert "--read-only" in block
+    assert "--cap-drop ALL" in block
+    assert block.count("--pids-limit 256") >= 2
+    assert "--security-opt no-new-privileges" in block
+    assert "CUDA_VISIBLE_DEVICES=" in block
+    assert "writable_paths" in block
+    assert "if: ${{ always() }}" in block
 
 
 def test_runtime_audit_uses_explicit_empty_inventory_without_claiming_success():

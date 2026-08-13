@@ -1,0 +1,70 @@
+{
+  "schema_version": 2,
+  "profile": "base",
+  "probe_policy": {
+    "network": "none",
+    "rootfs": "read-only",
+    "writable_paths": ["/tmp", "/audit"],
+    "execution": "allowlisted-interpreter-only",
+    "gpu": "CUDA_VISIBLE_DEVICES-empty-no-explicit-init"
+  },
+  "interpreter": "/opt/conda/bin/python",
+  "working_directory": "/app/comfyui",
+  "main_script": "/app/comfyui/main.py",
+  "entrypoints": [
+    {
+      "path": "/app/comfyui/main.py",
+      "owner": "runtime",
+      "kind": "python",
+      "required_executable": false,
+      "shebang": null
+    },
+    {
+      "path": "/opt/conda/bin/python",
+      "owner": "runtime",
+      "kind": "elf",
+      "required_executable": true,
+      "shebang": null
+    }
+  ],
+  "launcher_contract": [
+    {
+      "path": "/app/entrypoint.sh",
+      "kind": "script",
+      "required_executable": true,
+      "shebang": "/bin/bash"
+    },
+    {
+      "path": "/bin/bash",
+      "kind": "elf",
+      "required_executable": true,
+      "shebang": null
+    },
+    {
+      "path": "/usr/bin/dumb-init",
+      "kind": "elf",
+      "required_executable": true,
+      "shebang": null
+    }
+  ],
+  "imports": [
+    {"module": "PIL", "required": true},
+    {"module": "aiohttp", "required": true},
+    {"module": "comfy", "required": true},
+    {"module": "execution", "required": true},
+    {"module": "folder_paths", "required": true},
+    {"module": "numpy", "required": true},
+    {"module": "server", "required": true},
+    {"module": "torch", "required": true}
+  ],
+  "import_review": [
+    {"module": "PIL", "safe_import": true, "reason": "Core image type imported by ComfyUI nodes and server; import performs no network or server startup."},
+    {"module": "aiohttp", "safe_import": true, "reason": "ComfyUI server dependency; importing the library does not open a listener or make a network request."},
+    {"module": "comfy", "safe_import": true, "reason": "ComfyUI core package required by main and execution; import is local module loading only."},
+    {"module": "execution", "safe_import": true, "reason": "main.py imports execution before startup; module defines execution machinery and does not run a workflow at import time."},
+    {"module": "folder_paths", "safe_import": true, "reason": "ComfyUI path registry required by main/server; its initialization is local and uses the configured runtime tree."},
+    {"module": "numpy", "safe_import": true, "reason": "Core tensor/image dependency imported by ComfyUI nodes; import does not download or launch services."},
+    {"module": "server", "safe_import": true, "reason": "main.py imports server before PromptServer construction; importing defines routes/classes but does not bind a socket."},
+    {"module": "torch", "safe_import": true, "reason": "Core inference dependency; CUDA visibility is explicitly empty and the probe never performs GPU initialization."}
+  ]
+}

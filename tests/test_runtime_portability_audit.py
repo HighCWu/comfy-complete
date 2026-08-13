@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -22,6 +23,14 @@ assert SPEC and SPEC.loader
 audit = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = audit
 SPEC.loader.exec_module(audit)
+
+PROBE_SPEC = importlib.util.spec_from_file_location(
+    "runtime_critical_probe", ROOT / "scripts" / "runtime_critical_probe.py"
+)
+assert PROBE_SPEC and PROBE_SPEC.loader
+probe = importlib.util.module_from_spec(PROBE_SPEC)
+sys.modules[PROBE_SPEC.name] = probe
+PROBE_SPEC.loader.exec_module(probe)
 
 
 class RuntimePortabilityAuditTests(unittest.TestCase):
@@ -294,6 +303,150 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             report = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "limited")
             self.assertTrue(any(item["code"] == "readelf_metadata_invalid" for item in report["findings"]))
+
+    def test_critical_config_is_strict_and_allowlists_imports(self) -> None:
+        config = json.loads((ROOT / "ci/runtime-critical-entrypoints.json").read_text(encoding="utf-8"))
+        validated = audit.validate_critical_config(config)
+        self.assertEqual(validated["interpreter"], "/opt/conda/bin/python")
+        bad = json.loads(json.dumps(config))
+        bad["imports"][0]["module"] = "os.system"
+        with self.assertRaises(audit.RuntimeAuditError):
+            audit.validate_critical_config(bad)
+        bad = json.loads(json.dumps(config))
+        bad["imports"].append({"module": "torch", "required": True})
+        with self.assertRaises(audit.RuntimeAuditError):
+            audit.validate_critical_config(bad)
+        bad = json.loads(json.dumps(config))
+        bad["schema_version"] = 1
+        with self.assertRaises(audit.RuntimeAuditError):
+            audit.validate_critical_config(bad)
+
+    def test_critical_entrypoint_finds_real_root_files_outside_selection(self) -> None:
+        with tempfile.TemporaryDirectory():
+            root = self.rootfs()
+            (root / "app/entrypoint.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+            (root / "app/entrypoint.sh").chmod(0o755)
+            config = json.loads((ROOT / "ci/runtime-critical-entrypoints.json").read_text(encoding="utf-8"))
+            inventory = audit.LauncherInventory(
+                system_paths=("/bin/bash", "/usr/bin/dumb-init"),
+                executable_paths=("/bin/bash", "/usr/bin/dumb-init"),
+            )
+            report = self.audit_root(root, inventory=inventory)
+            report["critical"] = audit._critical_report(config, root, {"/" + item.path: item for item in audit.collect_records(root, report["selection_policy"], audit.Limits())[0]}, inventory, audit.Limits(), None)
+            self.assertFalse(any(item["code"] == "critical_entrypoint_shebang_mismatch" and item["path"] == "/app/entrypoint.sh" for item in report["critical"]["findings"]))
+
+    def test_critical_probe_schema_rejects_control_and_unapproved_imports(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "profile": "base",
+            "config_sha256": "0" * 64,
+            "status": "blocker",
+            "policy": dict(audit.CRITICAL_POLICY),
+            "main_script_compile": {"path": "/app/comfyui/main.py", "status": "failed", "source_bytes": 0, "error": "fixture"},
+            "import_review": [],
+            "imports": [],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            json.dump(probe, handle)
+            handle.flush()
+            probe["policy"]["writable_paths"] = ["/tmp", "../audit"]
+            handle.seek(0)
+            handle.truncate()
+            json.dump(probe, handle)
+            handle.flush()
+            with self.assertRaises(audit.RuntimeAuditError):
+                audit.load_critical_probe(Path(handle.name))
+
+    def test_critical_probe_records_mapped_shared_objects_and_failures(self) -> None:
+        with patch.object(probe.importlib, "import_module", side_effect=RuntimeError("fixture import failure")):
+            with patch.object(probe, "_mapped_files", side_effect=[["/lib64/ld-before.so"], ["/opt/conda/lib/libfixture.so", "/lib64/ld-before.so", "/lib64/ld-fixture.so"]]):
+                result = probe._import_one("torch", True)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["before_shared_objects"], ["/lib64/ld-before.so"])
+        self.assertEqual(result["cumulative_shared_objects"], ["/lib64/ld-before.so", "/lib64/ld-fixture.so", "/opt/conda/lib/libfixture.so"])
+        self.assertEqual(result["new_shared_objects"], ["/lib64/ld-fixture.so", "/opt/conda/lib/libfixture.so"])
+        self.assertEqual(result["cumulative_shared_object_classification"]["runtime"], ["/opt/conda/lib/libfixture.so"])
+        self.assertEqual(result["cumulative_shared_object_classification"]["launcher_or_system"], ["/lib64/ld-before.so", "/lib64/ld-fixture.so"])
+        self.assertEqual(result["new_shared_object_classification"]["launcher_or_system"], ["/lib64/ld-fixture.so"])
+        self.assertIn("fixture import failure", result["stderr"])
+
+    def test_critical_probe_runs_only_configured_allowlisted_imports(self) -> None:
+        config = json.loads((ROOT / "ci/runtime-critical-entrypoints.json").read_text(encoding="utf-8"))
+        imported: list[tuple[str, bool]] = []
+
+        def fake_import(module: str, required: bool) -> dict[str, object]:
+            imported.append((module, required))
+            return {
+                "module": module,
+                "required": required,
+                "status": "pass",
+                "duration_ms": 1,
+                "before_shared_objects": [],
+                "before_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+                "before_mapped_files": [],
+                "cumulative_shared_objects": [],
+                "cumulative_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+                "cumulative_mapped_files": [],
+                "new_shared_objects": [],
+                "new_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+                "new_mapped_files": [],
+                "stderr": "",
+                "stdout": "",
+            }
+
+        with patch.object(probe.os, "chdir"), patch.object(probe, "_compile_main_script", return_value={"path": "/app/comfyui/main.py", "status": "pass", "source_bytes": 1}), patch.object(probe, "_import_one", side_effect=fake_import), patch.dict(
+            probe.os.environ, {}, clear=False
+        ):
+            report = probe.run_probe(config)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(imported, [(item["module"], item["required"]) for item in config["imports"]])
+        self.assertEqual(report["main_script_compile"]["status"], "pass")
+        self.assertEqual(report["config_sha256"], hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest())
+
+    def test_critical_probe_schema_rejects_duplicate_imports_and_noncanonical_paths(self) -> None:
+        config = json.loads((ROOT / "ci/runtime-critical-entrypoints.json").read_text(encoding="utf-8"))
+
+        with patch.object(probe.os, "chdir"), patch.object(
+            probe, "_compile_main_script", return_value={"path": "/app/comfyui/main.py", "status": "pass", "source_bytes": 1}
+        ), patch.object(
+            probe, "_import_one", return_value={
+                "module": "PIL",
+                "required": True,
+                "status": "pass",
+                "duration_ms": 1,
+                "before_shared_objects": [],
+                "before_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+                "before_mapped_files": [],
+                "cumulative_shared_objects": [],
+                "cumulative_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+                "cumulative_mapped_files": [],
+                "new_shared_objects": [],
+                "new_shared_object_classification": {"runtime": [], "launcher_or_system": [], "other": []},
+                "new_mapped_files": [],
+                "stderr": "",
+                "stdout": "",
+            }
+        ):
+            report = probe.run_probe({**config, "imports": [{"module": "PIL", "required": True}], "import_review": [config["import_review"][0]]})
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            json.dump(report, handle)
+            handle.flush()
+            audit.load_critical_probe(Path(handle.name))
+            report["imports"].append(dict(report["imports"][0]))
+            handle.seek(0)
+            handle.truncate()
+            json.dump(report, handle)
+            handle.flush()
+            with self.assertRaisesRegex(audit.RuntimeAuditError, "duplicate critical probe import"):
+                audit.load_critical_probe(Path(handle.name))
+
+        report["imports"].pop()
+        report["imports"][0]["cumulative_mapped_files"] = ["/opt/conda/./lib.so"]
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
+            json.dump(report, handle)
+            handle.flush()
+            with self.assertRaisesRegex(audit.RuntimeAuditError, "normalized absolute POSIX path"):
+                audit.load_critical_probe(Path(handle.name))
 
 if __name__ == "__main__":
     unittest.main()

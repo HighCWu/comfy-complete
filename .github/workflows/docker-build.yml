@@ -424,7 +424,7 @@ jobs:
           Path(destination).write_text(
               json.dumps(
                   {
-                      "schema_version": 1,
+                      "schema_version": 2,
                       "source_image": image,
                       "source_image_digest": image_digest,
                       "build_sha": build_sha,
@@ -441,6 +441,104 @@ jobs:
           PY
           cp ci/runtime-selection-policy.json "$AUDIT_DIR/selection-policy.json"
           cp ci/runtime-launcher-inventory.json "$AUDIT_DIR/launcher-inventory.json"
+          cp ci/runtime-critical-entrypoints.json "$AUDIT_DIR/runtime-critical-entrypoints.json"
+
+      - name: Probe critical runtime imports in the final base container
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          AUDIT_DIR="${{ steps.audit-paths.outputs.audit_dir }}"
+          set -o pipefail
+          docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+            -e CUDA_VISIBLE_DEVICES= \
+            -e HOME=/tmp \
+            -e XDG_CACHE_HOME=/tmp/xdg-cache \
+            -e XDG_CONFIG_HOME=/tmp/xdg-config \
+            -e XDG_DATA_HOME=/tmp/xdg-data \
+            -e TMPDIR=/tmp \
+            -e PYTHONNOUSERSITE=1 \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e PYTHONPATH= \
+            --entrypoint /opt/conda/bin/python \
+            -v "$PWD/scripts/runtime_critical_probe.py:/runtime-audit/runtime_critical_probe.py:ro" \
+            -v "$PWD/scripts/runtime_portability_audit.py:/runtime-audit/runtime_portability_audit.py:ro" \
+            -v "$PWD/ci:/runtime-audit/ci:ro" \
+            -v "$AUDIT_DIR:/audit:rw" \
+            "${{ steps.audit-paths.outputs.image }}" \
+            /runtime-audit/runtime_critical_probe.py \
+            --config /runtime-audit/ci/runtime-critical-entrypoints.json \
+            --output /audit/critical-probe.json \
+            2>&1 | tee "$AUDIT_DIR/critical-probe.log"
+
+      - name: Materialize a blocker report if the critical probe produced no JSON
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          AUDIT_DIR="${{ steps.audit-paths.outputs.audit_dir }}"
+          if [ -s "$AUDIT_DIR/critical-probe.json" ] && python3 - "$AUDIT_DIR/critical-probe.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+              raise SystemExit(1)
+          raise SystemExit(0 if isinstance(value, dict) else 1)
+          PY
+          then
+            exit 0
+          fi
+          python3 - "$AUDIT_DIR/critical-probe.json" ci/runtime-critical-entrypoints.json <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          destination, config_path = sys.argv[1:]
+          config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+          digest = hashlib.sha256(
+              json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+          ).hexdigest()
+          Path(destination).write_text(
+              json.dumps(
+                  {
+                      "schema_version": 2,
+                      "profile": "base",
+                      "config_sha256": digest,
+                      "status": "blocker",
+                      "policy": {
+                          "network": "none",
+                          "rootfs": "read-only",
+                          "writable_paths": ["/tmp", "/audit"],
+                          "execution": "allowlisted-interpreter-only",
+                          "gpu": "CUDA_VISIBLE_DEVICES-empty-no-explicit-init",
+                      },
+                      "main_script_compile": {
+                          "path": "/app/comfyui/main.py",
+                          "status": "failed",
+                          "source_bytes": 0,
+                          "error": "critical probe container did not produce a report",
+                      },
+                      "import_review": [],
+                      "imports": [],
+                      "error": "critical probe container did not produce a report",
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Audit the final base container rootfs
         run: |
@@ -450,7 +548,19 @@ jobs:
           docker run --rm \
             --network none \
             --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+            -e CUDA_VISIBLE_DEVICES= \
+            -e HOME=/tmp \
+            -e XDG_CACHE_HOME=/tmp/xdg-cache \
+            -e XDG_CONFIG_HOME=/tmp/xdg-config \
+            -e XDG_DATA_HOME=/tmp/xdg-data \
+            -e TMPDIR=/tmp \
+            -e PYTHONNOUSERSITE=1 \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e PYTHONPATH= \
             --entrypoint /opt/conda/bin/python \
             -v "$PWD/scripts/runtime_portability_audit.py:/runtime-audit/runtime_portability_audit.py:ro" \
             -v "$AUDIT_DIR:/audit:rw" \
@@ -460,6 +570,8 @@ jobs:
             --source-root / \
             --selection-policy /runtime-audit/ci/runtime-selection-policy.json \
             --launcher-inventory /runtime-audit/ci/runtime-launcher-inventory.json \
+            --critical-config /runtime-audit/ci/runtime-critical-entrypoints.json \
+            --critical-probe /audit/critical-probe.json \
             --max-entries 500000 \
             --max-findings 50000 \
             --output /audit/runtime-portability.json \
