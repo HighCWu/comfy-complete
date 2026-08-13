@@ -66,6 +66,8 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
     assert "2>&1 | tee" in block
     assert "if: ${{ always() }}" in block
     assert "--source-root /" in block
+    assert "--max-entries 500000" in block
+    assert "--max-findings 50000" in block
     assert "--read-only" in block
     assert "--network none" in block
     assert "runtime_portability_audit.py:ro" in block

@@ -458,7 +458,8 @@ jobs:
             --source-root / \
             --selection-policy /runtime-audit/ci/runtime-selection-policy.json \
             --launcher-inventory /runtime-audit/ci/runtime-launcher-inventory.json \
-            --max-findings 2000 \
+            --max-entries 500000 \
+            --max-findings 50000 \
             --output /audit/runtime-portability.json \
             2>&1 | tee "$AUDIT_DIR/runtime-portability.log"
 

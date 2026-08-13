@@ -41,7 +41,7 @@ ELF_MAGIC = b"\x7fELF"
 MAX_PATH = 4096
 MAX_TEXT = 64 * 1024
 MAX_SHEBANG = 4096
-MAX_ENTRIES = 100_000
+MAX_ENTRIES = 500_000
 MAX_FINDINGS = 50_000
 MAX_READELF_OUTPUT = 1_048_576
 MAX_READelf_SECONDS = 5.0
@@ -489,6 +489,30 @@ def _origin_path(raw: str, item: Record) -> str | None:
     return normalized
 
 
+def _selected_library_index(selected: Mapping[str, Record]) -> dict[str, tuple[str, ...]]:
+    """Index selected files by basename without claiming loader reachability.
+
+    A basename match is useful evidence that a dependency is contained in the
+    runtime tree, but it is not enough to call the dependency resolved: the
+    dynamic loader may not search that directory.  Callers use this index only
+    to distinguish a runtime/configuration problem from a true launcher
+    requirement.
+    """
+
+    index: dict[str, list[str]] = {}
+    for path, item in selected.items():
+        if item.kind not in ("file", "symlink"):
+            continue
+        status, resolved = _resolve_selected(path, selected)
+        if status != "ok" or resolved is None or resolved.kind != "file":
+            continue
+        name = posixpath.basename(path)
+        if not name:
+            continue
+        index.setdefault(name, []).append(path)
+    return {name: tuple(sorted(paths)) for name, paths in index.items()}
+
+
 def _library_candidates(name: str, item: Record, metadata: Mapping[str, Any], selected: Mapping[str, Record], inventory: LauncherInventory) -> list[str]:
     paths: list[str] = []
     for raw in [*metadata["rpath"], *metadata["runpath"]]:
@@ -496,7 +520,8 @@ def _library_candidates(name: str, item: Record, metadata: Mapping[str, Any], se
             directory = _origin_path(component, item)
             if directory:
                 candidate = posixpath.join(directory, name)
-                if candidate in selected and candidate not in paths:
+                status, resolved = _resolve_selected(candidate, selected)
+                if status == "ok" and resolved is not None and resolved.kind == "file" and candidate not in paths:
                     paths.append(candidate)
     return paths
 
@@ -505,6 +530,7 @@ def check_elfs(records: Sequence[Record], selected: Mapping[str, Record], invent
     count = 0
     reports: list[dict[str, Any]] = []
     limited = False
+    selected_library_index = _selected_library_index(selected)
     for item in records:
         if item.kind != "file" or _read(item, 4) != ELF_MAGIC:
             continue
@@ -543,21 +569,52 @@ def check_elfs(records: Sequence[Record], selected: Mapping[str, Record], invent
             candidates = _library_candidates(name, item, metadata, selected, inventory)
             if candidates or name in inventory.library_names:
                 _add(findings, "elf_library_resolved", "info", "DT_NEEDED is provided by selected runtime or launcher inventory", item.path, {"needed": name, "resolved": candidates[0] if candidates else name})
+            elif name in selected_library_index:
+                # A same-named file elsewhere in the selected tree proves
+                # that the runtime contains the dependency, but not that the
+                # loader can reach it.  Keep it out of launcher requirements;
+                # the image/runtime loader configuration still needs review.
+                candidates = selected_library_index[name]
+                _add(
+                    findings,
+                    "runtime_library_present_unresolved",
+                    "blocker",
+                    "DT_NEEDED has selected-runtime candidate(s), but static audit cannot prove loader reachability",
+                    item.path,
+                    {"needed": name, "candidates": list(candidates[:16]), "candidate_count": len(candidates)},
+                )
             else:
                 required_libraries.add(name)
                 _add(findings, "missing_elf_library", "blocker", "DT_NEEDED is absent from selected runtime and launcher inventory", item.path, {"needed": name})
         for kind in ("rpath", "runpath"):
             for raw in metadata[kind]:
                 for component in raw.split(":"):
+                    if not component:
+                        # An empty loader path component means the process
+                        # current working directory. That implicit location
+                        # is runtime/launcher configuration, not a path the
+                        # launcher inventory can safely provide.
+                        _add(
+                            findings,
+                            "implicit_cwd_elf_search_path",
+                            "blocker",
+                            f"{kind.upper()} contains an empty component that depends on the process current working directory",
+                            item.path,
+                            {kind: raw},
+                        )
+                        continue
                     directory = _origin_path(component, item)
                     if directory is None:
-                        required_library_paths.add(component)
                         _add(findings, "unresolved_elf_search_path", "blocker", f"{kind.upper()} component is not absolute or $ORIGIN-relative", item.path, {kind: component})
                     elif any(_prefix(directory, prefix) for prefix in MUTABLE_PREFIXES):
                         _add(findings, "elf_search_path_mutable", "blocker", f"{kind.upper()} points into mutable or excluded state", item.path, {kind: directory})
                     elif directory not in selected and not any(_prefix(directory, value) for value in inventory.library_paths):
-                        required_library_paths.add(directory)
-                        _add(findings, "missing_elf_search_path", "blocker", f"{kind.upper()} directory is not provided", item.path, {kind: directory})
+                        # An RPATH/RUNPATH directory need not exist when the
+                        # dependency is absent, and it is not by itself a
+                        # launcher contract.  Dependency reachability is
+                        # decided from DT_NEEDED above; keep this as a warning
+                        # without polluting launcher requirements.
+                        _add(findings, "missing_elf_search_path", "warning", f"{kind.upper()} directory is not present in selected runtime or launcher inventory", item.path, {kind: directory})
                     else:
                         _add(findings, "elf_search_path_resolved", "info", f"{kind.upper()} directory is provided", item.path, {kind: directory})
     return count, sorted(reports, key=lambda value: value["path"]), limited
