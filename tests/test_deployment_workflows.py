@@ -40,3 +40,51 @@ def test_docker_workflow_yaml_is_valid():
     parsed = yaml.safe_load(DOCKER_BUILD.read_text())
     assert isinstance(parsed, dict)
     assert "jobs" in parsed
+
+
+def test_runtime_audit_job_reuses_published_base_and_is_read_only():
+    workflow = DOCKER_BUILD.read_text()
+    parsed = yaml.safe_load(workflow)
+    job = parsed["jobs"]["audit-base-runtime"]
+
+    assert job["needs"] == "build-base"
+    assert job["permissions"] == {"contents": "read", "packages": "read"}
+    assert "packages: write" not in workflow.split("audit-base-runtime:", 1)[1]
+
+
+def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure():
+    workflow = DOCKER_BUILD.read_text()
+    block = workflow.split("  audit-base-runtime:\n", 1)[1]
+
+    pull = block.index("docker pull")
+    run = block.index("docker run --rm")
+    audit = block.index("scripts/runtime_portability_audit.py")
+    upload = block.index("actions/upload-artifact@v4")
+    cleanup = block.index("Remove temporary audit files")
+    assert pull < run < audit < upload < cleanup
+    assert "set -euo pipefail" in block
+    assert "2>&1 | tee" in block
+    assert "if: ${{ always() }}" in block
+    assert "--source-root /" in block
+    assert "--read-only" in block
+    assert "--network none" in block
+    assert "runtime_portability_audit.py:ro" in block
+    assert "-v \"$PWD/ci:/runtime-audit/ci:ro\"" in block
+    assert "--source-root ." not in block
+    assert "docker export" not in block
+    assert "runtime.tar" not in block
+    assert ".tar.zst" not in block
+
+
+def test_runtime_audit_uses_explicit_empty_inventory_without_claiming_success():
+    inventory = REPO_ROOT / "ci" / "runtime-launcher-inventory.json"
+    assert yaml.safe_load(inventory.read_text()) == {
+        "system_paths": [],
+        "libraries": [],
+        "library_paths": [],
+        "symlinks": {},
+    }
+
+    policy = yaml.safe_load((REPO_ROOT / "ci" / "runtime-selection-policy.json").read_text())
+    assert policy["targets"] == ["/app/comfyui", "/opt/conda"]
+    assert policy["include_app"] == []

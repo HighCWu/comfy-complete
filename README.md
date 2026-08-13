@@ -149,6 +149,82 @@ pytest tests/ -v
 Tests verify: `requirements.txt` resolves, every package is pinned to an
 exact version, YAML configs are valid, no known conflicting packages.
 
+## Flattened runtime export (local tool)
+
+The production `docker/Dockerfile.cloudbuild` `base` image is the source of
+the final runtime file tree. The export helper works on a materialized final
+filesystem, never on OCI history layers:
+
+```bash
+python scripts/export_runtime.py \
+  --source-root /path/to/final-rootfs \
+  --output-dir /path/to/runtime-output \
+  --runtime-version base-<version> \
+  --source-image ghcr.io/example/comfy-complete-base \
+  --source-image-digest sha256:<64-lowercase-hex> \
+  --build-sha <40-lowercase-hex> \
+  --launcher-digest sha256:<64-lowercase-hex> \
+  --launcher-abi laimon-launcher/v1 \
+  --entrypoint /app/comfyui/PLACEHOLDER_ENTRYPOINT
+```
+
+The default selection is `/opt/conda` and `/app/comfyui`, with mutable
+instance paths excluded. Additional files under `/app` must be named with
+repeated `--include-app`; broad roots such as `/etc` and `/usr/local/cuda`
+are not accepted; replace `PLACEHOLDER_ENTRYPOINT` with the launcher path
+from the runtime design before running. The command requires the `zstd` CLI
+and writes a
+content-addressed `sha256-<archive-sha256>.tar.zst`. The manifest is named by
+the canonical final file-tree runtime digest plus the archive digest
+(`sha256-<tree-sha256>-<archive-sha256>.json`), while archive digest/size are
+recorded independently. Hard links are copied as ordinary files in v1, so
+repeated content can increase bundle size.
+This archive-producing helper remains a local tool. It is not wired to R2,
+RunPod, or Pod hydration. Use `--verify ARCHIVE MANIFEST` to fail closed on a
+missing, corrupt, or inconsistent export.
+
+## Runtime portability audit (local, read-only)
+
+After materializing the final `base` rootfs, audit the same selection before
+exporting it:
+
+```bash
+python scripts/runtime_portability_audit.py \
+  --source-root /path/to/final-rootfs \
+  --selection-policy /path/to/runtime-manifest.json \
+  --launcher-inventory /path/to/launcher-inventory.json \
+  --output /path/to/runtime-portability.json
+```
+
+The audit reports deterministic blocker/warning/info findings for executable
+absolute shebangs, ELF `PT_INTERP`, `DT_NEEDED`, `RPATH`, and `RUNPATH`, and
+lists the system paths, libraries, and library directories the minimal
+launcher image must provide. It also counts selected symlinks. The rootfs is
+never modified; no image, Actions, R2, or RunPod operation is performed.
+Missing `readelf` or a bounded inspection failure is reported as a limited
+audit rather than silently treated as success; `limited` is a non-zero CLI
+result and blocks publishing until the audit is complete.
+
+### Public Docker Build audit
+
+The `Docker Build` workflow has a separate `audit-base-runtime` job. It waits
+for `build-base`, reuses that job's content-addressed `base-*` tag, pulls the
+published `Dockerfile.cloudbuild` `base` image, and runs the audit inside that
+exact image with `--source-root /`. The container is read-only, has no network,
+and mounts only the audit script, policy, inventory, and small output directory;
+the audit input is therefore the final image rootfs, not this checkout. This
+avoids copying the multi-gigabyte runtime to the runner filesystem while
+preserving the final-container boundary. The job uses an explicit empty
+launcher inventory until the launcher image contract is defined; missing
+interpreter/library/search-path requirements are expected to produce a
+non-zero first report rather than a fabricated pass.
+
+Only small JSON metadata/policy files, the portability report, and its log are
+uploaded as a short-retention workflow artifact. The materialized rootfs and
+the archive from `export_runtime.py` are never uploaded. The audit job has only
+`contents: read` and `packages: read` permissions and performs no R2, RunPod,
+D1, or paid external-resource operation.
+
 ## License
 
 Apache 2.0 — see [LICENSE](./LICENSE).

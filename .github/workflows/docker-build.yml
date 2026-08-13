@@ -343,3 +343,134 @@ jobs:
   # (e.g. after a Worker-side bug fix, secret rotation, or API endpoint
   # change). See that file for setup instructions.
   # -----------------------------------------------------------------------
+
+  # The portability gate intentionally runs as a separate, read-only job. It
+  # consumes the exact content-addressed base tag produced above, so it never
+  # rebuilds the image. The audit reads the final image rootfs from a
+  # read-only, network-disabled container; it never scans this checkout and
+  # no runtime archive is published.
+  audit-base-runtime:
+    needs: build-base
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Free disk space and move Docker data to /mnt
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/share/edge \
+            /usr/local/share/firefox \
+            /opt/hostedtoolcache/CodeQL
+          docker system prune -af --volumes || true
+          sudo systemctl stop docker
+          sudo rm -rf /var/lib/docker
+          sudo mkdir -p /mnt/docker-data
+          sudo ln -s /mnt/docker-data /var/lib/docker
+          sudo systemctl start docker
+          echo "=== Disk space after cleanup ==="
+          df -h / /mnt /var/lib/docker
+
+      - uses: actions/checkout@v7
+
+      - name: Set audit image and artifact paths
+        id: audit-paths
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete:${{ needs.build-base.outputs.base_tag }}"
+          AUDIT_DIR="$RUNNER_TEMP/runtime-audit"
+          rm -rf "$AUDIT_DIR"
+          mkdir -p "$AUDIT_DIR"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "audit_dir=$AUDIT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR for the published base image
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the exact published base image
+        run: |
+          set -euo pipefail
+          docker pull "${{ steps.audit-paths.outputs.image }}"
+
+      - name: Prepare audit inputs from the exact final base image
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.audit-paths.outputs.image }}"
+          AUDIT_DIR="${{ steps.audit-paths.outputs.audit_dir }}"
+          IMAGE_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+          test -n "$IMAGE_DIGEST"
+          python3 - "$AUDIT_DIR/runtime-source.json" "$IMAGE" "$IMAGE_DIGEST" "${{ github.sha }}" <<'PY'
+          from __future__ import annotations
+
+          import json
+          import sys
+          from pathlib import Path
+
+          destination, image, image_digest, build_sha = sys.argv[1:]
+          Path(destination).write_text(
+              json.dumps(
+                  {
+                      "schema_version": 1,
+                      "source_image": image,
+                      "source_image_digest": image_digest,
+                      "build_sha": build_sha,
+                      "rootfs_materialization": "exact-image-read-only-container",
+                      "selected_rootfs_paths": ["/opt/conda", "/app/comfyui"],
+                      "runtime_archive_published": False,
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          cp ci/runtime-selection-policy.json "$AUDIT_DIR/selection-policy.json"
+          cp ci/runtime-launcher-inventory.json "$AUDIT_DIR/launcher-inventory.json"
+
+      - name: Audit the final base container rootfs
+        run: |
+          set -euo pipefail
+          AUDIT_DIR="${{ steps.audit-paths.outputs.audit_dir }}"
+          set -o pipefail
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+            --entrypoint /opt/conda/bin/python \
+            -v "$PWD/scripts/runtime_portability_audit.py:/runtime-audit/runtime_portability_audit.py:ro" \
+            -v "$AUDIT_DIR:/audit:rw" \
+            -v "$PWD/ci:/runtime-audit/ci:ro" \
+            "${{ steps.audit-paths.outputs.image }}" \
+            /runtime-audit/runtime_portability_audit.py \
+            --source-root / \
+            --selection-policy /runtime-audit/ci/runtime-selection-policy.json \
+            --launcher-inventory /runtime-audit/ci/runtime-launcher-inventory.json \
+            --max-findings 2000 \
+            --output /audit/runtime-portability.json \
+            2>&1 | tee "$AUDIT_DIR/runtime-portability.log"
+
+      - name: Upload runtime portability reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-portability-${{ github.run_id }}
+          path: ${{ steps.audit-paths.outputs.audit_dir }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Remove temporary audit files
+        if: ${{ always() }}
+        run: rm -rf "${{ steps.audit-paths.outputs.audit_dir }}"
