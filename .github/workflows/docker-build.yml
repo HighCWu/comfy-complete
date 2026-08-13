@@ -395,6 +395,8 @@ jobs:
           echo "audit_dir=$AUDIT_DIR" >> "$GITHUB_OUTPUT"
           echo "probe_dir=$AUDIT_DIR/probe-output" >> "$GITHUB_OUTPUT"
           echo "audit_output_dir=$AUDIT_DIR/audit-output" >> "$GITHUB_OUTPUT"
+          echo "probe_volume=runtime-audit-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}" >> "$GITHUB_OUTPUT"
+          echo "audit_volume=runtime-audit-output-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR for the published base image
         uses: docker/login-action@v4
@@ -451,15 +453,15 @@ jobs:
           set -euo pipefail
           AUDIT_DIR="${{ steps.audit-paths.outputs.audit_dir }}"
           PROBE_DIR="${{ steps.audit-paths.outputs.probe_dir }}"
-          sudo chown 1000:1000 "$PROBE_DIR"
-          sudo chmod 0700 "$PROBE_DIR"
-          reclaim_probe_output() {
-            sudo chown -R "$(id -u):$(id -g)" "$PROBE_DIR"
-            sudo chmod 0700 "$PROBE_DIR"
+          IMAGE="${{ steps.audit-paths.outputs.image }}"
+          PROBE_VOLUME="${{ steps.audit-paths.outputs.probe_volume }}"
+          PROBE_CONTAINER="runtime-audit-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          cleanup_probe_container() {
+            docker rm -f "$PROBE_CONTAINER" >/dev/null 2>&1 || true
           }
-          trap reclaim_probe_output EXIT
-          set -o pipefail
-          docker run --rm \
+          trap cleanup_probe_container EXIT
+          docker volume create "$PROBE_VOLUME" >/dev/null
+          docker create --name "$PROBE_CONTAINER" \
             --network none \
             --read-only \
             --pids-limit 256 \
@@ -476,15 +478,72 @@ jobs:
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e PYTHONPATH= \
             --entrypoint /opt/conda/bin/python \
+            --mount type=volume,source="$PROBE_VOLUME",destination=/audit \
             -v "$PWD/scripts/runtime_critical_probe.py:/runtime-audit/runtime_critical_probe.py:ro" \
             -v "$PWD/scripts/runtime_portability_audit.py:/runtime-audit/runtime_portability_audit.py:ro" \
             -v "$PWD/ci:/runtime-audit/ci:ro" \
-            -v "$PROBE_DIR:/audit:rw" \
             "${{ steps.audit-paths.outputs.image }}" \
             /runtime-audit/runtime_critical_probe.py \
             --config /runtime-audit/ci/runtime-critical-entrypoints.json \
-            --output /audit/critical-probe.json \
-            2>&1 | tee "$AUDIT_DIR/critical-probe.log"
+            --output /audit/critical-probe.json
+          set +e
+          docker start -a "$PROBE_CONTAINER" 2>&1 | tee "$AUDIT_DIR/critical-probe.log"
+          probe_status=${PIPESTATUS[0]}
+          set -e
+          set +e
+          CAT_BIN=/bin/cat
+          if docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -c 'test -x /bin/cat' \
+            > /dev/null \
+            2> "$AUDIT_DIR/critical-probe-cat-check.log"; then
+            :
+          elif docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -c 'test -x /usr/bin/cat' \
+            > /dev/null \
+            2> "$AUDIT_DIR/critical-probe-cat-check.log"; then
+            CAT_BIN=/usr/bin/cat
+          else
+            echo "base image has neither /bin/cat nor /usr/bin/cat" >&2
+            exit 1
+          fi
+          docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --entrypoint "$CAT_BIN" \
+            -v "$PROBE_VOLUME:/evidence:ro" \
+            "$IMAGE" \
+            /evidence/critical-probe.json \
+            > "$PROBE_DIR/critical-probe.json" \
+            2> "$AUDIT_DIR/critical-probe-copy.log"
+          copy_status=$?
+          set -e
+          if [ ! -s "$PROBE_DIR/critical-probe.json" ]; then
+            echo "critical probe did not produce /audit/critical-probe.json" >&2
+            if [ "$probe_status" -eq 0 ]; then
+              probe_status=1
+            fi
+          fi
+          if [ "$copy_status" -ne 0 ] && [ "$probe_status" -eq 0 ]; then
+            probe_status=1
+          fi
+          exit "$probe_status"
 
       - name: Materialize a blocker report if the critical probe produced no JSON
         if: ${{ always() }}
@@ -492,6 +551,8 @@ jobs:
           set -euo pipefail
           AUDIT_DIR="${{ steps.audit-paths.outputs.audit_dir }}"
           PROBE_DIR="${{ steps.audit-paths.outputs.probe_dir }}"
+          IMAGE="${{ steps.audit-paths.outputs.image }}"
+          PROBE_VOLUME="${{ steps.audit-paths.outputs.probe_volume }}"
           if [ -s "$PROBE_DIR/critical-probe.json" ] && python3 - "$PROBE_DIR/critical-probe.json" <<'PY'
           import json
           import sys
@@ -550,22 +611,35 @@ jobs:
               encoding="utf-8",
           )
           PY
+          docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --entrypoint /bin/sh \
+            -v "$PROBE_DIR:/input:ro" \
+            -v "$PROBE_VOLUME:/audit" \
+            "$IMAGE" \
+            -c 'cat /input/critical-probe.json > /audit/critical-probe.json' \
+            > /dev/null \
+            2> "$AUDIT_DIR/critical-probe-fallback-copy.log"
 
       - name: Audit the final base container rootfs
         run: |
           set -euo pipefail
           AUDIT_DIR="${{ steps.audit-paths.outputs.audit_dir }}"
-          PROBE_DIR="${{ steps.audit-paths.outputs.probe_dir }}"
           AUDIT_OUTPUT_DIR="${{ steps.audit-paths.outputs.audit_output_dir }}"
-          sudo chown 1000:1000 "$AUDIT_OUTPUT_DIR"
-          sudo chmod 0700 "$AUDIT_OUTPUT_DIR"
-          reclaim_audit_output() {
-            sudo chown -R "$(id -u):$(id -g)" "$AUDIT_OUTPUT_DIR"
-            sudo chmod 0700 "$AUDIT_OUTPUT_DIR"
+          IMAGE="${{ steps.audit-paths.outputs.image }}"
+          PROBE_VOLUME="${{ steps.audit-paths.outputs.probe_volume }}"
+          AUDIT_VOLUME="${{ steps.audit-paths.outputs.audit_volume }}"
+          AUDIT_CONTAINER="runtime-audit-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          cleanup_audit_container() {
+            docker rm -f "$AUDIT_CONTAINER" >/dev/null 2>&1 || true
           }
-          trap reclaim_audit_output EXIT
-          set -o pipefail
-          docker run --rm \
+          trap cleanup_audit_container EXIT
+          docker volume create "$AUDIT_VOLUME" >/dev/null
+          docker create --name "$AUDIT_CONTAINER" \
             --network none \
             --read-only \
             --pids-limit 256 \
@@ -582,9 +656,9 @@ jobs:
             -e PYTHONDONTWRITEBYTECODE=1 \
             -e PYTHONPATH= \
             --entrypoint /opt/conda/bin/python \
+            --mount type=volume,source="$PROBE_VOLUME",destination=/audit-input,readonly \
+            --mount type=volume,source="$AUDIT_VOLUME",destination=/audit-output \
             -v "$PWD/scripts/runtime_portability_audit.py:/runtime-audit/runtime_portability_audit.py:ro" \
-            -v "$PROBE_DIR:/audit-input:ro" \
-            -v "$AUDIT_OUTPUT_DIR:/audit-output:rw" \
             -v "$PWD/ci:/runtime-audit/ci:ro" \
             "${{ steps.audit-paths.outputs.image }}" \
             /runtime-audit/runtime_portability_audit.py \
@@ -595,8 +669,65 @@ jobs:
             --critical-probe /audit-input/critical-probe.json \
             --max-entries 500000 \
             --max-findings 50000 \
-            --output /audit-output/runtime-portability.json \
-            2>&1 | tee "$AUDIT_DIR/runtime-portability.log"
+            --output /audit-output/runtime-portability.json
+          set +e
+          docker start -a "$AUDIT_CONTAINER" 2>&1 | tee "$AUDIT_DIR/runtime-portability.log"
+          audit_status=${PIPESTATUS[0]}
+          set -e
+          set +e
+          CAT_BIN=/bin/cat
+          if docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -c 'test -x /bin/cat' \
+            > /dev/null \
+            2> "$AUDIT_DIR/runtime-portability-cat-check.log"; then
+            :
+          elif docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -c 'test -x /usr/bin/cat' \
+            > /dev/null \
+            2> "$AUDIT_DIR/runtime-portability-cat-check.log"; then
+            CAT_BIN=/usr/bin/cat
+          else
+            echo "base image has neither /bin/cat nor /usr/bin/cat" >&2
+            exit 1
+          fi
+          docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --entrypoint "$CAT_BIN" \
+            -v "$AUDIT_VOLUME:/evidence:ro" \
+            "$IMAGE" \
+            /evidence/runtime-portability.json \
+            > "$AUDIT_OUTPUT_DIR/runtime-portability.json" \
+            2> "$AUDIT_DIR/runtime-portability-copy.log"
+          copy_status=$?
+          set -e
+          if [ ! -s "$AUDIT_OUTPUT_DIR/runtime-portability.json" ]; then
+            echo "runtime portability audit did not produce /audit-output/runtime-portability.json" >&2
+            if [ "$audit_status" -eq 0 ]; then
+              audit_status=1
+            fi
+          fi
+          if [ "$copy_status" -ne 0 ] && [ "$audit_status" -eq 0 ]; then
+            audit_status=1
+          fi
+          exit "$audit_status"
 
       - name: Upload runtime portability reports
         if: ${{ always() }}
@@ -609,4 +740,17 @@ jobs:
 
       - name: Remove temporary audit files
         if: ${{ always() }}
-        run: rm -rf "${{ steps.audit-paths.outputs.audit_dir }}"
+        run: |
+          set -euo pipefail
+          docker rm -f \
+            "runtime-audit-probe-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}" \
+            "runtime-audit-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}" \
+            >/dev/null 2>&1 || true
+          for volume in \
+            "${{ steps.audit-paths.outputs.probe_volume }}" \
+            "${{ steps.audit-paths.outputs.audit_volume }}"; do
+            if [ -n "$volume" ]; then
+              docker volume rm "$volume" >/dev/null 2>&1 || true
+            fi
+          done
+          rm -rf "${{ steps.audit-paths.outputs.audit_dir }}"

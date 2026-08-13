@@ -68,11 +68,12 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
     block = workflow.split("  audit-base-runtime:\n", 1)[1]
 
     pull = block.index("docker pull")
-    run = block.index("docker run --rm")
-    audit = block.index("scripts/runtime_portability_audit.py")
+    create = block.index("docker create")
+    start = block.index("docker start -a")
+    audit = block.index("--source-root /")
     upload = block.index("actions/upload-artifact@v4")
     cleanup = block.index("Remove temporary audit files")
-    assert pull < run < audit < upload < cleanup
+    assert pull < create < start < audit < upload < cleanup
     assert "set -euo pipefail" in block
     assert "2>&1 | tee" in block
     assert "if: ${{ always() }}" in block
@@ -82,12 +83,38 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
     assert "--read-only" in block
     assert "--pids-limit 256" in block
     assert "--network none" in block
-    assert "sudo chown 1000:1000" in block
-    assert "sudo chmod 0700" in block
-    assert "reclaim_probe_output" in block
-    assert "reclaim_audit_output" in block
-    assert "-v \"$PROBE_DIR:/audit-input:ro\"" in block
-    assert "-v \"$AUDIT_OUTPUT_DIR:/audit-output:rw\"" in block
+    assert "--mount type=volume,source=\"$PROBE_VOLUME\",destination=/audit" in block
+    assert "--mount type=volume,source=\"$PROBE_VOLUME\",destination=/audit-input,readonly" in block
+    assert "--mount type=volume,source=\"$AUDIT_VOLUME\",destination=/audit-output" in block
+    assert "-v \"$PROBE_VOLUME:/evidence:ro\"" in block
+    assert "-v \"$AUDIT_VOLUME:/evidence:ro\"" in block
+    assert "CAT_BIN=/bin/cat" in block
+    assert "test -x /bin/cat" in block
+    assert "test -x /usr/bin/cat" in block
+    assert "CAT_BIN=/usr/bin/cat" in block
+    assert "--entrypoint \"$CAT_BIN\"" in block
+    assert "--entrypoint /bin/sh" in block
+    assert "-v \"$PROBE_DIR:/input:ro\"" in block
+    assert "> \"$PROBE_DIR/critical-probe.json\"" in block
+    assert "> \"$AUDIT_OUTPUT_DIR/runtime-portability.json\"" in block
+    assert "docker rm -f \"$PROBE_CONTAINER\"" in block
+    assert "docker rm -f \"$AUDIT_CONTAINER\"" in block
+    assert "--output /audit/critical-probe.json" in block
+    assert "--output /audit-output/runtime-portability.json" in block
+    assert "docker volume create \"$PROBE_VOLUME\"" in block
+    assert "docker volume create \"$AUDIT_VOLUME\"" in block
+    assert "docker run --rm" in block
+    assert "docker cp" not in block
+    assert ':/audit:rw"' not in block
+    assert ':/audit-output:rw"' not in block
+    assert ':/audit-input:rw"' not in block
+    assert not any(' -v "$' in line and ':rw"' in line for line in block.splitlines())
+    assert "sudo chown" not in block
+    assert "sudo chmod" not in block
+    assert "reclaim_probe_output" not in block
+    assert "reclaim_audit_output" not in block
+    assert "-v \"$PROBE_DIR:/audit-input:ro\"" not in block
+    assert "-v \"$AUDIT_OUTPUT_DIR:/audit-output:rw\"" not in block
     assert "chmod 0777" not in block
     assert "--user root" not in block
     assert "runtime_portability_audit.py:ro" in block
@@ -96,6 +123,32 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
     assert "docker export" not in block
     assert "runtime.tar" not in block
     assert ".tar.zst" not in block
+
+
+def test_runtime_audit_uses_named_volumes_for_container_artifacts():
+    workflow = DOCKER_BUILD.read_text()
+    block = workflow.split("  audit-base-runtime:\n", 1)[1]
+
+    assert "--output /audit/critical-probe.json" in block
+    assert "--output /audit-output/runtime-portability.json" in block
+    assert "--critical-probe /audit-input/critical-probe.json" in block
+    assert "-v \"$PROBE_DIR:/audit-input:ro\"" not in block
+    assert "-v \"$AUDIT_OUTPUT_DIR:/audit-output:rw\"" not in block
+    assert "-v \"$PROBE_VOLUME:/evidence:ro\"" in block
+    assert "-v \"$AUDIT_VOLUME:/evidence:ro\"" in block
+    assert "CAT_BIN=/bin/cat" in block
+    assert "test -x /bin/cat" in block
+    assert "test -x /usr/bin/cat" in block
+    assert "CAT_BIN=/usr/bin/cat" in block
+    assert "--entrypoint \"$CAT_BIN\"" in block
+    assert "--entrypoint /bin/sh" in block
+    assert "-v \"$PROBE_DIR:/input:ro\"" in block
+    assert "> \"$PROBE_DIR/critical-probe.json\"" in block
+    assert "> \"$AUDIT_OUTPUT_DIR/runtime-portability.json\"" in block
+    assert ':/audit:rw"' not in block
+    assert ':/audit-output:rw"' not in block
+    assert ':/audit-input:rw"' not in block
+    assert not any(' -v "$' in line and ':rw"' in line for line in block.splitlines())
 
 
 def test_runtime_audit_has_critical_probe_and_uploads_its_evidence():
