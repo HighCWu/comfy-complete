@@ -1,7 +1,7 @@
 """
 Unit tests for the ComfyUI RunPod handler (docker/runpod/handler.py).
 
-Covers the pure functions and the laimon-specific code paths that were
+Covers the pure functions and the platform-specific code paths that were
 added when the worker was forked from upstream runpod-worker-comfyui:
 
   - validate_input                (input shape + userId/promptId extraction)
@@ -90,7 +90,7 @@ class TestValidateInput(unittest.TestCase):
         data, err = handler.validate_input({"workflow": {"key": "value"}})
         self.assertIsNone(err)
         self.assertEqual(data["workflow"], {"key": "value"})
-        # laimon fields default to None when not provided
+        # comfy fields default to None when not provided
         self.assertIsNone(data["images"])
         self.assertIsNone(data["userId"])
         self.assertIsNone(data["promptId"])
@@ -104,7 +104,7 @@ class TestValidateInput(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(len(data["images"]), 1)
 
-    def test_laimon_userId_promptId_extracted(self):
+    def test_comfy_userId_promptId_extracted(self):
         # The R2 key construction in handler() depends on these two fields
         # being surfaced. A regression that dropped them would silently
         # skip R2 upload and fall back to base64 -- tripping the 10MB
@@ -164,7 +164,7 @@ class TestValidateInput(unittest.TestCase):
 
 class TestUploadToR2(unittest.TestCase):
     """
-    upload_to_r2 is the laimon-specific bypass for RunPod's 10MB output cap.
+    upload_to_r2 is the platform-specific bypass for RunPod's 10MB output cap.
 
     Env-var gating is the critical contract: if any of the 4 env vars is
     unset, the function returns None WITHOUT raising -- the caller falls
@@ -185,6 +185,20 @@ class TestUploadToR2(unittest.TestCase):
             result = handler.upload_to_r2(self.BYTES, self.KEY, self.CT)
             self.assertIsNone(result)
 
+    def test_r2_config_requires_all_credentials(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(handler.r2_configured())
+        with patch.dict(
+            os.environ,
+            {
+                "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
+                "R2_BUCKET": "example-bucket",
+                "R2_ACCESS_KEY_ID": "access",
+            },
+            clear=True,
+        ):
+            self.assertFalse(handler.r2_configured())
+
     def test_returns_key_on_success(self):
         # boto3 is imported lazily inside upload_to_r2 (`import boto3`
         # is inside the function body), so we can't patch `handler.boto3`.
@@ -197,7 +211,7 @@ class TestUploadToR2(unittest.TestCase):
         with patch.dict(sys.modules, {"boto3": mock_boto3}), \
              patch.dict(os.environ, {
                  "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
-                 "R2_BUCKET": "laimon-storage",
+                 "R2_BUCKET": "example-bucket",
                  "R2_ACCESS_KEY_ID": "AKIA-test",
                  "R2_SECRET_ACCESS_KEY": "secret-test",
              }):
@@ -208,7 +222,7 @@ class TestUploadToR2(unittest.TestCase):
         # path-style config which is load-bearing for the dev Worker route.
         mock_client.put_object.assert_called_once()
         call_kwargs = mock_client.put_object.call_args.kwargs
-        self.assertEqual(call_kwargs["Bucket"], "laimon-storage")
+        self.assertEqual(call_kwargs["Bucket"], "example-bucket")
         self.assertEqual(call_kwargs["Key"], self.KEY)
         self.assertEqual(call_kwargs["Body"], self.BYTES)
         self.assertEqual(call_kwargs["ContentType"], self.CT)
@@ -227,7 +241,7 @@ class TestUploadToR2(unittest.TestCase):
         with patch.dict(sys.modules, {"boto3": mock_boto3}), \
              patch.dict(os.environ, {
                  "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
-                 "R2_BUCKET": "laimon-storage",
+                 "R2_BUCKET": "example-bucket",
                  "R2_ACCESS_KEY_ID": "AKIA-test",
                  "R2_SECRET_ACCESS_KEY": "secret-test",
              }):

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 
-TOKEN_HEADER = "X-Laimon-Hydration-Token"
+TOKEN_HEADER = "X-Comfy-Hydration-Token"
 SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
 SAFE_ARTIFACT_PATH = re.compile(
     r"^shared/models/objects/[a-f0-9]{2}/[a-f0-9]{64}/artifact$"
@@ -78,6 +78,18 @@ def required_env(name: str) -> str:
     return value
 
 
+def integration_configured() -> bool:
+    """Return whether the optional hydration control plane is configured."""
+    names = ("COMFY_CONTROL_PLANE_URL", "COMFY_HYDRATION_ID", "COMFY_HYDRATION_TOKEN")
+    configured = [bool(os.environ.get(name, "").strip()) for name in names]
+    if any(configured) and not all(configured):
+        raise HydrationError(
+            "configuration_incomplete",
+            "hydration control-plane variables must be configured together",
+        )
+    return all(configured)
+
+
 def bounded_json(response: Any, maximum_bytes: int) -> dict[str, Any]:
     payload = response.read(maximum_bytes + 1)
     if len(payload) > maximum_bytes:
@@ -102,7 +114,7 @@ def control_request(
     headers = {
         TOKEN_HEADER: token,
         "Accept": "application/json",
-        "User-Agent": "laimon-model-hydrator/1",
+        "User-Agent": "comfy-model-hydrator/1",
     }
     if encoded is not None:
         headers["Content-Type"] = "application/json"
@@ -151,7 +163,7 @@ def validate_manifest(value: dict[str, Any]) -> dict[str, object]:
         or not SAFE_ARTIFACT_PATH.fullmatch(artifact_path)
         or artifact_path.split("/")[3] != sha256[:2]
         or artifact_path.split("/")[4] != sha256
-        or marker_path != artifact_path + ".laimon.json"
+        or marker_path != artifact_path + ".manifest.json"
         or not isinstance(reserve_bytes, int)
         or isinstance(reserve_bytes, bool)
         or reserve_bytes < 0
@@ -234,7 +246,7 @@ def download(
     offset = partial.stat().st_size if partial.exists() else 0
     headers = {
         "Accept": "application/octet-stream",
-        "User-Agent": "laimon-model-hydrator/1",
+        "User-Agent": "comfy-model-hydrator/1",
     }
     if source_kind == "r2":
         headers[TOKEN_HEADER] = token
@@ -310,7 +322,7 @@ def hydrate(
         )
 
     partial = artifact.with_name("artifact.partial")
-    marker_temporary = marker.with_name("artifact.laimon.json.tmp")
+    marker_temporary = marker.with_name("artifact.manifest.json.tmp")
     marker.unlink(missing_ok=True)
     marker_temporary.unlink(missing_ok=True)
     started = time.monotonic()
@@ -369,10 +381,17 @@ def report(
 
 
 def main() -> None:
-    control_plane = required_env("LAIMON_CONTROL_PLANE_URL")
-    hydration_id = required_env("LAIMON_HYDRATION_ID")
-    token = required_env("LAIMON_HYDRATION_TOKEN")
-    volume_root = Path(os.environ.get("LAIMON_VOLUME_ROOT", "/runpod-volume"))
+    if not integration_configured():
+        print(
+            "comfy-hydrator: control-plane credentials are not configured; "
+            "hydration is disabled",
+            flush=True,
+        )
+        return
+    control_plane = required_env("COMFY_CONTROL_PLANE_URL")
+    hydration_id = required_env("COMFY_HYDRATION_ID")
+    token = required_env("COMFY_HYDRATION_TOKEN")
+    volume_root = Path(os.environ.get("COMFY_VOLUME_ROOT", "/runpod-volume"))
     try:
         manifest = validate_manifest(load_manifest(control_plane, hydration_id, token))
         result = {"ok": True, **hydrate(volume_root, manifest, token)}
@@ -381,11 +400,14 @@ def main() -> None:
     try:
         report(control_plane, hydration_id, token, result)
     except Exception as error:
-        raise SystemExit(f"laimon-hydrator: failed to report terminal result: {error}") from error
+        raise SystemExit(f"comfy-hydrator: failed to report terminal result: {error}") from error
     if not result["ok"]:
-        raise SystemExit(f"laimon-hydrator: {result['error_code']}: {result['message']}")
+        raise SystemExit(f"comfy-hydrator: {result['error_code']}: {result['message']}")
     print(json.dumps(result, separators=(",", ":")), flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except HydrationError as error:
+        raise SystemExit(f"comfy-hydrator: {error.code}: {error}") from error

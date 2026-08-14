@@ -205,6 +205,181 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             )
             self.assertTrue(any(item["code"] == "runtime_library_present_unresolved" and item["evidence"]["needed"] == "libc.so.6" for item in report["findings"]))
             self.assertNotIn("libc.so.6", report["launcher_image_requirements"]["libraries"])
+            unresolved = next(item for item in report["findings"] if item["code"] == "runtime_library_present_unresolved")
+            self.assertEqual(unresolved["severity"], "warning")
+
+    def test_portability_gate_is_deny_by_default_and_caps_allowances(self) -> None:
+        findings = [
+            {
+                "code": "missing_elf_library",
+                "severity": "blocker",
+                "path": "app/comfyui/optional/tool",
+                "detail": "optional",
+            },
+            {
+                "code": "missing_elf_library",
+                "severity": "blocker",
+                "path": "app/comfyui/optional/new-tool",
+                "detail": "new",
+            },
+            {
+                "code": "missing_elf_library",
+                "severity": "blocker",
+                "path": "opt/conda/bin/python",
+                "detail": "core",
+            },
+        ]
+        reviewed = audit.portability_finding_fingerprint(findings[0])
+        policy = audit.validate_portability_gate_policy(
+            {
+                "schema_version": audit.PORTABILITY_GATE_POLICY_VERSION,
+                "audit_version": audit.AUDIT_VERSION,
+                "critical_profile": "base",
+                "profile": "fixture",
+                "default_action": "block",
+                "allowances": [
+                    {
+                        "id": "optional-fixture",
+                        "finding_fingerprints": [reviewed],
+                        "max_matches": 1,
+                        "reason": "fixture optional dependency",
+                    }
+                ],
+            }
+        )
+        gate = audit.evaluate_portability_gate(findings, policy)
+        self.assertEqual(gate["status"], "blocker")
+        self.assertEqual(gate["raw_blocker_count"], 3)
+        self.assertEqual(gate["allowed_blocker_count"], 1)
+        self.assertEqual(gate["unapproved_blocker_count"], 2)
+        self.assertEqual(
+            {item["gate_reason"] for item in gate["unapproved_findings"]},
+            {"no_allowance_match"},
+        )
+
+    def test_portability_gate_policy_is_bound_to_scanner_and_critical_profile(self) -> None:
+        base = {
+            "schema_version": audit.PORTABILITY_GATE_POLICY_VERSION,
+            "audit_version": audit.AUDIT_VERSION,
+            "critical_profile": "base",
+            "profile": "fixture",
+            "default_action": "block",
+            "allowances": [],
+        }
+        audit.validate_portability_gate_policy(base)
+        with self.assertRaisesRegex(audit.RuntimeAuditError, "audit_version"):
+            audit.validate_portability_gate_policy({**base, "audit_version": "older-scanner"})
+        with self.assertRaisesRegex(audit.RuntimeAuditError, "critical_profile"):
+            audit.validate_portability_gate_policy({**base, "critical_profile": "other"})
+
+    def test_portability_gate_matches_the_complete_finding_identity(self) -> None:
+        approved = [
+            {"code": "missing_absolute_shebang", "severity": "blocker", "path": "app/x/.git/hooks/pre-commit", "evidence": {"interpreter": "/usr/bin/perl"}},
+            {"code": "missing_absolute_shebang", "severity": "blocker", "path": "app/x/cgi.py", "evidence": {"interpreter": "/usr/local/bin/python"}},
+        ]
+        policy = audit.validate_portability_gate_policy(
+            {
+                "schema_version": audit.PORTABILITY_GATE_POLICY_VERSION,
+                "audit_version": audit.AUDIT_VERSION,
+                "critical_profile": "base",
+                "profile": "fixture",
+                "default_action": "block",
+                "allowances": [
+                    {
+                        "id": "hook",
+                        "finding_fingerprints": [audit.portability_finding_fingerprint(approved[0])],
+                        "max_matches": 1,
+                        "reason": "fixture metadata",
+                    },
+                    {
+                        "id": "cgi",
+                        "finding_fingerprints": [audit.portability_finding_fingerprint(approved[1])],
+                        "max_matches": 1,
+                        "reason": "fixture dead module header",
+                    },
+                ],
+            }
+        )
+        findings = [*approved,
+            {"code": "missing_absolute_shebang", "severity": "blocker", "path": "app/x/cgi.py", "evidence": {"interpreter": "/usr/bin/python"}},
+        ]
+        gate = audit.evaluate_portability_gate(findings, policy)
+        self.assertEqual(gate["status"], "blocker")
+        self.assertEqual(gate["allowed_blocker_count"], 2)
+        self.assertEqual(gate["unapproved_blocker_count"], 1)
+
+    def test_portability_gate_rejects_order_dependent_overlapping_allowances(self) -> None:
+        finding = {
+            "code": "missing_elf_library",
+            "severity": "blocker",
+            "path": "app/comfyui/optional/tool/plugin.so",
+            "detail": "overlap",
+        }
+        fingerprint = audit.portability_finding_fingerprint(finding)
+        policy = audit.validate_portability_gate_policy(
+            {
+                "schema_version": audit.PORTABILITY_GATE_POLICY_VERSION,
+                "audit_version": audit.AUDIT_VERSION,
+                "critical_profile": "base",
+                "profile": "fixture",
+                "default_action": "block",
+                "allowances": [
+                    {
+                        "id": "broad",
+                        "finding_fingerprints": [fingerprint],
+                        "max_matches": 1,
+                        "reason": "broad fixture",
+                    },
+                    {
+                        "id": "narrow",
+                        "finding_fingerprints": [fingerprint],
+                        "max_matches": 1,
+                        "reason": "narrow fixture",
+                    },
+                ],
+            }
+        )
+        gate = audit.evaluate_portability_gate([finding], policy)
+        self.assertEqual(gate["status"], "blocker")
+        self.assertEqual(gate["allowed_blocker_count"], 0)
+        self.assertEqual(gate["unapproved_blocker_count"], 1)
+        self.assertEqual(
+            gate["unapproved_findings"][0]["gate_reason"],
+            "ambiguous_allowance_match",
+        )
+        self.assertEqual(gate["unapproved_findings"][0]["allowance_ids"], ["broad", "narrow"])
+
+    def test_truncated_static_gate_has_one_consistent_incomplete_finding(self) -> None:
+        with tempfile.TemporaryDirectory():
+            root = self.rootfs()
+            for index in range(3):
+                script = root / f"app/comfyui/tool-{index}"
+                script.write_text("#!/missing/interpreter\n", encoding="utf-8")
+                script.chmod(0o755)
+            policy = audit.validate_portability_gate_policy(
+                {
+                    "schema_version": audit.PORTABILITY_GATE_POLICY_VERSION,
+                    "audit_version": audit.AUDIT_VERSION,
+                    "critical_profile": "base",
+                    "profile": "deny-all",
+                    "default_action": "block",
+                    "allowances": [],
+                }
+            )
+            report = audit.audit_runtime(
+                source_root=root,
+                limits=audit.Limits(max_findings=1),
+                portability_gate_policy=policy,
+            )
+            gate = report["gate"]["static_policy"]
+            incomplete = [
+                item
+                for item in gate["unapproved_findings"]
+                if item["code"] == "finding_limit_exceeded"
+            ]
+            self.assertEqual(len(incomplete), 1)
+            self.assertEqual(gate["raw_blocker_count"], gate["unapproved_blocker_count"])
+            self.assertEqual(gate["allowed_blocker_count"], 0)
 
     def test_missing_library_is_launcher_requirement_when_runtime_has_no_candidate(self) -> None:
         with tempfile.TemporaryDirectory():

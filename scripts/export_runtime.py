@@ -54,6 +54,13 @@ DEFAULT_EXCLUDES = (
     "/app/comfyui/models/_xdgcache",
     "/app/comfyui/models/_xdgconfig",
     "/app/comfyui/models/_xdgdata",
+    # These pixi ICU build metadata links target files not shipped by the
+    # package.  They have no runtime consumer and would make the launcher
+    # reject the otherwise valid archive's symlink contract.
+    "/app/comfyui/.ce/envs/geometrypack-nodes/.pixi/envs/default/lib/icu/Makefile.inc",
+    "/app/comfyui/.ce/envs/geometrypack-nodes/.pixi/envs/default/lib/icu/pkgdata.inc",
+    "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/Makefile.inc",
+    "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/pkgdata.inc",
 )
 ALLOWED_TARGETS = frozenset(DEFAULT_TARGETS)
 

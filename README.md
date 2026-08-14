@@ -139,6 +139,16 @@ environment.
 | `COMFY_EXTRA_ARGS` | (none) | Additional ComfyUI arguments |
 | `COMFY_EXTRA_LIBS` | (none) | Additional pip packages installed at startup (testing only) |
 
+The Pod wrapper also supports optional managed integrations. `COMFY_CONTROL_PLANE_URL`,
+`COMFY_INSTANCE_ID`, and `COMFY_POD_TOKEN` must be supplied together to enable model
+bootstrap and input/output asset synchronization. `COMFY_POD_TOKEN` alone enables
+the authenticated gateway; `COMFY_CONTROL_PLANE_URL` or `COMFY_INSTANCE_ID`
+without that token is rejected. With no control-plane credentials, the wrapper
+serves ordinary ComfyUI directly on `COMFY_POD_PORT`. `R2_ENDPOINT`, `R2_BUCKET`,
+`R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` likewise form an all-or-nothing
+optional output-upload integration; incomplete configuration falls back to the
+RunPod-compatible base64 result path.
+
 ## Tests
 
 ```bash
@@ -164,7 +174,7 @@ python scripts/export_runtime.py \
   --source-image-digest sha256:<64-lowercase-hex> \
   --build-sha <40-lowercase-hex> \
   --launcher-digest sha256:<64-lowercase-hex> \
-  --launcher-abi laimon-launcher/v1 \
+  --launcher-abi comfy-launcher/v1 \
   --entrypoint /app/comfyui/PLACEHOLDER_ENTRYPOINT
 ```
 
@@ -179,9 +189,22 @@ the canonical final file-tree runtime digest plus the archive digest
 (`sha256-<tree-sha256>-<archive-sha256>.json`), while archive digest/size are
 recorded independently. Hard links are copied as ordinary files in v1, so
 repeated content can increase bundle size.
-This archive-producing helper remains a local tool. It is not wired to R2,
-RunPod, or Pod hydration. Use `--verify ARCHIVE MANIFEST` to fail closed on a
-missing, corrupt, or inconsistent export.
+The exporter itself remains local and provider-neutral. The public workflow
+can pass its verified output to the separately gated object publisher, but it
+is not wired to RunPod or Pod hydration. Use `--verify ARCHIVE MANIFEST` to
+fail closed on a missing, corrupt, or inconsistent export.
+
+## Runtime object publisher (explicit opt-in)
+
+After the export and `READY.json` checks pass, the independent
+`scripts/publish_runtime.py` helper can publish the archive to an
+S3-compatible object store. It uses content-addressed immutable objects,
+bounded sequential multipart upload, post-upload HEAD verification, and a
+small channel pointer written last. Missing object-store credentials produce a
+safe `skipped` result; partial credentials fail closed. It never deletes old
+versions or copies the large archive. See
+[`docs/runtime-object-publisher.md`](docs/runtime-object-publisher.md) for
+configuration and the explicit workflow integration point.
 
 ## Runtime portability audit (local, read-only)
 
@@ -193,6 +216,7 @@ python scripts/runtime_portability_audit.py \
   --source-root /path/to/final-rootfs \
   --selection-policy /path/to/runtime-manifest.json \
   --launcher-inventory /path/to/launcher-inventory.json \
+  --gate-policy ci/runtime-portability-gate.json \
   --output /path/to/runtime-portability.json
 ```
 
@@ -203,7 +227,18 @@ launcher image must provide. It also counts selected symlinks. The rootfs is
 never modified; no image, Actions, R2, or RunPod operation is performed.
 Missing `readelf` or a bounded inspection failure is reported as a limited
 audit rather than silently treated as success; `limited` is a non-zero CLI
-result and blocks publishing until the audit is complete.
+result and blocks publishing until the audit is complete. The raw report keeps
+every finding. The optional `--gate-policy` is a separate, reviewed,
+deny-by-default policy: an allowance contains the SHA-256 identity of the
+complete deterministic finding, not a path glob. A new or modified finding,
+duplicate allowance, or incomplete report remains a gate blocker. The
+checked-in bootstrap policy intentionally allows nothing until a fresh report
+from the exact immutable base image has been reviewed. The policy is also
+bound to the audit implementation version and the `base` critical profile so
+allowances cannot silently cross scanner/profile contracts. Static
+`runtime_library_present_unresolved` findings are warnings when a selected
+runtime candidate exists; the critical import probe is the dynamic proof for
+the base startup closure, while genuinely missing libraries remain blockers.
 
 ### Public Docker Build audit
 
@@ -214,10 +249,12 @@ exact image with `--source-root /`. The container is read-only, has no network,
 and mounts only the audit script, policy, inventory, and small output directory;
 the audit input is therefore the final image rootfs, not this checkout. This
 avoids copying the multi-gigabyte runtime to the runner filesystem while
-preserving the final-container boundary. The job uses an explicit empty
-launcher inventory until the launcher image contract is defined; missing
-interpreter/library/search-path requirements are expected to produce a
-non-zero first report rather than a fabricated pass.
+preserving the final-container boundary. The job uses the checked-in Ubuntu
+launcher inventory (`ci/runtime-launcher-inventory.json`) plus the
+deny-by-default static gate policy (`ci/runtime-portability-gate.json`).
+Provider-injected CUDA driver names and launcher-provided shell/coreutils
+paths are explicit inventory evidence; any dependency outside that contract
+or outside an exact reviewed finding allowance fails the release gate.
 
 Only small JSON metadata/policy files, the portability report, and its log are
 uploaded as a short-retention workflow artifact. The materialized rootfs and
