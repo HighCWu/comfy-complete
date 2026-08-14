@@ -225,6 +225,37 @@ class RuntimeExportTests(unittest.TestCase):
             with self.assertRaisesRegex(export_module.RuntimeExportError, "not part of the selected"):
                 export_module.collect_entries(root, ["/app/comfyui"], [], [])
 
+    def test_excludes_conda_package_cache_but_rejects_live_links_into_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "opt/conda/bin").mkdir(parents=True)
+            (root / "opt/conda/bin/python").write_bytes(b"runtime")
+            package_bin = root / "opt/conda/pkgs/python-build/bin"
+            package_bin.mkdir(parents=True)
+            (package_bin / "python").write_bytes(b"cache")
+            compiler_compat = root / "opt/conda/pkgs/python-build/compiler_compat"
+            compiler_compat.mkdir()
+            os.symlink("../bin/python", compiler_compat / "ld")
+
+            entries = export_module.collect_entries(
+                root,
+                ["/opt/conda"],
+                [],
+                ["/opt/conda/pkgs"],
+            )
+            self.assertFalse(
+                any(entry.bundle_path.startswith("opt/conda/pkgs") for entry in entries)
+            )
+
+            os.symlink("../pkgs/python-build/bin/python", root / "opt/conda/bin/cache-python")
+            with self.assertRaisesRegex(export_module.RuntimeExportError, "not part of the selected"):
+                export_module.collect_entries(
+                    root,
+                    ["/opt/conda"],
+                    [],
+                    ["/opt/conda/pkgs"],
+                )
+
     def test_accepts_file_symlink_through_a_symlinked_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -44,6 +44,11 @@ from runtime_manifest import (
 DEFAULT_TARGETS = ("/opt/conda", "/app/comfyui")
 # These paths are mutable instance state, not an immutable shared runtime.
 DEFAULT_EXCLUDES = (
+    # Conda's downloaded/extracted package cache is build-time state. The
+    # installed environment under /opt/conda uses its own files/hardlinks;
+    # any live symlink back into this excluded cache is still rejected by the
+    # selected-tree closure check below.
+    "/opt/conda/pkgs",
     "/app/comfyui/output",
     "/app/comfyui/temp",
     "/app/comfyui/models/_xdgcache",
