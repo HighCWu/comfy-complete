@@ -14,6 +14,9 @@ import tempfile
 import socket
 import traceback
 import logging
+from dataclasses import dataclass
+from typing import Literal
+from urllib.parse import urlsplit
 
 from network_volume import (
     is_network_volume_debug_enabled,
@@ -58,6 +61,147 @@ COMFY_HOST = "127.0.0.1:8188"
 # Enforce a clean state after each job is done
 # see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
+
+
+# ---------------------------------------------------------------------------
+# Optional S3-compatible object storage
+# ---------------------------------------------------------------------------
+#
+# The handler is also useful as a standalone ComfyUI/RunPod example.  Object
+# storage is therefore deliberately optional: with no configuration, outputs
+# use the legacy inline/base64 shape.  A half-configured store is different
+# from a disabled store, however.  Treating it as disabled would hide a typo in
+# a secret name and can make a large output exceed RunPod's response limit.
+# Keep the provider-neutral names first while accepting the historical R2/S3
+# names for existing deployments.
+OBJECT_STORE_DISABLED = "disabled"
+OBJECT_STORE_CONFIGURED = "configured"
+OBJECT_STORE_INVALID = "invalid"
+
+
+class ObjectStoreConfigurationError(ValueError):
+    """Raised when an optional object-store configuration is incomplete/unsafe."""
+
+
+@dataclass(frozen=True)
+class ObjectStoreConfig:
+    endpoint: str
+    bucket: str
+    access_key_id: str
+    secret_access_key: str
+    region: str = "auto"
+
+    def validate(self) -> "ObjectStoreConfig":
+        try:
+            parsed = urlsplit(self.endpoint)
+        except ValueError as error:
+            raise ObjectStoreConfigurationError(
+                "object-store endpoint is not a valid URL"
+            ) from error
+        hostname = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" and hostname not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            raise ObjectStoreConfigurationError(
+                "object-store endpoint must use HTTPS (HTTP is allowed only for localhost)"
+            )
+        if (
+            not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ObjectStoreConfigurationError(
+                "object-store endpoint must not contain credentials, a query, or a fragment"
+            )
+        if not 3 <= len(self.bucket) <= 255 or any(
+            ord(char) < 32 or char in "/\\" for char in self.bucket
+        ):
+            raise ObjectStoreConfigurationError("object-store bucket name is invalid")
+        if not self.region.strip():
+            raise ObjectStoreConfigurationError("object-store region must not be empty")
+        return self
+
+
+ObjectStoreState = Literal["disabled", "configured", "invalid"]
+
+_OBJECT_STORE_GROUPS = (
+    (
+        "OBJECT_STORE",
+        "OBJECT_STORE_ENDPOINT",
+        "OBJECT_STORE_BUCKET",
+        "OBJECT_STORE_ACCESS_KEY_ID",
+        "OBJECT_STORE_SECRET_ACCESS_KEY",
+        "OBJECT_STORE_REGION",
+    ),
+    (
+        "S3",
+        "S3_ENDPOINT",
+        "S3_BUCKET",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+        "S3_REGION",
+    ),
+    (
+        "R2",
+        "R2_ENDPOINT",
+        "R2_BUCKET",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_REGION",
+    ),
+)
+
+
+def _read_env(name: str) -> str:
+    return os.environ.get(name, "").strip()
+
+
+def _object_store_group_values(group: tuple[str, ...]) -> tuple[dict[str, str], bool]:
+    """Read one coherent alias group and report whether it was mentioned."""
+    _, endpoint_name, bucket_name, access_name, secret_name, region_name = group
+    values = {
+        "endpoint": _read_env(endpoint_name),
+        "bucket": _read_env(bucket_name),
+        "access_key_id": _read_env(access_name),
+        "secret_access_key": _read_env(secret_name),
+        "region": _read_env(region_name) or "auto",
+    }
+    mentioned = any(_read_env(name) for name in group[1:])
+    return values, mentioned
+
+
+def object_store_config() -> ObjectStoreConfig | None:
+    """Return the configured S3-compatible store, or ``None`` when disabled.
+
+    Alias groups are selected in order: ``OBJECT_STORE_*``, ``S3_*``, then
+    ``R2_*``.  Values are never mixed between groups.  This preserves old
+    deployments while making a partially renamed configuration fail closed.
+    """
+    for group in _OBJECT_STORE_GROUPS:
+        values, mentioned = _object_store_group_values(group)
+        if not mentioned:
+            continue
+        required = ("endpoint", "bucket", "access_key_id", "secret_access_key")
+        missing = [name for name in required if not values[name]]
+        if missing:
+            prefix = group[0]
+            raise ObjectStoreConfigurationError(
+                f"object-store configuration is partial for {prefix}_*; missing {', '.join(missing)}"
+            )
+        return ObjectStoreConfig(**values).validate()
+    return None
+
+
+def object_store_state() -> ObjectStoreState:
+    """Return explicit ``disabled``, ``configured`` or ``invalid`` state."""
+    try:
+        return OBJECT_STORE_CONFIGURED if object_store_config() else OBJECT_STORE_DISABLED
+    except ObjectStoreConfigurationError:
+        return OBJECT_STORE_INVALID
 
 
 def error_chunk(message, details=None):
@@ -204,7 +348,8 @@ def validate_input(job_input):
     # Optional: API key for Comfy.org API Nodes, passed per-request
     comfy_org_api_key = job_input.get("comfy_org_api_key")
 
-    # [platform] userId + promptId for R2 key construction
+    # User/job identifiers scope object-store keys when the optional
+    # integration is enabled.
     user_id = job_input.get("userId")
     prompt_id = job_input.get("promptId")
 
@@ -219,44 +364,29 @@ def validate_input(job_input):
 
 
 def r2_configured():
-    """Return whether the optional S3-compatible output integration is ready."""
-    return all(
-        os.environ.get(name, "").strip()
-        for name in (
-            "R2_ENDPOINT",
-            "R2_BUCKET",
-            "R2_ACCESS_KEY_ID",
-            "R2_SECRET_ACCESS_KEY",
-        )
-    )
+    """Compatibility boolean for callers that only need the enabled state.
 
-
-def upload_to_r2(file_bytes, r2_key, content_type):
+    New code should use :func:`object_store_state` or
+    :func:`object_store_config` so a malformed configuration is distinguishable
+    from an intentionally disabled integration.  Unlike the old implementation,
+    malformed configuration raises instead of being silently reported as
+    ``False``.  The handler validates the configuration before starting a job.
     """
-    [platform] Upload output files directly to R2 (S3-compatible), bypassing
-    the RunPod 10MB output limit.
+    return object_store_config() is not None
 
-    Always uses boto3 + SigV4 — the same code path whether R2_ENDPOINT points
-    at real R2 (production) or at the Worker's local S3-compatible HTTP route
-    (dev). In dev the Worker route accepts the SigV4-signed request without
-    verifying the signature (localhost trust) and delegates to its R2 binding.
-    In production R2 verifies the signature normally.
 
-    Env vars (same names, different values per environment):
-      R2_ENDPOINT          — prod: https://<account_id>.r2.cloudflarestorage.com
-                             dev:  http://localhost:3080/r2 (Worker route)
-      R2_ACCESS_KEY_ID     — R2 access key (real token in prod, dummy in dev)
-      R2_SECRET_ACCESS_KEY — R2 secret key
-      R2_BUCKET            — example-bucket
+def upload_to_object_store(file_bytes, object_key, content_type):
+    """Upload bytes to the configured S3-compatible object store.
 
-    Returns r2_key on success, None on failure (caller falls back to base64).
+    ``None`` means the integration is intentionally disabled.  A partial or
+    unsafe configuration raises :class:`ObjectStoreConfigurationError` so it
+    cannot silently degrade into an unauthenticated/public or oversized inline
+    result.  Provider/network failures still return ``None``; the handler's
+    existing caller can preserve the legacy inline fallback for that run.
     """
-    if not r2_configured():
+    config = object_store_config()
+    if config is None:
         return None
-    endpoint = os.environ["R2_ENDPOINT"]
-    bucket = os.environ["R2_BUCKET"]
-    access_key = os.environ["R2_ACCESS_KEY_ID"]
-    secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
 
     try:
         import boto3
@@ -264,29 +394,39 @@ def upload_to_r2(file_bytes, r2_key, content_type):
 
         s3 = boto3.client(
             "s3",
-            endpoint_url=endpoint,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            region_name="auto",
-            # path-style addressing so the URL is {endpoint}/{bucket}/{key}
-            # — required for the local Worker route to parse the key correctly.
+            endpoint_url=config.endpoint,
+            aws_access_key_id=config.access_key_id,
+            aws_secret_access_key=config.secret_access_key,
+            region_name=config.region,
+            # Path-style addressing works with both ordinary S3-compatible
+            # endpoints and local development facades.
             config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"}),
         )
         s3.put_object(
-            Bucket=bucket,
-            Key=r2_key,
+            Bucket=config.bucket,
+            Key=object_key,
             Body=file_bytes,
             ContentType=content_type,
         )
-        return r2_key
-    except Exception as e:
-        print(f"worker-comfyui - [platform] R2 upload failed for {r2_key}: {e}")
+        return object_key
+    except Exception as error:
+        print(f"worker-comfyui - object-store upload failed for {object_key}: {error}")
         return None
 
 
-# [platform] Threshold for falling back from KV to R2 for temp images.
-# RunPod /run output has a 10MB hard cap. When accumulated base64 temp data
-# approaches this limit, switch remaining temps to R2 direct upload.
+def upload_to_r2(file_bytes, r2_key, content_type):
+    """Backward-compatible alias for :func:`upload_to_object_store`.
+
+    The historical function name and ``R2_*`` variables remain supported, but
+    the implementation is provider-neutral and also accepts ``OBJECT_STORE_*``
+    and ``S3_*`` aliases.
+    """
+    return upload_to_object_store(file_bytes, r2_key, content_type)
+
+
+# Threshold for falling back from inline/base64 to object storage for temp
+# images. RunPod /run output has a 10MB hard cap. When accumulated base64 temp
+# data approaches this limit, switch remaining temps to the configured store.
 TEMP_R2_FALLBACK_THRESHOLD = 8 * 1024 * 1024  # 8 MB (leaves 2 MB margin)
 
 # RunPod's Python SDK deliberately swallows failures from its per-chunk
@@ -299,7 +439,7 @@ TERMINAL_MANIFEST_MAX_BYTES = 256 * 1024
 
 
 def terminal_manifest_key(user_id, prompt_id):
-    """Return the deterministic private R2 key for a terminal result."""
+    """Return the deterministic private object-store key for a terminal result."""
     if not isinstance(user_id, str) or not isinstance(prompt_id, str):
         return None
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
@@ -311,7 +451,7 @@ def terminal_manifest_key(user_id, prompt_id):
 
 
 def persist_terminal_result(user_id, prompt_id, result_chunk):
-    """Best-effort R2 redundancy for a compact terminal result chunk.
+    """Best-effort object-store redundancy for a compact terminal result chunk.
 
     Base64 outputs are intentionally excluded: duplicating them can exceed
     both RunPod's output limit and the bounded manifest size. Production output
@@ -741,6 +881,15 @@ def handler(job):
     Returns:
         dict: A dictionary containing either an error message or a success status with generated images.
     """
+    # Validate optional object storage before touching ComfyUI.  An absent
+    # store is a supported standalone mode; a partial/unsafe store is an
+    # operator error and must not be silently converted into the inline path.
+    try:
+        object_store = object_store_config()
+    except ObjectStoreConfigurationError as error:
+        yield error_chunk(f"Object storage configuration error: {error}")
+        return
+
     # ---------------------------------------------------------------------------
     # Network Volume Diagnostics (opt-in via NETWORK_VOLUME_DEBUG=true)
     # ---------------------------------------------------------------------------
@@ -759,8 +908,8 @@ def handler(job):
     # Extract validated data
     workflow = validated_data["workflow"]
     input_images = validated_data.get("images")
-    user_id = validated_data.get("userId")            # [platform] for R2 key
-    input_prompt_id = validated_data.get("promptId")  # [platform] API-assigned, for R2 key subfolder
+    user_id = validated_data.get("userId")
+    input_prompt_id = validated_data.get("promptId")
 
     # Make sure that the ComfyUI HTTP API is available before proceeding
     if not check_server(
@@ -946,7 +1095,7 @@ def handler(job):
         FILE_OUTPUT_CATEGORIES = ("images", "audio", "gltf", "video", "text")
 
         print(f"worker-comfyui - Processing {len(outputs)} output nodes...")
-        temp_base64_total = 0  # [platform] accumulated base64 temp size for R2 fallback
+        temp_base64_total = 0  # accumulated inline/base64 temp size
         for node_id, node_output in outputs.items():
             for category in FILE_OUTPUT_CATEGORIES:
                 if category not in node_output:
@@ -960,10 +1109,10 @@ def handler(job):
                     subfolder = file_info.get("subfolder", "")
                     file_type = file_info.get("type")
 
-                    # [platform] Temp outputs (PreviewImage and similar) MUST be
+                    # Temp outputs (PreviewImage and similar) MUST be
                     # surfaced — the cloud platform surfaces them as ephemeral
                     # previews. Consumer (queues/workflow.ts) routes them to KV
-                    # with TTL (small temps, base64 path) or R2 at the handler's
+                    # with TTL (small temps, base64 path) or object storage at the handler's
                     # key (large temps, r2_key path that would otherwise exceed
                     # RunPod's 10 MB output cap). Do NOT reintroduce an
                     # INCLUDE_TEMP_IMAGES gate here — that was a regression.
@@ -978,10 +1127,10 @@ def handler(job):
                     if file_bytes:
                         file_extension = os.path.splitext(filename)[1] or ".bin"
 
-                        # [platform] R2 direct upload — bypasses RunPod 10MB output
-                        # limit. Output images always go to R2; temp images go to
-                        # R2 only when accumulated base64 would approach the limit.
-                        r2_enabled = r2_configured()
+                        # Direct object-store upload bypasses RunPod's 10MB output
+                        # limit. Output images always use the store when enabled;
+                        # temp images use it only near the inline limit.
+                        r2_enabled = object_store is not None
                         use_r2_for_temp = False
                         if file_type == "temp" and r2_enabled:
                             projected = temp_base64_total + int(len(file_bytes) * 1.34)
@@ -1007,10 +1156,11 @@ def handler(job):
                                     }
                                 )
                                 print(
-                                    f"worker-comfyui - [platform] Uploaded {filename} to R2: {r2_key}"
+                                    f"worker-comfyui - Uploaded {filename} to object storage: {r2_key}"
                                 )
                             else:
-                                # R2 upload failed — degrade to base64
+                                # Preserve the historical inline fallback when a
+                                # configured store is temporarily unavailable.
                                 base64_data = base64.b64encode(file_bytes).decode("utf-8")
                                 output_data.append(
                                     {
@@ -1026,7 +1176,7 @@ def handler(job):
                                 if file_type == "temp":
                                     temp_base64_total += int(len(file_bytes) * 1.34)
                                 print(
-                                    f"worker-comfyui - [platform] R2 failed, fell back to base64 for {filename}"
+                                    f"worker-comfyui - object-store upload failed, fell back to base64 for {filename}"
                                 )
                         elif os.environ.get("BUCKET_ENDPOINT_URL"):
                             try:

@@ -5,7 +5,8 @@ Covers the pure functions and the platform-specific code paths that were
 added when the worker was forked from upstream runpod-worker-comfyui:
 
   - validate_input                (input shape + userId/promptId extraction)
-  - upload_to_r2                  (R2 direct upload + env gating + fallback)
+  - object_store_config/state     (optional S3-compatible integration gating)
+  - upload_to_r2                  (backward-compatible object-store upload)
   - persist_terminal_result       (compact R2 result redundancy)
   - _get_comfyui_pid              (PID file parsing)
   - _is_comfyui_process_alive     (os.kill signal-0 probe)
@@ -81,6 +82,26 @@ class TestStreamSafeErrorChunks(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertIn("not reachable", chunks[0]["message"])
         self.assertNotIn("error", chunks[0])
+
+    @patch("handler.check_server")
+    def test_handler_rejects_partial_object_store_before_startup(self, check_server):
+        with patch.dict(
+            os.environ,
+            {
+                "OBJECT_STORE_ENDPOINT": "https://objects.example.test",
+                "OBJECT_STORE_BUCKET": "objects-bucket",
+            },
+            clear=True,
+        ):
+            chunks = list(
+                handler.handler(
+                    {"id": "job-3", "input": {"workflow": {"1": {}}}}
+                )
+            )
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("Object storage configuration error", chunks[0]["message"])
+        self.assertIn("partial", chunks[0]["message"])
+        check_server.assert_not_called()
 
 
 class TestValidateInput(unittest.TestCase):
@@ -159,17 +180,109 @@ class TestValidateInput(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# upload_to_r2
+# Optional object-store configuration and upload
 # ---------------------------------------------------------------------------
+
+
+class TestObjectStoreConfiguration(unittest.TestCase):
+    def test_unconfigured_is_explicitly_disabled(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(handler.object_store_state(), handler.OBJECT_STORE_DISABLED)
+            self.assertIsNone(handler.object_store_config())
+            self.assertFalse(handler.r2_configured())
+
+    def test_partial_configuration_is_explicitly_invalid(self):
+        with patch.dict(
+            os.environ,
+            {
+                "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
+                "R2_BUCKET": "example-bucket",
+                "R2_ACCESS_KEY_ID": "access",
+            },
+            clear=True,
+        ):
+            self.assertEqual(handler.object_store_state(), handler.OBJECT_STORE_INVALID)
+            with self.assertRaisesRegex(
+                handler.ObjectStoreConfigurationError,
+                "partial.*R2_.*secret_access_key",
+            ):
+                handler.object_store_config()
+
+    def test_generic_names_are_preferred_and_not_mixed_with_legacy_names(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OBJECT_STORE_ENDPOINT": "https://objects.example.test",
+                "OBJECT_STORE_BUCKET": "generic-bucket",
+                "OBJECT_STORE_ACCESS_KEY_ID": "generic-access",
+                "OBJECT_STORE_SECRET_ACCESS_KEY": "generic-secret",
+                # A complete legacy group must not override the preferred one.
+                "R2_ENDPOINT": "https://legacy.example.test",
+                "R2_BUCKET": "legacy-bucket",
+                "R2_ACCESS_KEY_ID": "legacy-access",
+                "R2_SECRET_ACCESS_KEY": "legacy-secret",
+            },
+            clear=True,
+        ):
+            config = handler.object_store_config()
+            self.assertIsNotNone(config)
+            self.assertEqual(config.endpoint, "https://objects.example.test")
+            self.assertEqual(config.bucket, "generic-bucket")
+
+    def test_partial_preferred_group_does_not_fall_back_to_complete_legacy_group(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OBJECT_STORE_ENDPOINT": "https://objects.example.test",
+                "R2_ENDPOINT": "https://legacy.example.test",
+                "R2_BUCKET": "legacy-bucket",
+                "R2_ACCESS_KEY_ID": "legacy-access",
+                "R2_SECRET_ACCESS_KEY": "legacy-secret",
+            },
+            clear=True,
+        ):
+            self.assertEqual(handler.object_store_state(), handler.OBJECT_STORE_INVALID)
+            with self.assertRaisesRegex(handler.ObjectStoreConfigurationError, "OBJECT_STORE"):
+                handler.object_store_config()
+
+    def test_non_local_http_endpoint_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OBJECT_STORE_ENDPOINT": "http://objects.example.test",
+                "OBJECT_STORE_BUCKET": "objects-bucket",
+                "OBJECT_STORE_ACCESS_KEY_ID": "access",
+                "OBJECT_STORE_SECRET_ACCESS_KEY": "secret",
+            },
+            clear=True,
+        ):
+            self.assertEqual(handler.object_store_state(), handler.OBJECT_STORE_INVALID)
+            with self.assertRaisesRegex(handler.ObjectStoreConfigurationError, "HTTPS"):
+                handler.object_store_config()
+
+    def test_local_http_endpoint_is_allowed_for_development_facades(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OBJECT_STORE_ENDPOINT": "http://localhost:3080/r2",
+                "OBJECT_STORE_BUCKET": "objects-bucket",
+                "OBJECT_STORE_ACCESS_KEY_ID": "access",
+                "OBJECT_STORE_SECRET_ACCESS_KEY": "secret",
+            },
+            clear=True,
+        ):
+            self.assertEqual(handler.object_store_state(), handler.OBJECT_STORE_CONFIGURED)
+
 
 class TestUploadToR2(unittest.TestCase):
     """
-    upload_to_r2 is the platform-specific bypass for RunPod's 10MB output cap.
+    upload_to_r2 is the compatibility entry point for the S3-compatible
+    bypass for RunPod's 10MB output cap.
 
-    Env-var gating is the critical contract: if any of the 4 env vars is
-    unset, the function returns None WITHOUT raising -- the caller falls
-    back to base64. A regression that raised on missing env would crash
-    the handler mid-job.
+    Env-var gating is the critical contract: if all object-store variables are
+    unset, the function returns None WITHOUT raising -- the caller falls back
+    to base64. A partial configuration is different: the function must raise
+    so a typo cannot silently select the inline path.
     """
 
     BYTES = b"\x89PNG\r\n\x1a\nfake-png-bytes"
@@ -185,7 +298,7 @@ class TestUploadToR2(unittest.TestCase):
             result = handler.upload_to_r2(self.BYTES, self.KEY, self.CT)
             self.assertIsNone(result)
 
-    def test_r2_config_requires_all_credentials(self):
+    def test_r2_config_partial_state_is_not_disabled(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(handler.r2_configured())
         with patch.dict(
@@ -197,7 +310,11 @@ class TestUploadToR2(unittest.TestCase):
             },
             clear=True,
         ):
-            self.assertFalse(handler.r2_configured())
+            self.assertEqual(handler.object_store_state(), handler.OBJECT_STORE_INVALID)
+            with self.assertRaises(handler.ObjectStoreConfigurationError):
+                handler.r2_configured()
+            with self.assertRaises(handler.ObjectStoreConfigurationError):
+                handler.upload_to_r2(self.BYTES, self.KEY, self.CT)
 
     def test_returns_key_on_success(self):
         # boto3 is imported lazily inside upload_to_r2 (`import boto3`
@@ -210,11 +327,11 @@ class TestUploadToR2(unittest.TestCase):
 
         with patch.dict(sys.modules, {"boto3": mock_boto3}), \
              patch.dict(os.environ, {
-                 "R2_ENDPOINT": "https://example.r2.cloudflarestorage.com",
-                 "R2_BUCKET": "example-bucket",
-                 "R2_ACCESS_KEY_ID": "AKIA-test",
-                 "R2_SECRET_ACCESS_KEY": "secret-test",
-             }):
+                 "OBJECT_STORE_ENDPOINT": "https://objects.example.test",
+                 "OBJECT_STORE_BUCKET": "example-bucket",
+                 "OBJECT_STORE_ACCESS_KEY_ID": "AKIA-test",
+                 "OBJECT_STORE_SECRET_ACCESS_KEY": "secret-test",
+             }, clear=True):
             result = handler.upload_to_r2(self.BYTES, self.KEY, self.CT)
 
         self.assertEqual(result, self.KEY)
@@ -244,7 +361,7 @@ class TestUploadToR2(unittest.TestCase):
                  "R2_BUCKET": "example-bucket",
                  "R2_ACCESS_KEY_ID": "AKIA-test",
                  "R2_SECRET_ACCESS_KEY": "secret-test",
-             }):
+             }, clear=True):
             result = handler.upload_to_r2(self.BYTES, self.KEY, self.CT)
 
         self.assertIsNone(result)
