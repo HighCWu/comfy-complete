@@ -37,6 +37,7 @@ from runtime_manifest import (
     canonical_json,
     is_safe_relative_path,
     sha256_bytes,
+    validate_exclude_directory_names,
     validate_manifest,
 )
 
@@ -62,6 +63,7 @@ DEFAULT_EXCLUDES = (
     "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/Makefile.inc",
     "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/pkgdata.inc",
 )
+DEFAULT_EXCLUDE_DIRECTORY_NAMES = (".git",)
 ALLOWED_TARGETS = frozenset(DEFAULT_TARGETS)
 
 
@@ -139,6 +141,13 @@ def _normalise_exclusions(root: Path, values: Iterable[str]) -> set[str]:
     return excluded
 
 
+def _normalise_exclude_directory_names(values: Sequence[str]) -> frozenset[str]:
+    try:
+        return frozenset(validate_exclude_directory_names(list(values)))
+    except RuntimeManifestError as error:
+        raise RuntimeExportError(str(error)) from error
+
+
 def _is_excluded(bundle_path: str, exclusions: set[str]) -> bool:
     return bundle_path in exclusions or any(bundle_path.startswith(item + "/") for item in exclusions)
 
@@ -168,13 +177,25 @@ def _link_resolved_path(bundle_path: str, target: str) -> str:
     return resolved
 
 
-def _collect_one(path: Path, bundle_path: str, exclusions: set[str], result: dict[str, CollectedEntry]) -> None:
+def _collect_one(
+    path: Path,
+    bundle_path: str,
+    exclusions: set[str],
+    exclude_directory_names: frozenset[str],
+    result: dict[str, CollectedEntry],
+) -> None:
     if _is_excluded(bundle_path, exclusions):
         return
     try:
         info = path.lstat()
     except OSError as error:
         raise RuntimeExportError(f"cannot stat runtime path {path}: {error}") from error
+
+    # Exclude only real directories. A symlink named `.git` must remain in the
+    # selected tree so the closure check can reject a dangling or escaping
+    # target instead of silently skipping it.
+    if stat.S_ISDIR(info.st_mode) and path.name in exclude_directory_names:
+        return
 
     mode = stat.S_IMODE(info.st_mode)
     if stat.S_ISLNK(info.st_mode):
@@ -209,7 +230,7 @@ def _collect_one(path: Path, bundle_path: str, exclusions: set[str], result: dic
         child_bundle = f"{bundle_path}/{child.name}"
         if not is_safe_relative_path(child_bundle):
             raise RuntimeExportError(f"unsafe child path in runtime tree: {child_bundle}")
-        _collect_one(child, child_bundle, exclusions, result)
+        _collect_one(child, child_bundle, exclusions, exclude_directory_names, result)
 
 
 def _validate_symlink_targets(entries: Sequence[CollectedEntry]) -> None:
@@ -275,6 +296,7 @@ def collect_entries(
     targets: Sequence[str],
     app_files: Sequence[str],
     exclusions: Sequence[str],
+    exclude_directory_names: Sequence[str] = DEFAULT_EXCLUDE_DIRECTORY_NAMES,
 ) -> list[CollectedEntry]:
     """Collect and hash the selected final tree without following symlinks."""
 
@@ -297,12 +319,13 @@ def collect_entries(
             selected_targets.append(target)
 
     excluded = _normalise_exclusions(root, exclusions)
+    excluded_directory_names = _normalise_exclude_directory_names(exclude_directory_names)
     result: dict[str, CollectedEntry] = {}
     for target in selected_targets:
         path = _source_path(root, target)
         if not path.is_dir() or path.is_symlink():
             raise RuntimeExportError(f"target must be a real directory: {target}")
-        _collect_one(path, _bundle_path(target), excluded, result)
+        _collect_one(path, _bundle_path(target), excluded, excluded_directory_names, result)
 
     for raw_file in app_files:
         app_file = _safe_absolute_source(raw_file, name="include-app")
@@ -313,7 +336,7 @@ def collect_entries(
             raise RuntimeExportError(f"include-app path does not exist: {app_file}")
         if path.is_dir() and not path.is_symlink():
             raise RuntimeExportError(f"include-app accepts files, not directories: {app_file}")
-        _collect_one(path, _bundle_path(app_file), excluded, result)
+        _collect_one(path, _bundle_path(app_file), excluded, excluded_directory_names, result)
 
     entries = sorted(result.values(), key=lambda entry: entry.bundle_path)
     _validate_symlink_targets(entries)
@@ -417,12 +440,20 @@ def _verify_archive_entries(archive_path: Path, entries: Sequence[dict[str, Any]
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    if process.stdout is None or process.stderr is None:
-        process.kill()
+    stdout = process.stdout
+    stderr = process.stderr
+    if stdout is None or stderr is None:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        if stdout is not None:
+            stdout.close()
+        if stderr is not None:
+            stderr.close()
         raise RuntimeExportError("could not open zstd verification stream")
     index = 0
     try:
-        with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+        with tarfile.open(fileobj=stdout, mode="r|") as archive:
             for member in archive:
                 if index >= len(entries):
                     raise RuntimeExportError(f"runtime archive has an unexpected member: {member.name}")
@@ -460,14 +491,18 @@ def _verify_archive_entries(archive_path: Path, entries: Sequence[dict[str, Any]
                 else:
                     raise RuntimeExportError(f"unsupported manifest entry type: {kind}")
                 index += 1
-        stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.read().decode("utf-8", errors="replace").strip()
         return_code = process.wait()
         if return_code != 0:
-            raise RuntimeExportError(f"runtime archive decompression failed: {stderr or return_code}")
-    except Exception:
-        process.kill()
+            raise RuntimeExportError(f"runtime archive decompression failed: {stderr_text or return_code}")
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
         process.wait()
         raise
+    finally:
+        stdout.close()
+        stderr.close()
     if index != len(entries):
         raise RuntimeExportError("runtime archive is missing manifest file-tree entries")
 
@@ -491,6 +526,7 @@ def _manifest(
     glibc_version: str | None,
     entrypoint: str,
     entrypoint_args: Sequence[str],
+    exclude_directory_names: Sequence[str] = DEFAULT_EXCLUDE_DIRECTORY_NAMES,
 ) -> RuntimeManifest:
     file_entries = [entry.manifest_entry() for entry in entries]
     total_bytes = sum(entry.size_bytes for entry in entries if entry.kind == "file")
@@ -527,6 +563,7 @@ def _manifest(
             "targets": _canonical_targets(targets),
             "include_app": sorted(set(app_files)),
             "excludes": sorted(set(exclusions)),
+            "exclude_directory_names": validate_exclude_directory_names(list(exclude_directory_names), name="selection_policy.exclude_directory_names"),
         },
         "file_tree": {
             "entry_count": len(file_entries),
@@ -574,9 +611,16 @@ def export_runtime(
     glibc_version: str | None,
     entrypoint: str,
     entrypoint_args: Sequence[str],
+    exclude_directory_names: Sequence[str] = DEFAULT_EXCLUDE_DIRECTORY_NAMES,
 ) -> tuple[Path, Path, RuntimeManifest]:
     zstd = _require_zstd()
-    entries = collect_entries(source_root, targets, app_files, exclusions)
+    entries = collect_entries(
+        source_root,
+        targets,
+        app_files,
+        exclusions,
+        exclude_directory_names,
+    )
     entrypoint = _safe_absolute_source(entrypoint, name="entrypoint")
     entrypoint_bundle = _bundle_path(entrypoint)
     if not any(entry.bundle_path == entrypoint_bundle for entry in entries):
@@ -617,6 +661,7 @@ def export_runtime(
         glibc_version=glibc_version,
         entrypoint=entrypoint,
         entrypoint_args=entrypoint_args,
+        exclude_directory_names=exclude_directory_names,
     )
     runtime_hex = manifest["runtime_digest"].removeprefix("sha256:")
     archive_hex = manifest["archive"]["sha256"]
@@ -659,6 +704,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", action="append", dest="targets", help="runtime directory (repeat; /opt/conda or /app/comfyui)")
     parser.add_argument("--include-app", action="append", default=[], help="explicit app file allowlist entry (repeat; files under /app only)")
     parser.add_argument("--exclude", action="append", dest="exclusions", help="mutable source path to exclude (repeat)")
+    parser.add_argument(
+        "--exclude-directory-name",
+        action="append",
+        dest="exclude_directory_names",
+        help="real directory basename to exclude at any depth (repeat)",
+    )
     parser.add_argument("--runtime-version")
     parser.add_argument("--source-image")
     parser.add_argument("--source-image-digest")
@@ -698,6 +749,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeExportError("missing required export options: " + ", ".join(missing))
         targets = args.targets or list(DEFAULT_TARGETS)
         exclusions = args.exclusions or list(DEFAULT_EXCLUDES)
+        exclude_directory_names = (
+            args.exclude_directory_names
+            if args.exclude_directory_names is not None
+            else list(DEFAULT_EXCLUDE_DIRECTORY_NAMES)
+        )
         archive, manifest_path, manifest = export_runtime(
             source_root=args.source_root,
             output_dir=args.output_dir,
@@ -716,6 +772,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             glibc_version=args.glibc_version,
             entrypoint=args.entrypoint,
             entrypoint_args=args.entrypoint_arg,
+            exclude_directory_names=exclude_directory_names,
         )
         verify_export(archive, manifest_path)
         print(json.dumps({"archive": str(archive), "manifest": str(manifest_path), "runtime_digest": manifest["runtime_digest"]}, sort_keys=True))

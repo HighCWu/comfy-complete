@@ -76,6 +76,8 @@ RUN apt-get -o Acquire::Retries=3 update && \
   wget \
   curl \
   ca-certificates \
+  binutils \
+  patchelf \
   libssl-dev \
   bash \
   libgl1-mesa-glx \
@@ -269,6 +271,12 @@ RUN --mount=type=cache,target=${COMFY_PATH}/models/_xdgcache/rattler,uid=1000,gi
 RUN --mount=type=cache,target=${COMFY_PATH}/models/_xdgcache/rattler,uid=1000,gid=1000 \
     cd ${COMFY_PATH} && \
     runuser -u comfy -- /opt/conda/bin/comfy-env install
+
+# Remove unsafe empty DT_RPATH/DT_RUNPATH components after every dependency,
+# custom node, and comfy-env install is complete.  The script is fail-closed
+# and re-reads every modified dynamic section before this image layer succeeds.
+COPY scripts/sanitize_elf_search_paths.py /app/sanitize_elf_search_paths.py
+RUN ${PYTHON_PATH} /app/sanitize_elf_search_paths.py
 
 # Entrypoint for standalone usage (cloud K8s overrides command directly)
 COPY docker/entrypoint.sh /app/entrypoint.sh

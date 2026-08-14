@@ -404,6 +404,33 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             self.assertEqual(report["symlinks"]["total"], 1)
             self.assertNotIn("app/comfyui/output/ignored", {item["path"] for item in report["elf"]["files"]})
 
+    def test_excludes_real_git_directories_at_any_depth(self) -> None:
+        with tempfile.TemporaryDirectory():
+            root = self.rootfs()
+            self.copy_true(root)
+            git_dir = root / "app/comfyui/custom/nested/.git/hooks"
+            git_dir.mkdir(parents=True)
+            (git_dir / "pre-commit").write_text("private\n", encoding="utf-8")
+            report = self.audit_root(root)
+            selected_paths = {item.path for item in audit.collect_records(root, report["selection_policy"], audit.Limits())[0]}
+            self.assertFalse(any("/.git" in path for path in selected_paths))
+            self.assertEqual(report["selection_policy"]["exclude_directory_names"], [".git"])
+
+    def test_git_symlink_is_not_skipped_and_must_close_inside_runtime(self) -> None:
+        with tempfile.TemporaryDirectory():
+            root = self.rootfs()
+            self.copy_true(root)
+            os.symlink("../../../../outside", root / "app/comfyui/bin/.git")
+            report = self.audit_root(root)
+            self.assertIn("app/comfyui/bin/.git", {item.path for item in audit.collect_records(root, report["selection_policy"], audit.Limits())[0]})
+            self.assertTrue(any(item["code"] == "symlink_broken" for item in report["findings"]))
+
+    def test_exclude_directory_names_are_strict(self) -> None:
+        for names in (["."], [".."], ["a/b"], ["a\\b"], ["a\nb"], [".git", ".git"], ["z", ".git"]):
+            with self.subTest(names=names):
+                with self.assertRaisesRegex(audit.RuntimeAuditError, "exclude_directory_names"):
+                    audit._policy(["/opt/conda", "/app/comfyui"], [], [], names)
+
     def test_report_is_deterministic_and_rootfs_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory():
             root = self.rootfs()
@@ -546,11 +573,80 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             self.assertNotIn("", report["launcher_image_requirements"]["library_search_paths"])
             self.assertNotIn("/launcher/legacy", report["launcher_image_requirements"]["library_search_paths"])
 
-    def test_empty_interpreter_and_needed_are_rejected(self) -> None:
+    def test_empty_patched_shared_object_interpreter_is_absent(self) -> None:
+        for output in (
+            """
+            Elf file type is DYN (Shared object file)
+                  [Requesting program interpreter: ]
+            """,
+            """
+            Elf file type is DYN (Shared object file)
+            Requesting program interpreter: ]
+            """,
+        ):
+            metadata = audit._elf_metadata(output)
+            self.assertIsNone(metadata["interpreter"])
+
+    def test_patched_qt_shared_objects_do_not_make_elf_scan_incomplete(self) -> None:
+        root = self.rootfs()
+        self.copy_true(root)
+        for output in (
+            """
+            Elf file type is DYN (Shared object file)
+                  [Requesting program interpreter: ]
+            0x000000000000000f (RPATH)              Library rpath: [$ORIGIN/.]
+            """,
+            """
+            Elf file type is DYN (Shared object file)
+            [Requesting program interpreter: ]
+            0x000000000000000f (RPATH)              Library rpath: [$ORIGIN]
+            """,
+        ):
+            with patch.object(audit, "_readelf", return_value=(output, True)):
+                report = self.audit_root(root)
+            self.assertEqual(report["tooling"]["elf_analysis"], "complete")
+            self.assertFalse(any(item["code"] == "readelf_metadata_invalid" for item in report["findings"]))
+            self.assertFalse(any(item["code"] == "elf_analysis_incomplete" for item in report["findings"]))
+
+    def test_empty_executable_interpreter_is_rejected(self) -> None:
         with self.assertRaisesRegex(audit.RuntimeAuditError, "unsafe interpreter"):
-            audit._elf_metadata("Requesting program interpreter: ]")
+            audit._elf_metadata(
+                "Elf file type is EXEC (Executable file)\n"
+                "[Requesting program interpreter: ]"
+            )
+
+    def test_empty_needed_is_rejected(self) -> None:
         with self.assertRaisesRegex(audit.RuntimeAuditError, "unsafe library"):
             audit._elf_metadata("Shared library: []")
+
+    def test_incomplete_elf_evidence_cannot_be_allowed(self) -> None:
+        finding = {
+            "code": "elf_analysis_incomplete",
+            "severity": "blocker",
+            "path": "",
+            "detail": "ELF analysis is incomplete",
+        }
+        policy = audit.validate_portability_gate_policy(
+            {
+                "schema_version": audit.PORTABILITY_GATE_POLICY_VERSION,
+                "audit_version": audit.AUDIT_VERSION,
+                "critical_profile": "base",
+                "profile": "fixture",
+                "default_action": "block",
+                "allowances": [
+                    {
+                        "id": "attempted-incomplete-allowance",
+                        "finding_fingerprints": [audit.portability_finding_fingerprint(finding)],
+                        "max_matches": 1,
+                        "reason": "must never be accepted",
+                    }
+                ],
+            }
+        )
+        gate = audit.evaluate_portability_gate([finding], policy)
+        self.assertEqual(gate["status"], "blocker")
+        self.assertEqual(gate["unapproved_blocker_count"], 1)
+        self.assertEqual(gate["unapproved_findings"][0]["gate_reason"], "analysis_incomplete")
 
     def test_invalid_readelf_metadata_is_reported_without_discarding_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

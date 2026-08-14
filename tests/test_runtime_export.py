@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -34,6 +35,7 @@ class RuntimeExportTests(unittest.TestCase):
         (root / "app/comfyui/bin").mkdir(parents=True)
         (root / "app/comfyui/output").mkdir()
         (root / "app/comfyui/models/_xdgcache").mkdir(parents=True)
+        (root / "app/comfyui/custom/nested/.git/hooks").mkdir(parents=True)
         (root / "opt/conda/bin/python").write_bytes(b"python-runtime")
         python = root / "opt/conda/bin/python"
         python.chmod(0o755)
@@ -42,6 +44,7 @@ class RuntimeExportTests(unittest.TestCase):
         (root / "app/comfyui/README").write_bytes(b"immutable")
         (root / "app/comfyui/output/result.png").write_bytes(b"mutable")
         (root / "app/comfyui/models/_xdgcache/cache").write_bytes(b"mutable")
+        (root / "app/comfyui/custom/nested/.git/hooks/pre-commit").write_bytes(b"private")
         os.symlink("../README", root / "app/comfyui/bin/readme-link")
 
     def export(self, root: Path, output: Path, *, entrypoint: str = "/app/comfyui/bin/launcher"):
@@ -225,6 +228,41 @@ class RuntimeExportTests(unittest.TestCase):
             with self.assertRaisesRegex(export_module.RuntimeExportError, "not part of the selected"):
                 export_module.collect_entries(root, ["/app/comfyui"], [], [])
 
+    def test_excludes_real_git_directories_at_any_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source"
+            self.make_tree(source)
+            entries = export_module.collect_entries(
+                source,
+                ["/opt/conda", "/app/comfyui"],
+                [],
+                ["/app/comfyui/output", "/app/comfyui/models/_xdgcache"],
+            )
+            self.assertFalse(any("/.git" in entry.bundle_path for entry in entries))
+            _, manifest_path, manifest = self.export(source, base / "out")
+            self.assertEqual(manifest["selection_policy"]["exclude_directory_names"], [".git"])
+            manifest_module.validate_manifest(json.loads(manifest_path.read_text(encoding="utf-8")))
+
+    def test_git_symlink_is_not_skipped_and_must_close_inside_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app/comfyui/bin").mkdir(parents=True)
+            (root / "app/comfyui/bin/launcher").write_bytes(b"x")
+            (root / "app/comfyui/bin/launcher").chmod(0o755)
+            os.symlink("../../../../outside", root / "app/comfyui/bin/.git")
+            with self.assertRaisesRegex(export_module.RuntimeExportError, "escapes runtime bundle"):
+                export_module.collect_entries(root, ["/app/comfyui"], [], [])
+
+    def test_exclude_directory_names_are_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app/comfyui").mkdir(parents=True)
+            for names in (["."], [".."], ["a/b"], ["a\\b"], ["a\nb"], [".git", ".git"], ["z", ".git"]):
+                with self.subTest(names=names):
+                    with self.assertRaisesRegex(export_module.RuntimeExportError, "exclude_directory_names"):
+                        export_module.collect_entries(root, ["/app/comfyui"], [], [], names)
+
     def test_excludes_conda_package_cache_but_rejects_live_links_into_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -330,6 +368,7 @@ class RuntimeExportTests(unittest.TestCase):
             self.assertEqual(manifest["selection_policy"]["targets"], ["/app/comfyui", "/opt/conda"])
             self.assertEqual(manifest["selection_policy"]["include_app"], [])
             self.assertEqual(manifest["selection_policy"]["excludes"], ["/app/comfyui/models/_xdgcache", "/app/comfyui/output"])
+            self.assertEqual(manifest["selection_policy"]["exclude_directory_names"], [".git"])
             manifest["file_tree"]["entries"].append({
                 "path": "app/comfyui/output/evil",
                 "type": "file",
@@ -373,6 +412,59 @@ class RuntimeExportTests(unittest.TestCase):
         with patch.object(export_module.shutil, "which", return_value=None):
             with self.assertRaisesRegex(export_module.RuntimeExportError, "zstd is required"):
                 export_module._require_zstd()
+
+    def test_archive_verification_closes_zstd_pipes_on_success_and_error(self) -> None:
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.returncode: int | None = 0
+                self.kill_calls = 0
+                self.wait_calls = 0
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def kill(self) -> None:
+                self.kill_calls += 1
+                self.returncode = -9
+
+            def wait(self) -> int:
+                self.wait_calls += 1
+                assert self.returncode is not None
+                return self.returncode
+
+        class EmptyArchive:
+            def __enter__(self) -> "EmptyArchive":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def __iter__(self):
+                return iter(())
+
+        class UnexpectedArchive(EmptyArchive):
+            def __iter__(self):
+                return iter((type("UnexpectedMember", (), {"name": "unexpected"})(),))
+
+        for archive, expected_kills in ((EmptyArchive(), 0), (UnexpectedArchive(), 1)):
+            with self.subTest(archive=type(archive).__name__):
+                process = FakeProcess()
+                if expected_kills:
+                    process.returncode = None
+                with patch.object(export_module.subprocess, "Popen", return_value=process), patch.object(
+                    export_module.tarfile, "open", return_value=archive
+                ):
+                    if expected_kills:
+                        with self.assertRaises(export_module.RuntimeExportError):
+                            export_module._verify_archive_entries(Path("runtime.tar.zst"), [], "zstd")
+                    else:
+                        export_module._verify_archive_entries(Path("runtime.tar.zst"), [], "zstd")
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+                self.assertEqual(process.kill_calls, expected_kills)
+                self.assertGreaterEqual(process.wait_calls, 1)
 
 
 if __name__ == "__main__":
