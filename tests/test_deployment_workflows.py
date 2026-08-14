@@ -1,6 +1,9 @@
 """Safety contracts for image build and deployment workflows."""
 
+import json
+import os
 import shlex
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -8,6 +11,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKER_BUILD = REPO_ROOT / ".github" / "workflows" / "docker-build.yml"
+DOCKER_PULL_RETRY = REPO_ROOT / ".github" / "scripts" / "docker-pull-with-retry.sh"
+CONFIGURE_DOCKER_PULLS = REPO_ROOT / ".github" / "scripts" / "configure-docker-pulls.py"
 
 
 def _job_block(workflow: str, job: str, next_job: str) -> str:
@@ -124,6 +129,128 @@ def test_runtime_audit_job_reuses_published_base_and_is_read_only():
     assert "packages: write" not in audit_block
 
 
+def test_large_base_pulls_limit_request_bursts_and_use_bounded_retry():
+    workflow = DOCKER_BUILD.read_text()
+    blocks = (
+        _job_block(workflow, "audit-base-runtime", "publish-runtime-slim"),
+        workflow.split("  publish-runtime-slim:\n", 1)[1],
+    )
+    for block in blocks:
+        configure = block.index("configure-docker-pulls.py")
+        restart = block.index("systemctl restart docker", configure)
+        pull = block.index("docker-pull-with-retry.sh")
+        assert configure < restart < pull
+        assert "docker pull \"${{" not in block
+
+    retry_script = DOCKER_PULL_RETRY.read_text()
+    assert 'DOCKER_PULL_RETRY_ATTEMPTS:-5' in retry_script
+    assert "attempt <= max_attempts" in retry_script
+    assert "base_delay * (1 << (attempt - 1))" in retry_script
+    assert "toomanyrequests" in retry_script
+
+
+def test_docker_pull_daemon_config_merges_existing_keys(tmp_path: Path):
+    config_path = tmp_path / "daemon.json"
+    config_path.write_text(json.dumps({"data-root": "/mnt/docker", "debug": True}))
+
+    subprocess.run(
+        ["python3", str(CONFIGURE_DOCKER_PULLS), str(config_path)],
+        check=True,
+    )
+
+    assert json.loads(config_path.read_text()) == {
+        "data-root": "/mnt/docker",
+        "debug": True,
+        "max-concurrent-downloads": 1,
+        "max-download-attempts": 5,
+    }
+
+
+def _write_fake_pull_commands(tmp_path: Path) -> dict[str, str]:
+    docker = tmp_path / "docker"
+    docker.write_text(
+        """#!/usr/bin/env bash
+count=0
+if [ -f "$FAKE_DOCKER_COUNT" ]; then count="$(cat "$FAKE_DOCKER_COUNT")"; fi
+count=$((count + 1))
+printf '%s' "$count" > "$FAKE_DOCKER_COUNT"
+if [ "$FAKE_DOCKER_MODE" = transient-then-success ] && [ "$count" -ge 3 ]; then
+  echo 'pull complete'
+  exit 0
+fi
+if [ "$FAKE_DOCKER_MODE" = permanent ]; then
+  echo 'unauthorized: authentication required' >&2
+else
+  echo 'toomanyrequests: retry-after: 265ms' >&2
+fi
+exit 1
+"""
+    )
+    sleep = tmp_path / "sleep"
+    sleep.write_text("#!/usr/bin/env bash\necho \"$1\" >> \"$FAKE_SLEEP_LOG\"\n")
+    docker.chmod(0o755)
+    sleep.chmod(0o755)
+    return {
+        **os.environ,
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+        "FAKE_DOCKER_COUNT": str(tmp_path / "count"),
+        "FAKE_SLEEP_LOG": str(tmp_path / "sleeps"),
+        "DOCKER_PULL_RETRY_BASE_SECONDS": "2",
+        "DOCKER_PULL_RETRY_JITTER_SECONDS": "0",
+    }
+
+
+def test_docker_pull_retry_recovers_with_increasing_bounded_backoff(tmp_path: Path):
+    env = _write_fake_pull_commands(tmp_path)
+    env["FAKE_DOCKER_MODE"] = "transient-then-success"
+
+    result = subprocess.run(
+        ["bash", str(DOCKER_PULL_RETRY), "ghcr.io/example/image:immutable"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "count").read_text() == "3"
+    assert (tmp_path / "sleeps").read_text().splitlines() == ["2", "4"]
+
+
+def test_docker_pull_retry_fails_permanent_errors_immediately(tmp_path: Path):
+    env = _write_fake_pull_commands(tmp_path)
+    env["FAKE_DOCKER_MODE"] = "permanent"
+
+    result = subprocess.run(
+        ["bash", str(DOCKER_PULL_RETRY), "ghcr.io/example/missing:immutable"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert (tmp_path / "count").read_text() == "1"
+    assert not (tmp_path / "sleeps").exists()
+    assert "non-transient error" in result.stderr
+
+
+def test_docker_pull_retry_stops_after_five_transient_failures(tmp_path: Path):
+    env = _write_fake_pull_commands(tmp_path)
+    env["FAKE_DOCKER_MODE"] = "always-transient"
+    env["DOCKER_PULL_RETRY_BASE_SECONDS"] = "0"
+
+    result = subprocess.run(
+        ["bash", str(DOCKER_PULL_RETRY), "ghcr.io/example/image:immutable"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert (tmp_path / "count").read_text() == "5"
+    assert (tmp_path / "sleeps").read_text().splitlines() == ["0", "0", "0", "0"]
+    assert "exhausted 5 attempts" in result.stderr
+
+
 def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifacts():
     workflow = DOCKER_BUILD.read_text()
     parsed = yaml.safe_load(workflow)
@@ -155,7 +282,7 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
     workflow = DOCKER_BUILD.read_text()
     block = workflow.split("  audit-base-runtime:\n", 1)[1].split("\n  publish-runtime-slim:", 1)[0]
 
-    pull = block.index("docker pull")
+    pull = block.index("docker-pull-with-retry.sh")
     create = block.index("docker create")
     start = block.index("docker start -a")
     audit = block.index("--source-root /")
