@@ -896,7 +896,10 @@ jobs:
           sudo mkdir -p /mnt/docker-data
           sudo ln -s /mnt/docker-data /var/lib/docker
           sudo systemctl start docker
-          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /mnt/runtime-export
+          # The exporter runs as container root with DAC_OVERRIDE dropped.
+          # Root ownership lets it write without widening capabilities; the
+          # runner's primary group retains host-side access to the results.
+          sudo install -d -o 0 -g "$(id -g)" -m 0770 /mnt/runtime-export
           df -h / /mnt /var/lib/docker
 
       - uses: actions/checkout@v7

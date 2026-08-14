@@ -269,6 +269,8 @@ def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifac
     assert "--cap-drop ALL" in block
     assert "--cap-add DAC_READ_SEARCH" in block
     assert "--security-opt no-new-privileges" in block
+    assert 'sudo install -d -o 0 -g "$(id -g)" -m 0770 /mnt/runtime-export' in block
+    assert "--cap-add DAC_OVERRIDE" not in block
     assert "runtime-summary.json" in block
     assert "slim-image.json" in block
     upload = block.split("actions/upload-artifact@v4", 1)[1].split("Delete the runner-local runtime archive", 1)[0]
