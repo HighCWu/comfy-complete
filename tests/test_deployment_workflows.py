@@ -74,9 +74,13 @@ def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifac
     block = workflow.split("  publish-runtime-slim:\n", 1)[1]
     assert "scripts/export_runtime.py" in block
     assert "scripts/runtime_ready.py" in block
+    assert "actions/download-artifact@v4" in block
+    assert 'gate.get("status") != "pass"' in block
+    assert 'gate.get("source") != "critical"' in block
     assert "docker/Dockerfile.pod-slim" in block
     assert "--network none" in block
     assert "--cap-drop ALL" in block
+    assert "--cap-add DAC_READ_SEARCH" in block
     assert "--security-opt no-new-privileges" in block
     assert "runtime-summary.json" in block
     assert "slim-image.json" in block
