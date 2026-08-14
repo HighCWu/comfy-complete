@@ -1,5 +1,6 @@
 """Safety contracts for image build and deployment workflows."""
 
+import shlex
 from pathlib import Path
 
 import yaml
@@ -7,6 +8,23 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKER_BUILD = REPO_ROOT / ".github" / "workflows" / "docker-build.yml"
+
+
+def _job_block(workflow: str, job: str, next_job: str) -> str:
+    return workflow.split(f"  {job}:\n", 1)[1].split(f"\n  {next_job}:", 1)[0]
+
+
+def _local_copy_inputs(dockerfile: str) -> list[str]:
+    """Return local COPY sources, excluding flags and the destination."""
+    inputs: list[str] = []
+    for line in dockerfile.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("COPY ") or "--from=" in stripped:
+            continue
+        tokens = shlex.split(stripped)
+        sources = [token for token in tokens[1:] if not token.startswith("--")]
+        inputs.extend(sources[:-1])
+    return inputs
 
 
 def test_docker_build_never_mutates_runpod_endpoints():
@@ -34,6 +52,48 @@ def test_base_content_hash_covers_every_local_copy_input():
     }
     for path in local_copy_inputs:
         assert path in workflow, f"base content hash is missing Docker COPY input: {path}"
+
+
+def test_wrapper_content_hashes_cover_every_local_copy_input_and_base_identity():
+    """Wrapper tags must change with the immutable base or any local COPY input."""
+    workflow = DOCKER_BUILD.read_text()
+    cases = (
+        ("build-runpod", "build-pod", "docker/Dockerfile.runpod", "runpod-"),
+        ("build-pod", "build-hydrator", "docker/Dockerfile.pod", "pod-"),
+    )
+    for job, next_job, dockerfile_path, tag_prefix in cases:
+        block = _job_block(workflow, job, next_job)
+        hash_step = block.split("Calculate ", 1)[1].split("\n\n      - uses: docker/login-action", 1)[0]
+        assert "${{ needs.build-base.outputs.base_tag }}" in hash_step
+        assert dockerfile_path in hash_step
+        for path in _local_copy_inputs((REPO_ROOT / dockerfile_path).read_text()):
+            assert path in hash_step, f"{job} wrapper hash is missing Docker COPY input: {path}"
+        assert f'echo "tag={tag_prefix}${{HASH:0:16}}"' in hash_step
+        assert "--build-arg BASE_IMAGE=${{ steps.img.outputs.base }}:${{ needs.build-base.outputs.base_tag }}" in block
+        assert "--build-arg BASE_IMAGE=${{ steps.img.outputs.base }}:latest" not in block
+
+
+def test_wrapper_manifest_checks_precede_expensive_setup_and_hits_retag_immutable_content():
+    workflow = DOCKER_BUILD.read_text()
+    cases = (
+        ("build-runpod", "build-pod", "runpod"),
+        ("build-pod", "build-hydrator", "pod"),
+    )
+    for job, next_job, image_suffix in cases:
+        block = _job_block(workflow, job, next_job)
+        checkout = block.index("actions/checkout@v7")
+        calculate = block.index("Calculate ")
+        login = block.index("docker/login-action@v4")
+        manifest = block.index("docker manifest inspect")
+        cleanup = block.index("Free disk space and move Docker data to /mnt")
+        assert checkout < calculate < login < manifest < cleanup
+        expensive = block[cleanup:]
+        assert "if: steps.existing.outputs.reuse != 'true'" in expensive
+
+        assert f'SOURCE="${{{{ steps.img.outputs.base }}}}-{image_suffix}:${{{{ steps.wrapper.outputs.tag }}}}"' in block
+        assert 'crane tag "$SOURCE" "${{ github.sha }}"' in block
+        assert 'crane tag "$SOURCE" latest' in block
+        assert "if: steps.existing.outputs.reuse == 'true'" in block
 
 
 def test_docker_workflow_yaml_is_valid():

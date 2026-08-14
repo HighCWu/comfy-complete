@@ -203,7 +203,51 @@ jobs:
       contents: read
       packages: write
     steps:
+      - uses: actions/checkout@v7
+
+      - name: Set image base (lowercase)
+        id: img
+        run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
+
+      - name: Calculate RunPod wrapper content hash
+        id: wrapper
+        run: |
+          set -euo pipefail
+          HASH=$({
+            printf 'base_tag=%s\n' "${{ needs.build-base.outputs.base_tag }}"
+            sha256sum \
+              docker/Dockerfile.runpod \
+              docker/runpod/start.sh \
+              docker/runpod/handler.py \
+              docker/runpod/network_volume.py \
+              docker/runpod/extra_model_paths.yaml \
+              docker/runpod/comfy-manager-set-mode.sh \
+              docker/runpod/comfy-node-install.sh | LC_ALL=C sort
+          } | sha256sum | cut -d' ' -f1)
+          echo "tag=runpod-${HASH:0:16}" >> "$GITHUB_OUTPUT"
+          echo "RunPod wrapper content tag: runpod-${HASH:0:16}"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for reusable RunPod wrapper image
+        id: existing
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.base }}-runpod:${{ steps.wrapper.outputs.tag }}"
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing ${IMAGE}"
+          else
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+            echo "Wrapper image not found — will build ${IMAGE}"
+          fi
+
       - name: Free disk space and move Docker data to /mnt
+        if: steps.existing.outputs.reuse != 'true'
         run: |
           sudo rm -rf \
             /usr/share/dotnet \
@@ -224,30 +268,36 @@ jobs:
           echo "=== Disk space after cleanup ==="
           df -h / /mnt /var/lib/docker
 
-      - uses: actions/checkout@v7
-
-      - name: Set image base (lowercase)
-        id: img
-        run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
-
-      - uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push runpod image
+      - name: Build and push RunPod wrapper image
+        if: steps.existing.outputs.reuse != 'true'
         run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.base }}-runpod"
+          CONTENT_TAG="${{ steps.wrapper.outputs.tag }}"
           DOCKER_BUILDKIT=1 docker build \
             -f docker/Dockerfile.runpod \
             --build-arg BASE_IMAGE=${{ steps.img.outputs.base }}:${{ needs.build-base.outputs.base_tag }} \
             --build-arg BUILDKIT_INLINE_CACHE=1 \
-            --cache-from ${{ steps.img.outputs.base }}-runpod:latest \
-            -t ${{ steps.img.outputs.base }}-runpod:latest \
-            -t ${{ steps.img.outputs.base }}-runpod:${{ github.sha }} \
+            --cache-from "$IMAGE:latest" \
+            -t "$IMAGE:$CONTENT_TAG" \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:${{ github.sha }}" \
             .
-          docker push ${{ steps.img.outputs.base }}-runpod:latest
-          docker push ${{ steps.img.outputs.base }}-runpod:${{ github.sha }}
+          docker push "$IMAGE:$CONTENT_TAG"
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+
+      - name: Install crane for reusable RunPod wrapper tags
+        if: steps.existing.outputs.reuse == 'true'
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Publish commit tags for reusable RunPod wrapper
+        if: steps.existing.outputs.reuse == 'true'
+        run: |
+          set -euo pipefail
+          SOURCE="${{ steps.img.outputs.base }}-runpod:${{ steps.wrapper.outputs.tag }}"
+          crane tag "$SOURCE" "${{ github.sha }}"
+          crane tag "$SOURCE" latest
 
   build-pod:
     needs: build-base
@@ -257,7 +307,50 @@ jobs:
       contents: read
       packages: write
     steps:
+      - uses: actions/checkout@v7
+
+      - name: Set image base (lowercase)
+        id: img
+        run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
+
+      - name: Calculate Pod wrapper content hash
+        id: wrapper
+        run: |
+          set -euo pipefail
+          HASH=$({
+            printf 'base_tag=%s\n' "${{ needs.build-base.outputs.base_tag }}"
+            sha256sum \
+              docker/Dockerfile.pod \
+              docker/pod/start.sh \
+              docker/pod/gateway.py \
+              docker/pod/model_bootstrap.py \
+              docker/pod/asset_sync.py \
+              docker/runpod/comfy-manager-set-mode.sh | LC_ALL=C sort
+          } | sha256sum | cut -d' ' -f1)
+          echo "tag=pod-${HASH:0:16}" >> "$GITHUB_OUTPUT"
+          echo "Pod wrapper content tag: pod-${HASH:0:16}"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for reusable Pod wrapper image
+        id: existing
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.base }}-pod:${{ steps.wrapper.outputs.tag }}"
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing ${IMAGE}"
+          else
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+            echo "Wrapper image not found — will build ${IMAGE}"
+          fi
+
       - name: Free disk space and move Docker data to /mnt
+        if: steps.existing.outputs.reuse != 'true'
         run: |
           sudo rm -rf \
             /usr/share/dotnet \
@@ -277,30 +370,36 @@ jobs:
           sudo systemctl start docker
           df -h / /mnt /var/lib/docker
 
-      - uses: actions/checkout@v7
-
-      - name: Set image base (lowercase)
-        id: img
-        run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
-
-      - uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Pod image
+      - name: Build and push Pod wrapper image
+        if: steps.existing.outputs.reuse != 'true'
         run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.base }}-pod"
+          CONTENT_TAG="${{ steps.wrapper.outputs.tag }}"
           DOCKER_BUILDKIT=1 docker build \
             -f docker/Dockerfile.pod \
             --build-arg BASE_IMAGE=${{ steps.img.outputs.base }}:${{ needs.build-base.outputs.base_tag }} \
             --build-arg BUILDKIT_INLINE_CACHE=1 \
-            --cache-from ${{ steps.img.outputs.base }}-pod:latest \
-            -t ${{ steps.img.outputs.base }}-pod:latest \
-            -t ${{ steps.img.outputs.base }}-pod:${{ github.sha }} \
+            --cache-from "$IMAGE:latest" \
+            -t "$IMAGE:$CONTENT_TAG" \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:${{ github.sha }}" \
             .
-          docker push ${{ steps.img.outputs.base }}-pod:latest
-          docker push ${{ steps.img.outputs.base }}-pod:${{ github.sha }}
+          docker push "$IMAGE:$CONTENT_TAG"
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+
+      - name: Install crane for reusable Pod wrapper tags
+        if: steps.existing.outputs.reuse == 'true'
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Publish commit tags for reusable Pod wrapper
+        if: steps.existing.outputs.reuse == 'true'
+        run: |
+          set -euo pipefail
+          SOURCE="${{ steps.img.outputs.base }}-pod:${{ steps.wrapper.outputs.tag }}"
+          crane tag "$SOURCE" "${{ github.sha }}"
+          crane tag "$SOURCE" latest
 
   build-hydrator:
     runs-on: ubuntu-latest
