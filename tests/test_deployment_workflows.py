@@ -258,6 +258,7 @@ def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifac
 
     assert job["needs"] == ["build-base", "audit-base-runtime"]
     assert job["permissions"] == {"contents": "read", "packages": "write"}
+    assert job["timeout-minutes"] == 360
     block = workflow.split("  publish-runtime-slim:\n", 1)[1]
     assert "scripts/export_runtime.py" in block
     assert "scripts/runtime_ready.py" in block

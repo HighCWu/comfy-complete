@@ -872,7 +872,10 @@ jobs:
   publish-runtime-slim:
     needs: [build-base, audit-base-runtime]
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The first production-sized export exceeded 80 minutes before reaching
+    # archive verification. Keep the platform maximum as a temporary safety
+    # ceiling until the exporter is converted to streaming/multithreaded zstd.
+    timeout-minutes: 360
     permissions:
       contents: read
       packages: write
