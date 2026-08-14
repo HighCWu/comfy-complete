@@ -32,6 +32,7 @@ CRITICAL_CONFIG_VERSION = 3
 CRITICAL_PROBE_VERSION = 3
 DEFAULT_TARGETS = ("/opt/conda", "/app/comfyui")
 DEFAULT_EXCLUDES = (
+    "/opt/conda/pkgs",
     "/app/comfyui/output",
     "/app/comfyui/temp",
     "/app/comfyui/models/_xdgcache",

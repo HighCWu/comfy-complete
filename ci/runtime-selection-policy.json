@@ -5,6 +5,7 @@
   ],
   "include_app": [],
   "excludes": [
+    "/opt/conda/pkgs",
     "/app/comfyui/models/_xdgcache",
     "/app/comfyui/models/_xdgconfig",
     "/app/comfyui/models/_xdgdata",

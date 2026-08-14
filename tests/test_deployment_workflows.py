@@ -412,3 +412,11 @@ def test_runtime_audit_launcher_inventory_is_the_evidence_backed_critical_closur
     policy = yaml.safe_load((REPO_ROOT / "ci" / "runtime-selection-policy.json").read_text())
     assert policy["targets"] == ["/app/comfyui", "/opt/conda"]
     assert policy["include_app"] == []
+    assert policy["excludes"] == [
+        "/opt/conda/pkgs",
+        "/app/comfyui/models/_xdgcache",
+        "/app/comfyui/models/_xdgconfig",
+        "/app/comfyui/models/_xdgdata",
+        "/app/comfyui/output",
+        "/app/comfyui/temp",
+    ]
