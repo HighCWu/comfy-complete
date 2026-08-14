@@ -104,6 +104,13 @@ class RuntimeReadyTests(unittest.TestCase):
             self.assertEqual(first["runtime_digest"], second["runtime_digest"])
             self.assertNotEqual(first["manifest_sha256"], second["manifest_sha256"])
 
+    def test_rejects_manifest_bytes_from_a_different_manifest(self) -> None:
+        manifest = self.manifest()
+        other = self.manifest()
+        other["runtime_version"] = "different"
+        with self.assertRaisesRegex(runtime_ready.RuntimeReadyError, "do not match"):
+            runtime_ready.build_ready_marker(canonical_json(other), manifest)
+
     def test_invalid_manifest_does_not_replace_existing_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

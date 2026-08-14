@@ -44,6 +44,12 @@ def build_ready_marker(manifest_bytes: bytes, manifest: dict[str, object]) -> di
     # Revalidate at the boundary so callers cannot accidentally bind a marker
     # to an unchecked dictionary assembled by another tool.
     validated = validate_manifest(manifest)
+    try:
+        parsed_bytes = validate_manifest(json.loads(manifest_bytes))
+    except (UnicodeDecodeError, json.JSONDecodeError, RuntimeManifestError) as error:
+        raise RuntimeReadyError(f"runtime manifest bytes are invalid: {error}") from error
+    if parsed_bytes != validated:
+        raise RuntimeReadyError("runtime manifest bytes do not match the supplied manifest")
     return {
         "schema_version": READY_SCHEMA_VERSION,
         "runtime_digest": validated["runtime_digest"],
