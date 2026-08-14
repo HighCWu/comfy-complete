@@ -1143,6 +1143,7 @@ jobs:
           set -euo pipefail
           test "$(docker image inspect --format '{{json .Config.Entrypoint}}' '${{ steps.identity.outputs.slim_image }}')" = '["/usr/bin/dumb-init","--","/runtime-launcher.py"]'
           docker run --rm \
+            -i \
             --network none \
             --read-only \
             --pids-limit 128 \
@@ -1261,6 +1262,7 @@ jobs:
           test -f "$CURRENT/manifest.json"
           test -f "$CURRENT/READY.json"
           docker run --rm \
+            -i \
             --network none \
             --read-only \
             --pids-limit 256 \

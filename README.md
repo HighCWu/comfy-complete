@@ -144,10 +144,19 @@ The Pod wrapper also supports optional managed integrations. `COMFY_CONTROL_PLAN
 bootstrap and input/output asset synchronization. `COMFY_POD_TOKEN` alone enables
 the authenticated gateway; `COMFY_CONTROL_PLANE_URL` or `COMFY_INSTANCE_ID`
 without that token is rejected. With no control-plane credentials, the wrapper
-serves ordinary ComfyUI directly on `COMFY_POD_PORT`. `R2_ENDPOINT`, `R2_BUCKET`,
-`R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` likewise form an all-or-nothing
-optional output-upload integration; incomplete configuration falls back to the
-RunPod-compatible base64 result path.
+serves ordinary ComfyUI directly on `COMFY_POD_PORT`.
+
+The Serverless handler's output upload is also optional and provider-neutral. The
+preferred variables are `OBJECT_STORE_ENDPOINT`, `OBJECT_STORE_BUCKET`,
+`OBJECT_STORE_ACCESS_KEY_ID`, and `OBJECT_STORE_SECRET_ACCESS_KEY`, with optional
+`OBJECT_STORE_REGION` (default `auto`). Existing `S3_*` and `R2_*` names remain
+supported as compatibility aliases. If all object-store variables are absent,
+the handler uses the RunPod-compatible inline/base64 result path. A partial or
+unsafe configuration fails the job before ComfyUI starts, rather than silently
+falling back or writing to an unintended endpoint. The per-request
+`comfy_org_api_key` field and `COMFY_ORG_API_KEY` environment variable are
+likewise optional; API-node requests simply omit the credential when neither is
+provided.
 
 ## Tests
 

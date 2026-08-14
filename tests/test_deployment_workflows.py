@@ -363,6 +363,7 @@ def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
     assert "--pids-limit 128" in smoke_block
     assert "--tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m" in smoke_block
     assert "--entrypoint /bin/sh" in smoke_block
+    assert "docker run --rm \\\n            -i \\\n" in smoke_block
     assert "bash -n /start-pod.sh" in smoke_block
     assert "PYTHONDONTWRITEBYTECODE=1" in smoke_block
     assert 'compile(source.read(), path, "exec")' in smoke_block
@@ -434,6 +435,7 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
     assert "start.sh" not in smoke_block
     assert "OBJECT_STORE_" not in smoke_block
     assert "secrets." not in smoke_block
+    assert "docker run --rm \\\n            -i \\\n" in smoke_block
 
     cleanup_block = block.split(
         "      - name: Remove local simulated runtime volume after smoke\n", 1
