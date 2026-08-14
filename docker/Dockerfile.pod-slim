@@ -12,7 +12,11 @@ ARG LAUNCHER_ABI=comfy-pod-launcher/v1
 RUN test -n "${LAUNCHER_DIGEST}" && \
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      bash ca-certificates coreutils dumb-init grep python3 sed && \
+      bash ca-certificates coreutils dumb-init ffmpeg grep \
+      libcom-err2 libgpg-error0 libp11-kit0 libsox3 libxt6 \
+      python3 sed && \
+    ln -s libsox.so.3 /usr/lib/x86_64-linux-gnu/libsox.so && \
+    ldconfig && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /app /opt /launcher-lib
 

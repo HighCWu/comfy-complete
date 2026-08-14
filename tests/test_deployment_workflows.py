@@ -310,10 +310,14 @@ def test_runtime_object_publisher_is_explicit_dispatch_only_and_secret_gated():
     assert inputs["channel"]["default"] == "staging"
 
     block = workflow.split("  publish-runtime-slim:\n", 1)[1]
-    gate = "if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_runtime == true }}"
+    gate = (
+        "if: ${{ github.event_name == 'workflow_dispatch' && "
+        "github.ref == 'refs/heads/main' && inputs.publish_runtime == true }}"
+    )
     publisher = block.split("      - name: Publish verified runtime archive to object store\n", 1)[1]
     publisher = publisher.split("      - name: Upload runtime publication metadata\n", 1)[0]
     assert publisher.count(gate) == 1
+    assert "    environment: runtime-publication\n" in block
     assert "Validate runtime publication channel" in block
     assert "RUNTIME_CHANNEL" in publisher
     assert '"$RUNTIME_CHANNEL" == "."' in block
@@ -577,30 +581,40 @@ def test_runtime_audit_has_critical_probe_and_uploads_its_evidence():
 
 def test_runtime_audit_launcher_inventory_is_the_evidence_backed_critical_closure():
     inventory = REPO_ROOT / "ci" / "runtime-launcher-inventory.json"
-    assert yaml.safe_load(inventory.read_text()) == {
-        "system_paths": [
-            "/bin/bash",
-            "/bin/sh",
-            "/usr/bin/dash",
-            "/usr/bin/dumb-init",
-            "/usr/bin/env",
-            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-        ],
-        "libraries": ["ld-linux-x86-64.so.2", "libc.so.6", "libcuda.so.1", "libdl.so.2", "libm.so.6", "libpthread.so.0", "libresolv.so.2", "librt.so.1", "libutil.so.1"],
-        "library_paths": [],
-        "executable_paths": [
-            "/bin/bash",
-            "/bin/sh",
-            "/usr/bin/dash",
-            "/usr/bin/dumb-init",
-            "/usr/bin/env",
-            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-        ],
-        "symlinks": {
-            "/bin/sh": "/usr/bin/dash",
-            "/lib64/ld-linux-x86-64.so.2": "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-        },
-    }
+    launcher = yaml.safe_load(inventory.read_text())
+    assert launcher["library_paths"] == []
+    assert launcher["libraries"] == sorted(set(launcher["libraries"]))
+    assert {
+        "ld-linux-x86-64.so.2",
+        "libc.so.6",
+        "libcuda.so.1",
+        "libavcodec.so.60",
+        "libavdevice.so.60",
+        "libavfilter.so.9",
+        "libavformat.so.60",
+        "libavutil.so.58",
+        "libcom_err.so.2",
+        "libgpg-error.so.0",
+        "libmvec.so.1",
+        "libp11-kit.so.0",
+        "libsox.so",
+        "libXt.so.6",
+    } <= set(launcher["libraries"])
+    assert {"/bin/bash", "/bin/sh", "/usr/bin/dumb-init", "/usr/bin/env"} <= set(
+        launcher["executable_paths"]
+    )
+
+    workflow = DOCKER_BUILD.read_text()
+    inventory_block = workflow.split("- name: Generate and verify the slim launcher inventory", 1)[1].split(
+        "- name: Smoke-test slim launcher image contract", 1
+    )[0]
+    assert '--user "$(id -u):$(id -g)"' in inventory_block
+    assert "--injected-library libcuda.so.1" in inventory_block
+    assert 'diff -u ci/runtime-launcher-inventory.json "$GENERATED"' in inventory_block
+
+    publish_job = workflow.split("  publish-runtime-slim:\n", 1)[1]
+    assert "    environment: runtime-publication\n" in publish_job
+    assert publish_job.count("github.ref == 'refs/heads/main'") >= 2
 
     policy = yaml.safe_load((REPO_ROOT / "ci" / "runtime-selection-policy.json").read_text())
     assert policy["targets"] == ["/app/comfyui", "/opt/conda"]

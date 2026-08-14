@@ -886,6 +886,10 @@ jobs:
   publish-runtime-slim:
     needs: [build-base, audit-base-runtime]
     runs-on: ubuntu-latest
+    # The environment permits deployments from main only. This prevents a
+    # workflow_dispatch on an unreviewed branch from receiving publication
+    # credentials, even if that branch edits the step-level condition.
+    environment: runtime-publication
     # The first production-sized export exceeded 80 minutes before reaching
     # archive verification. Keep the platform maximum as a temporary safety
     # ceiling until the exporter is converted to streaming/multithreaded zstd.
@@ -1085,7 +1089,10 @@ jobs:
             -t "${{ steps.identity.outputs.slim_image }}" \
             .
           SIZE="$(docker image inspect --format '{{.Size}}' '${{ steps.identity.outputs.slim_image }}')"
-          test "$SIZE" -lt 524288000
+          # FFmpeg 6's libavdevice closure intentionally carries the Ubuntu
+          # GL/audio device ABI. Keep a hard ceiling while allowing that
+          # reviewed closure; the runtime payload itself is still excluded.
+          test "$SIZE" -lt 671088640
           test "$(docker image inspect --format '{{json .Config.Entrypoint}}' '${{ steps.identity.outputs.slim_image }}')" = '["/usr/bin/dumb-init","--","/runtime-launcher.py"]'
           python3 - "$SIZE" "${{ steps.identity.outputs.runtime_dir }}/slim-image.json" <<'PY'
           import json
@@ -1107,6 +1114,29 @@ jobs:
               encoding="utf-8",
           )
           PY
+
+      - name: Generate and verify the slim launcher inventory
+        run: |
+          set -euo pipefail
+          INVENTORY_DIR="$RUNNER_TEMP/slim-launcher-inventory"
+          GENERATED="$INVENTORY_DIR/runtime-launcher-inventory.json"
+          mkdir -p "$INVENTORY_DIR"
+          docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 128 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --user "$(id -u):$(id -g)" \
+            --entrypoint /usr/bin/python3 \
+            -v "$PWD/scripts/runtime_launcher_inventory.py:/runtime-launcher-inventory.py:ro" \
+            -v "$INVENTORY_DIR:/inventory-output" \
+            "${{ steps.identity.outputs.slim_image }}" \
+            /runtime-launcher-inventory.py \
+            --root / \
+            --injected-library libcuda.so.1 \
+            --output /inventory-output/runtime-launcher-inventory.json
+          diff -u ci/runtime-launcher-inventory.json "$GENERATED"
 
       - name: Smoke-test slim launcher image contract
         run: |
@@ -1137,7 +1167,7 @@ jobs:
           test -x /usr/local/bin/comfy-manager-set-mode
           test -x /usr/bin/dumb-init
           test -x /usr/bin/env
-          for command in bash python3 dumb-init env; do
+          for command in bash python3 dumb-init env ffmpeg; do
             executable="$(command -v "$command")"
             test -n "$executable"
             test -x "$executable"
@@ -1387,7 +1417,7 @@ jobs:
       # therefore do not receive object-store secrets or upload the archive.
       - name: Validate runtime publication channel
         id: runtime-publication-inputs
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_runtime == true }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish_runtime == true }}
         env:
           RUNTIME_CHANNEL: ${{ inputs.channel }}
         run: |
@@ -1400,7 +1430,7 @@ jobs:
 
       - name: Publish verified runtime archive to object store
         id: runtime-publisher
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_runtime == true }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish_runtime == true }}
         env:
           OBJECT_STORE_ENDPOINT: ${{ secrets.OBJECT_STORE_ENDPOINT }}
           OBJECT_STORE_BUCKET: ${{ secrets.OBJECT_STORE_BUCKET }}
