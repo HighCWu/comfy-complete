@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from scripts import runtime_launcher_inventory as inventory
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "runtime_launcher_inventory",
+    ROOT / "scripts" / "runtime_launcher_inventory.py",
+)
+assert SPEC and SPEC.loader
+inventory = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = inventory
+SPEC.loader.exec_module(inventory)
 
 
 class RuntimeLauncherInventoryTests(unittest.TestCase):
