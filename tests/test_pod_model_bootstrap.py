@@ -37,6 +37,15 @@ class FakeResponse(io.BytesIO):
 
 
 class PodModelBootstrapTests(unittest.TestCase):
+    def test_model_bootstrap_integration_is_optional(self) -> None:
+        with patch.dict(module.os.environ, {}, clear=True):
+            self.assertFalse(module.integration_configured())
+
+    def test_model_bootstrap_rejects_partial_configuration(self) -> None:
+        with patch.dict(module.os.environ, {"COMFY_INSTANCE_ID": "inst_test"}, clear=True):
+            with self.assertRaisesRegex(module.BootstrapError, "configured together"):
+                module.integration_configured()
+
     def test_rejects_unsafe_manifest_paths(self) -> None:
         with self.assertRaisesRegex(module.BootstrapError, "unsafe metadata"):
             module.validate_item(
@@ -74,7 +83,7 @@ class PodModelBootstrapTests(unittest.TestCase):
                 return FakeResponse(payload[start or 0 :], 206 if start else 200)
 
             with patch.object(module, "request", side_effect=fake_request):
-                module.download_model("https://laimon.ai", "token", model_root, item)
+                module.download_model("https://example.invalid", "token", model_root, item)
 
             self.assertEqual(starts, [7])
             self.assertEqual((target_dir / "model.pth").read_bytes(), payload)
@@ -99,9 +108,9 @@ class PodModelBootstrapTests(unittest.TestCase):
             ],
         }
         env = {
-            "LAIMON_POD_TOKEN": "token",
-            "LAIMON_INSTANCE_ID": "inst_test",
-            "LAIMON_CONTROL_PLANE_URL": "https://laimon.ai",
+            "COMFY_POD_TOKEN": "token",
+            "COMFY_INSTANCE_ID": "inst_test",
+            "COMFY_CONTROL_PLANE_URL": "https://example.invalid",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "instance"
@@ -124,7 +133,7 @@ class PodModelBootstrapTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(config.read_text(encoding="utf-8")),
                 {
-                    "laimon_instance": {
+                    "comfy_instance": {
                         "base_path": str(root),
                         "loras": "models/loras/",
                     }
@@ -148,13 +157,13 @@ class PodModelBootstrapTests(unittest.TestCase):
                 "sha256": sha256,
                 "source": "shared_volume",
                 "shared_volume_path": relative,
-                "shared_marker_path": relative + ".laimon.json",
+                "shared_marker_path": relative + ".manifest.json",
             }],
         }
         env = {
-            "LAIMON_POD_TOKEN": "token",
-            "LAIMON_INSTANCE_ID": "inst_test",
-            "LAIMON_CONTROL_PLANE_URL": "https://laimon.ai",
+            "COMFY_POD_TOKEN": "token",
+            "COMFY_INSTANCE_ID": "inst_test",
+            "COMFY_CONTROL_PLANE_URL": "https://example.invalid",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "runtime"
@@ -162,7 +171,7 @@ class PodModelBootstrapTests(unittest.TestCase):
             artifact = shared / relative
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(payload)
-            marker = shared / (relative + ".laimon.json")
+            marker = shared / (relative + ".manifest.json")
             marker.write_text(json.dumps({
                 "version": 1,
                 "sha256": sha256,

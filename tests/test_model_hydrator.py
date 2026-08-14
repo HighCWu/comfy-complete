@@ -41,7 +41,7 @@ def manifest(payload: bytes) -> dict[str, object]:
         "sha256": sha256,
         "size_bytes": len(payload),
         "artifact_path": path,
-        "marker_path": path + ".laimon.json",
+        "marker_path": path + ".manifest.json",
         "reserve_bytes": 0,
         "overhead_bps": 0,
         "source_kind": "huggingface",
@@ -50,12 +50,25 @@ def manifest(payload: bytes) -> dict[str, object]:
 
 
 class ModelHydratorTests(unittest.TestCase):
+    def test_hydration_integration_is_optional(self) -> None:
+        with patch.dict(module.os.environ, {}, clear=True):
+            self.assertFalse(module.integration_configured())
+
+    def test_hydration_integration_rejects_partial_configuration(self) -> None:
+        with patch.dict(
+            module.os.environ,
+            {"COMFY_CONTROL_PLANE_URL": "https://example.invalid"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(module.HydrationError, "configured together"):
+                module.integration_configured()
+
     def test_rejects_path_not_bound_to_hash(self) -> None:
         value = {
             "sha256": "a" * 64,
             "size_bytes": 10,
             "artifact_path": "shared/models/objects/bb/" + "b" * 64 + "/artifact",
-            "marker_path": "shared/models/objects/bb/" + "b" * 64 + "/artifact.laimon.json",
+            "marker_path": "shared/models/objects/bb/" + "b" * 64 + "/artifact.manifest.json",
             "reserve_bytes": 0,
             "overhead_bps": 0,
             "source": {
@@ -77,7 +90,7 @@ class ModelHydratorTests(unittest.TestCase):
             result = module.hydrate(root, manifest(payload))
             relative = str(manifest(payload)["artifact_path"])
             artifact = root / relative
-            marker = root / (relative + ".laimon.json")
+            marker = root / (relative + ".manifest.json")
             self.assertEqual(result["status"], "ready")
             self.assertEqual(artifact.read_bytes(), payload)
             self.assertEqual(
@@ -99,7 +112,7 @@ class ModelHydratorTests(unittest.TestCase):
             artifact = root / relative
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(payload)
-            (root / (relative + ".laimon.json")).write_text(
+            (root / (relative + ".manifest.json")).write_text(
                 json.dumps({
                     "version": 1,
                     "sha256": first_manifest["sha256"],

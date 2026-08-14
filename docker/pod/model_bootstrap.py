@@ -1,4 +1,4 @@
-"""Prepare the exact model set bound to the active Laimon Pod start quote.
+"""Prepare the exact model set bound to the active Compute Pod start quote.
 
 The control plane authenticates this container with the lease-derived Pod
 token and streams private R2 objects without exposing R2 credentials or keys.
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 
-TOKEN_HEADER = "X-Laimon-Pod-Token"
+TOKEN_HEADER = "X-Comfy-Pod-Token"
 SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
 SAFE_FOLDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SAFE_SHARED_PATH = re.compile(r"^shared/models/objects/[a-f0-9]{2}/[a-f0-9]{64}/[A-Za-z0-9._-]+$")
@@ -31,6 +31,15 @@ MANIFEST_WAIT_SECONDS = 300
 
 class BootstrapError(RuntimeError):
     """Terminal model-bootstrap failure."""
+
+
+def integration_configured() -> bool:
+    """Return whether the optional control-plane integration is configured."""
+    names = ("COMFY_CONTROL_PLANE_URL", "COMFY_INSTANCE_ID", "COMFY_POD_TOKEN")
+    configured = [bool(os.environ.get(name, "").strip()) for name in names]
+    if any(configured) and not all(configured):
+        raise BootstrapError("control-plane variables must be configured together")
+    return all(configured)
 
 
 def required_env(name: str) -> str:
@@ -59,7 +68,7 @@ def request(
     headers = {
         TOKEN_HEADER: token,
         "Accept": "application/json" if range_start is None else "application/octet-stream",
-        "User-Agent": "laimon-pod-model-bootstrap/1",
+        "User-Agent": "comfy-pod-model-bootstrap/1",
     }
     if range_start is not None and range_start > 0:
         headers["Range"] = f"bytes={range_start}-"
@@ -97,7 +106,7 @@ def load_manifest(control_plane: str, instance_id: str, token: str) -> dict[str,
             last_error = f"HTTP {error.code}: {detail}"
         except urllib.error.URLError as error:
             last_error = str(error.reason)
-        print(f"laimon-pod: waiting for model manifest — {last_error}", flush=True)
+        print(f"comfy-pod: waiting for model manifest — {last_error}", flush=True)
         time.sleep(2)
     raise BootstrapError(f"model manifest did not become ready: {last_error}")
 
@@ -147,7 +156,7 @@ def validate_item(value: object) -> dict[str, object]:
         or not SAFE_SHARED_PATH.fullmatch(shared_volume_path)
         or not isinstance(shared_marker_path, str)
         or not SAFE_SHARED_PATH.fullmatch(shared_marker_path)
-        or shared_marker_path != shared_volume_path + ".laimon.json"
+        or shared_marker_path != shared_volume_path + ".manifest.json"
     ):
         raise BootstrapError("shared model manifest item contains unsafe metadata")
     return {
@@ -179,7 +188,7 @@ def download_model(
 
     if target.exists():
         if target.stat().st_size == expected_size and file_sha256(target) == expected_sha256:
-            print(f"laimon-pod: model ready from cache — {folder}/{filename}", flush=True)
+            print(f"comfy-pod: model ready from cache — {folder}/{filename}", flush=True)
             return
         target.unlink()
 
@@ -215,7 +224,7 @@ def download_model(
                 )
             os.replace(partial, target)
             print(
-                f"laimon-pod: model prepared — {folder}/{filename} "
+                f"comfy-pod: model prepared — {folder}/{filename} "
                 f"({expected_size} bytes)",
                 flush=True,
             )
@@ -227,7 +236,7 @@ def download_model(
                 ) from error
             offset = partial.stat().st_size if partial.exists() else 0
             print(
-                f"laimon-pod: retrying model download {folder}/{filename} "
+                f"comfy-pod: retrying model download {folder}/{filename} "
                 f"({attempt}/3) — {error}",
                 flush=True,
             )
@@ -272,14 +281,14 @@ def link_shared_model(
         return
     if target.exists() or target.is_symlink():
         raise BootstrapError(f"shared model target collision for {folder}/{filename}")
-    temporary = target.with_name(f".{target.name}.laimon-shared-link")
+    temporary = target.with_name(f".{target.name}.shared-model-link")
     temporary.unlink(missing_ok=True)
     try:
         temporary.symlink_to(source)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
-    print(f"laimon-pod: shared model ready — {folder}/{filename}", flush=True)
+    print(f"comfy-pod: shared model ready — {folder}/{filename}", flush=True)
 
 
 def write_extra_model_paths(
@@ -293,7 +302,7 @@ def write_extra_model_paths(
     config_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = config_path.with_name(config_path.name + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
-        json.dump({"laimon_instance": entry}, handle, ensure_ascii=True)
+        json.dump({"comfy_instance": entry}, handle, ensure_ascii=True)
         handle.write("\n")
     os.replace(temporary, config_path)
 
@@ -330,7 +339,7 @@ def publish_comfy_model_links(
             raise BootstrapError(
                 f"ComfyUI model path collision for {folder}/{filename}"
             )
-        temporary = link.with_name(f".{link.name}.laimon-link")
+        temporary = link.with_name(f".{link.name}.model-link")
         temporary.unlink(missing_ok=True)
         try:
             temporary.symlink_to(target)
@@ -345,15 +354,15 @@ def bootstrap(
     comfy_model_root: Path,
     shared_volume_root: Path,
 ) -> dict[str, int | str]:
-    token = required_env("LAIMON_POD_TOKEN")
-    instance_id = required_env("LAIMON_INSTANCE_ID")
-    control_plane = required_env("LAIMON_CONTROL_PLANE_URL")
+    token = required_env("COMFY_POD_TOKEN")
+    instance_id = required_env("COMFY_INSTANCE_ID")
+    control_plane = required_env("COMFY_CONTROL_PLANE_URL")
     parsed_control_plane = urllib.parse.urlparse(control_plane)
     if parsed_control_plane.scheme != "https" and parsed_control_plane.hostname not in {
         "localhost",
         "127.0.0.1",
     }:
-        raise BootstrapError("LAIMON_CONTROL_PLANE_URL must use HTTPS")
+        raise BootstrapError("COMFY_CONTROL_PLANE_URL must use HTTPS")
     manifest = load_manifest(control_plane, instance_id, token)
     raw_items = manifest.get("items")
     if not isinstance(raw_items, list):
@@ -392,18 +401,25 @@ def main() -> None:
     parser.add_argument("--comfy-model-root", type=Path, required=True)
     parser.add_argument("--shared-volume-root", type=Path, required=True)
     args = parser.parse_args()
+    if not integration_configured():
+        print(
+            "comfy-pod: control-plane credentials are not configured; "
+            "model bootstrap is disabled",
+            flush=True,
+        )
+        return
     result = bootstrap(
         args.instance_root,
         args.config,
         args.comfy_model_root,
         args.shared_volume_root,
     )
-    print("laimon-pod: model bootstrap complete — " + json.dumps(result), flush=True)
+    print("comfy-pod: model bootstrap complete — " + json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":
     try:
         main()
     except BootstrapError as error:
-        print(f"laimon-pod: model bootstrap failed — {error}", flush=True)
+        print(f"comfy-pod: model bootstrap failed — {error}", flush=True)
         raise SystemExit(1) from error

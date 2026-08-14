@@ -24,13 +24,11 @@ COPY --chmod=644 docker/pod/model_bootstrap.py /pod-model-bootstrap.py
 COPY --chmod=644 docker/pod/asset_sync.py /pod-asset-sync.py
 COPY --chmod=755 docker/runpod/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 
-ENV COMFY_INTERNAL_HOST=127.0.0.1 \
-    COMFY_INTERNAL_PORT=8188 \
-    LAIMON_POD_PORT=8189 \
+ENV COMFY_POD_PORT=8189 \
     COMFY_LOG_LEVEL=INFO \
-    LAIMON_EXPECTED_LAUNCHER_DIGEST=${LAUNCHER_DIGEST} \
-    LAIMON_EXPECTED_LAUNCHER_ABI=${LAUNCHER_ABI} \
-    LAIMON_EXPECTED_RUNTIME_PLATFORM=linux/amd64
+    COMFY_EXPECTED_LAUNCHER_DIGEST=${LAUNCHER_DIGEST} \
+    COMFY_EXPECTED_LAUNCHER_ABI=${LAUNCHER_ABI} \
+    COMFY_EXPECTED_RUNTIME_PLATFORM=linux/amd64
 
 EXPOSE 8189
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/runtime-launcher.py"]

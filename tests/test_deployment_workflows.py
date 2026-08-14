@@ -11,6 +11,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKER_BUILD = REPO_ROOT / ".github" / "workflows" / "docker-build.yml"
+SEED_OBJECT_INFO = REPO_ROOT / ".github" / "workflows" / "seed-object-info.yml"
 DOCKER_PULL_RETRY = REPO_ROOT / ".github" / "scripts" / "docker-pull-with-retry.sh"
 CONFIGURE_DOCKER_PULLS = REPO_ROOT / ".github" / "scripts" / "configure-docker-pulls.py"
 
@@ -43,7 +44,17 @@ def test_docker_build_never_mutates_runpod_endpoints():
 def test_docker_build_does_not_need_cross_repository_credentials():
     text = DOCKER_BUILD.read_text()
     assert "repository_dispatch" not in text
-    assert "LAIMON_REPOSITORY_DISPATCH_TOKEN" not in text
+    assert "PROJECT_REPOSITORY_DISPATCH_TOKEN" not in text
+
+
+def test_optional_object_info_integration_skips_only_when_fully_unconfigured():
+    text = SEED_OBJECT_INFO.read_text()
+    block = text.split("      - name: Check optional API integration\n", 1)[1]
+    block = block.split("      - name: Resolve image tag\n", 1)[0]
+    assert '[ -z "$ADMIN_SECRET" ] && [ -z "$API_BASE_URL" ]' in block
+    assert '[ -z "$ADMIN_SECRET" ] || [ -z "$API_BASE_URL" ]' in block
+    assert "must be configured together" in block
+    assert "exit 1" in block
 
 
 def test_base_content_hash_covers_every_local_copy_input():
@@ -265,6 +276,8 @@ def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifac
     assert "actions/download-artifact@v4" in block
     assert 'gate.get("status") != "pass"' in block
     assert 'gate.get("source") != "critical"' in block
+    assert 'gate.get("static_policy")' in block
+    assert 'static_policy.get("status") != "pass"' in block
     assert "docker/Dockerfile.pod-slim" in block
     assert "--network none" in block
     assert "--cap-drop ALL" in block
@@ -279,6 +292,85 @@ def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifac
     assert "docker push" in block
     assert "-pod-slim:${{ github.sha }}" in block
     assert "-pod-slim:latest" not in block
+
+
+def test_runtime_object_publisher_is_explicit_dispatch_only_and_secret_gated():
+    workflow = DOCKER_BUILD.read_text()
+    parsed = yaml.safe_load(workflow)
+    trigger = parsed.get("on", parsed.get(True, {}))
+    inputs = trigger["workflow_dispatch"]["inputs"]
+
+    assert inputs["publish_runtime"] == {
+        "description": "Publish the verified runtime archive to the configured object store",
+        "required": False,
+        "type": "boolean",
+        "default": False,
+    }
+    assert inputs["channel"]["type"] == "string"
+    assert inputs["channel"]["default"] == "staging"
+
+    block = workflow.split("  publish-runtime-slim:\n", 1)[1]
+    gate = "if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_runtime == true }}"
+    publisher = block.split("      - name: Publish verified runtime archive to object store\n", 1)[1]
+    publisher = publisher.split("      - name: Upload runtime publication metadata\n", 1)[0]
+    assert publisher.count(gate) == 1
+    assert "Validate runtime publication channel" in block
+    assert "RUNTIME_CHANNEL" in publisher
+    assert '"$RUNTIME_CHANNEL" == "."' in block
+    assert '"$RUNTIME_CHANNEL" == ".."' in block
+    for secret in (
+        "OBJECT_STORE_ENDPOINT",
+        "OBJECT_STORE_BUCKET",
+        "OBJECT_STORE_ACCESS_KEY_ID",
+        "OBJECT_STORE_SECRET_ACCESS_KEY",
+    ):
+        assert f"{secret}: ${{{{ secrets.{secret} }}}}" in publisher
+    assert "--require-config" in publisher
+    assert "S3_" not in publisher
+
+
+def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
+    workflow = DOCKER_BUILD.read_text()
+    block = workflow.split("  publish-runtime-slim:\n", 1)[1]
+    export = block.index("Export and fully verify the immutable runtime")
+    ready = block.index("scripts/runtime_ready.py")
+    slim = block.index("Build and inspect the slim launcher image")
+    smoke = block.index("Smoke-test slim launcher image contract")
+    push = block.index("Push the immutable slim launcher image")
+    publish = block.index("Publish verified runtime archive to object store")
+    upload = block.index("Upload runtime publication metadata")
+    cleanup = block.index("Delete the runner-local runtime archive")
+    assert export < ready < slim < smoke < push < publish < upload < cleanup
+    smoke_block = block.split("      - name: Smoke-test slim launcher image contract\n", 1)[1]
+    smoke_block = smoke_block.split("      - name: Push the immutable slim launcher image\n", 1)[0]
+    for path in (
+        "/runtime-launcher.py",
+        "/start-pod.sh",
+        "/launcher-lib/runtime_manifest.py",
+        "/pod-gateway.py",
+        "/pod-model-bootstrap.py",
+        "/pod-asset-sync.py",
+        "/usr/local/bin/comfy-manager-set-mode",
+    ):
+        assert path in smoke_block
+    assert '["/usr/bin/dumb-init","--","/runtime-launcher.py"]' in smoke_block
+    assert "--network none" in smoke_block
+    assert "--read-only" in smoke_block
+    assert "--pids-limit 128" in smoke_block
+    assert "--tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m" in smoke_block
+    assert "--entrypoint /bin/sh" in smoke_block
+    assert "bash -n /start-pod.sh" in smoke_block
+    assert "PYTHONDONTWRITEBYTECODE=1" in smoke_block
+    assert 'compile(source.read(), path, "exec")' in smoke_block
+    assert "spec_from_file_location" in smoke_block
+    assert "import runtime_manifest" in smoke_block
+    assert "for command in bash python3 dumb-init env" in smoke_block
+    assert "--gpus" not in smoke_block
+    assert "RUNPOD" not in smoke_block
+    assert "runtime-publisher.json" in block
+    assert "'boto3==1.40.0'" in block
+    metadata = block.split("actions/upload-artifact@v4", 1)[1].split("Delete the runner-local runtime archive", 1)[0]
+    assert ".tar.zst" not in metadata
 
 
 def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure():
@@ -378,6 +470,8 @@ def test_runtime_audit_has_critical_probe_and_uploads_its_evidence():
     assert "critical-probe.log" in block
     assert "--critical-config" in block
     assert "--critical-probe" in block
+    assert "runtime-portability-gate.json" in block
+    assert "--gate-policy" in block
     assert "--profile cpu" in block
     assert "--critical-profile cpu" in block
     assert '"probe_profile": "cpu"' in block
@@ -397,17 +491,24 @@ def test_runtime_audit_launcher_inventory_is_the_evidence_backed_critical_closur
     assert yaml.safe_load(inventory.read_text()) == {
         "system_paths": [
             "/bin/bash",
+            "/bin/sh",
+            "/usr/bin/dash",
             "/usr/bin/dumb-init",
+            "/usr/bin/env",
             "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
         ],
-        "libraries": ["libc.so.6", "libdl.so.2", "libm.so.6", "libpthread.so.0", "librt.so.1", "libutil.so.1"],
+        "libraries": ["ld-linux-x86-64.so.2", "libc.so.6", "libcuda.so.1", "libdl.so.2", "libm.so.6", "libpthread.so.0", "libresolv.so.2", "librt.so.1", "libutil.so.1"],
         "library_paths": [],
         "executable_paths": [
             "/bin/bash",
+            "/bin/sh",
+            "/usr/bin/dash",
             "/usr/bin/dumb-init",
+            "/usr/bin/env",
             "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
         ],
         "symlinks": {
+            "/bin/sh": "/usr/bin/dash",
             "/lib64/ld-linux-x86-64.so.2": "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
         },
     }
@@ -422,4 +523,8 @@ def test_runtime_audit_launcher_inventory_is_the_evidence_backed_critical_closur
         "/app/comfyui/models/_xdgdata",
         "/app/comfyui/output",
         "/app/comfyui/temp",
+        "/app/comfyui/.ce/envs/geometrypack-nodes/.pixi/envs/default/lib/icu/Makefile.inc",
+        "/app/comfyui/.ce/envs/geometrypack-nodes/.pixi/envs/default/lib/icu/pkgdata.inc",
+        "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/Makefile.inc",
+        "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/pkgdata.inc",
     ]

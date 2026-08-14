@@ -10,6 +10,10 @@
     "/app/comfyui/models/_xdgconfig",
     "/app/comfyui/models/_xdgdata",
     "/app/comfyui/output",
-    "/app/comfyui/temp"
+    "/app/comfyui/temp",
+    "/app/comfyui/.ce/envs/geometrypack-nodes/.pixi/envs/default/lib/icu/Makefile.inc",
+    "/app/comfyui/.ce/envs/geometrypack-nodes/.pixi/envs/default/lib/icu/pkgdata.inc",
+    "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/Makefile.inc",
+    "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/pkgdata.inc"
   ]
 }

@@ -10,6 +10,16 @@ on:
         required: false
         type: boolean
         default: false
+      publish_runtime:
+        description: "Publish the verified runtime archive to the configured object store"
+        required: false
+        type: boolean
+        default: false
+      channel:
+        description: "Mutable runtime channel pointer (for example, staging)"
+        required: false
+        type: string
+        default: staging
 
 concurrency:
   group: docker-build-${{ github.ref }}
@@ -551,6 +561,7 @@ jobs:
           PY
           cp ci/runtime-selection-policy.json "$AUDIT_DIR/selection-policy.json"
           cp ci/runtime-launcher-inventory.json "$AUDIT_DIR/launcher-inventory.json"
+          cp ci/runtime-portability-gate.json "$AUDIT_DIR/runtime-portability-gate.json"
           cp ci/runtime-critical-entrypoints.json "$AUDIT_DIR/runtime-critical-entrypoints.json"
 
       - name: Probe critical runtime imports in the final base container
@@ -774,6 +785,7 @@ jobs:
             --source-root / \
             --selection-policy /runtime-audit/ci/runtime-selection-policy.json \
             --launcher-inventory /runtime-audit/ci/runtime-launcher-inventory.json \
+            --gate-policy /runtime-audit/ci/runtime-portability-gate.json \
             --critical-config /runtime-audit/ci/runtime-critical-entrypoints.json \
             --critical-probe /audit-input/critical-probe.json \
             --critical-profile cpu \
@@ -866,9 +878,10 @@ jobs:
           rm -rf "${{ steps.audit-paths.outputs.audit_dir }}"
 
   # Export and verify the exact immutable runtime, then publish only the thin
-  # launcher image. The large archive remains local to this runner until the
-  # separate R2 publisher is introduced; GitHub Artifacts receives metadata
-  # only, avoiding multi-gigabyte artifact storage and transfer charges.
+  # launcher image. The large archive remains local to this runner unless an
+  # explicit workflow_dispatch enables the object-store publisher; GitHub
+  # Artifacts receives metadata only, avoiding multi-gigabyte artifact storage
+  # and transfer charges.
   publish-runtime-slim:
     needs: [build-base, audit-base-runtime]
     runs-on: ubuntu-latest
@@ -936,6 +949,9 @@ jobs:
           gate = report.get("gate", {})
           if gate.get("status") != "pass" or gate.get("source") != "critical":
               raise SystemExit(f"runtime critical portability gate did not pass: {gate!r}")
+          static_policy = gate.get("static_policy")
+          if not isinstance(static_policy, dict) or static_policy.get("status") != "pass":
+              raise SystemExit(f"runtime static portability policy gate did not pass: {static_policy!r}")
           print(json.dumps(gate, sort_keys=True))
           PY
 
@@ -1086,13 +1102,137 @@ jobs:
                   },
                   sort_keys=True,
                   separators=(",", ":"),
-              ) + "\n",
+          ) + "\n",
               encoding="utf-8",
           )
           PY
 
+      - name: Smoke-test slim launcher image contract
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' '${{ steps.identity.outputs.slim_image }}')" = '["/usr/bin/dumb-init","--","/runtime-launcher.py"]'
+          docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 128 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m \
+            --entrypoint /bin/sh \
+            "${{ steps.identity.outputs.slim_image }}" \
+            -eu -s <<'SH'
+          for required in \
+            /runtime-launcher.py \
+            /start-pod.sh \
+            /launcher-lib/runtime_manifest.py \
+            /pod-gateway.py \
+            /pod-model-bootstrap.py \
+            /pod-asset-sync.py \
+            /usr/local/bin/comfy-manager-set-mode; do
+            test -f "$required"
+          done
+          test -x /runtime-launcher.py
+          test -x /start-pod.sh
+          test -x /usr/local/bin/comfy-manager-set-mode
+          test -x /usr/bin/dumb-init
+          test -x /usr/bin/env
+          for command in bash python3 dumb-init env; do
+            executable="$(command -v "$command")"
+            test -n "$executable"
+            test -x "$executable"
+          done
+          bash -n /start-pod.sh
+          bash -n /usr/local/bin/comfy-manager-set-mode
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/launcher-lib python3 -c '
+          import importlib.util
+          import runtime_manifest
+          import sys
+
+          spec = importlib.util.spec_from_file_location("runtime_launcher", "/runtime-launcher.py")
+          if spec is None or spec.loader is None:
+              raise SystemExit("runtime launcher import spec is missing")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          # These helpers intentionally run with the mounted runtime's
+          # /opt/conda Python after runtime_launcher installs that link. The
+          # base-image critical probe separately imports aiohttp and the core
+          # runtime dependencies; here the slim system Python validates source
+          # syntax without pretending to own those runtime packages.
+          for path in ("/pod-gateway.py", "/pod-model-bootstrap.py", "/pod-asset-sync.py"):
+              with open(path, "rb") as source:
+                  compile(source.read(), path, "exec")
+          '
+          SH
+
       - name: Push the immutable slim launcher image
         run: docker push "${{ steps.identity.outputs.slim_image }}"
+
+      # Object-store credentials are referenced only by this explicitly
+      # enabled workflow_dispatch step. Pushes to main cannot reach it and
+      # therefore do not receive object-store secrets or upload the archive.
+      - name: Validate runtime publication channel
+        id: runtime-publication-inputs
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_runtime == true }}
+        env:
+          RUNTIME_CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          if [[ "$RUNTIME_CHANNEL" == "." || "$RUNTIME_CHANNEL" == ".." || ! "$RUNTIME_CHANNEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "channel must be one safe path component (1-128 ASCII letters, digits, '.', '_', or '-')" >&2
+            exit 1
+          fi
+          printf 'channel=%s\n' "$RUNTIME_CHANNEL" >> "$GITHUB_OUTPUT"
+
+      - name: Publish verified runtime archive to object store
+        id: runtime-publisher
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_runtime == true }}
+        env:
+          OBJECT_STORE_ENDPOINT: ${{ secrets.OBJECT_STORE_ENDPOINT }}
+          OBJECT_STORE_BUCKET: ${{ secrets.OBJECT_STORE_BUCKET }}
+          OBJECT_STORE_ACCESS_KEY_ID: ${{ secrets.OBJECT_STORE_ACCESS_KEY_ID }}
+          OBJECT_STORE_SECRET_ACCESS_KEY: ${{ secrets.OBJECT_STORE_SECRET_ACCESS_KEY }}
+          OBJECT_STORE_REGION: ${{ secrets.OBJECT_STORE_REGION }}
+          OBJECT_STORE_PREFIX: ${{ secrets.OBJECT_STORE_PREFIX }}
+          RUNTIME_CHANNEL: ${{ steps.runtime-publication-inputs.outputs.channel }}
+        run: |
+          set -euo pipefail
+          PUBLISH_VENV="$RUNNER_TEMP/runtime-publisher-venv"
+          python3 -m venv "$PUBLISH_VENV"
+          "$PUBLISH_VENV/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            'boto3==1.40.0'
+          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
+          ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
+          test -n "$ARCHIVE"
+          PUBLISH_RESULT="$RUNTIME_DIR/runtime-publisher.json"
+          "$PUBLISH_VENV/bin/python" scripts/publish_runtime.py \
+            --archive "$ARCHIVE" \
+            --manifest "$RUNTIME_DIR/manifest.json" \
+            --channel "$RUNTIME_CHANNEL" \
+            --require-config \
+            > "$PUBLISH_RESULT"
+          python3 - "$PUBLISH_RESULT" "$GITHUB_STEP_SUMMARY" <<'PY'
+          from __future__ import annotations
+
+          import json
+          import sys
+          from pathlib import Path
+
+          result_path, summary_path = map(Path, sys.argv[1:])
+          result = json.loads(result_path.read_text(encoding="utf-8"))
+          if result.get("status") != "published":
+              raise SystemExit(f"runtime publisher did not publish: {result!r}")
+          with summary_path.open("a", encoding="utf-8") as summary:
+              summary.write(
+                  "## Runtime object publication\n\n"
+                  + "```json\n"
+                  + json.dumps(result, sort_keys=True, separators=(",", ":"))
+                  + "\n```\n"
+              )
+          PY
+          cat "$PUBLISH_RESULT"
 
       - name: Upload runtime publication metadata
         if: ${{ always() }}
@@ -1104,6 +1244,7 @@ jobs:
             ${{ steps.identity.outputs.runtime_dir }}/READY.json
             ${{ steps.identity.outputs.runtime_dir }}/runtime-summary.json
             ${{ steps.identity.outputs.runtime_dir }}/slim-image.json
+            ${{ steps.identity.outputs.runtime_dir }}/runtime-publisher.json
           if-no-files-found: warn
           retention-days: 14
 

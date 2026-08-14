@@ -114,6 +114,35 @@ class RuntimeLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(launcher.LauncherError, "digest"):
                 launcher.verify_runtime_tree(manifest_path.parent, manifest, full=True)
 
+    def test_launch_check_does_not_walk_noncritical_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path, ready_path, _ = self.fixture(Path(temporary))
+            manifest = self.load(manifest_path, ready_path)
+            missing = manifest_path.parent / "app/comfyui/noncritical.bin"
+            manifest["file_tree"]["entries"].append({
+                "path": "app/comfyui/noncritical.bin",
+                "type": "file",
+                "mode": 0o644,
+                "size_bytes": 7,
+                "sha256": hashlib.sha256(b"missing").hexdigest(),
+            })
+            launcher.verify_runtime_tree(manifest_path.parent, manifest)
+            with self.assertRaisesRegex(launcher.LauncherError, "missing"):
+                launcher.verify_runtime_tree(manifest_path.parent, manifest, full=True)
+            self.assertFalse(missing.exists())
+
+    def test_launch_check_rejects_missing_critical_manifest_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path, ready_path, _ = self.fixture(Path(temporary))
+            manifest = self.load(manifest_path, ready_path)
+            manifest["file_tree"]["entries"] = [
+                entry
+                for entry in manifest["file_tree"]["entries"]
+                if entry["path"] != "app/comfyui"
+            ]
+            with self.assertRaisesRegex(launcher.LauncherError, "launch-critical"):
+                launcher.verify_runtime_tree(manifest_path.parent, manifest)
+
     def test_rejects_real_compatibility_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -141,6 +170,32 @@ class RuntimeLauncherTests(unittest.TestCase):
             self.assertTrue((projected / "models/checkpoints/bundled.safetensors").is_symlink())
             (projected / "models/checkpoints/instance.safetensors").symlink_to(root / "instance-model")
             self.assertFalse((runtime / "models/checkpoints/instance.safetensors").exists())
+
+    def test_comfy_projection_is_idempotent_after_container_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            (runtime / "models/checkpoints").mkdir(parents=True)
+            (runtime / "main.py").write_text("pass\n", encoding="utf-8")
+            projected = root / "app/comfyui"
+
+            launcher.install_comfy_projection(projected, runtime)
+            marker = projected.parent / ".comfyui.runtime-projection"
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), str(runtime.resolve()))
+            launcher.install_comfy_projection(projected, runtime)
+            self.assertTrue((projected / "main.py").is_symlink())
+
+    def test_comfy_projection_rejects_unmarked_existing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            projected = root / "app/comfyui"
+            projected.mkdir(parents=True)
+            (projected / "user-data").write_text("do not replace\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(launcher.LauncherError, "existing ComfyUI path"):
+                launcher.install_comfy_projection(projected, runtime)
 
 
 if __name__ == "__main__":

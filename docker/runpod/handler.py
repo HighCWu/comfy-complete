@@ -204,7 +204,7 @@ def validate_input(job_input):
     # Optional: API key for Comfy.org API Nodes, passed per-request
     comfy_org_api_key = job_input.get("comfy_org_api_key")
 
-    # [laimon] userId + promptId for R2 key construction
+    # [platform] userId + promptId for R2 key construction
     user_id = job_input.get("userId")
     prompt_id = job_input.get("promptId")
 
@@ -218,9 +218,22 @@ def validate_input(job_input):
     }, None
 
 
+def r2_configured():
+    """Return whether the optional S3-compatible output integration is ready."""
+    return all(
+        os.environ.get(name, "").strip()
+        for name in (
+            "R2_ENDPOINT",
+            "R2_BUCKET",
+            "R2_ACCESS_KEY_ID",
+            "R2_SECRET_ACCESS_KEY",
+        )
+    )
+
+
 def upload_to_r2(file_bytes, r2_key, content_type):
     """
-    [laimon] Upload output files directly to R2 (S3-compatible), bypassing
+    [platform] Upload output files directly to R2 (S3-compatible), bypassing
     the RunPod 10MB output limit.
 
     Always uses boto3 + SigV4 — the same code path whether R2_ENDPOINT points
@@ -234,16 +247,16 @@ def upload_to_r2(file_bytes, r2_key, content_type):
                              dev:  http://localhost:3080/r2 (Worker route)
       R2_ACCESS_KEY_ID     — R2 access key (real token in prod, dummy in dev)
       R2_SECRET_ACCESS_KEY — R2 secret key
-      R2_BUCKET            — laimon-storage
+      R2_BUCKET            — example-bucket
 
     Returns r2_key on success, None on failure (caller falls back to base64).
     """
-    endpoint = os.environ.get("R2_ENDPOINT")
-    bucket = os.environ.get("R2_BUCKET")
-    access_key = os.environ.get("R2_ACCESS_KEY_ID")
-    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY")
-    if not (endpoint and bucket and access_key and secret_key):
+    if not r2_configured():
         return None
+    endpoint = os.environ["R2_ENDPOINT"]
+    bucket = os.environ["R2_BUCKET"]
+    access_key = os.environ["R2_ACCESS_KEY_ID"]
+    secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
 
     try:
         import boto3
@@ -267,11 +280,11 @@ def upload_to_r2(file_bytes, r2_key, content_type):
         )
         return r2_key
     except Exception as e:
-        print(f"worker-comfyui - [laimon] R2 upload failed for {r2_key}: {e}")
+        print(f"worker-comfyui - [platform] R2 upload failed for {r2_key}: {e}")
         return None
 
 
-# [laimon] Threshold for falling back from KV to R2 for temp images.
+# [platform] Threshold for falling back from KV to R2 for temp images.
 # RunPod /run output has a 10MB hard cap. When accumulated base64 temp data
 # approaches this limit, switch remaining temps to R2 direct upload.
 TEMP_R2_FALLBACK_THRESHOLD = 8 * 1024 * 1024  # 8 MB (leaves 2 MB margin)
@@ -328,14 +341,14 @@ def persist_terminal_result(user_id, prompt_id, result_chunk):
     )
     if len(encoded) > TERMINAL_MANIFEST_MAX_BYTES:
         print(
-            f"worker-comfyui - [laimon] Terminal manifest too large for {prompt_id}: {len(encoded)} bytes"
+            f"worker-comfyui - [platform] Terminal manifest too large for {prompt_id}: {len(encoded)} bytes"
         )
         return None
 
     uploaded = upload_to_r2(encoded, key, "application/json")
     if uploaded:
         print(
-            f"worker-comfyui - [laimon] Persisted terminal result manifest for {prompt_id}"
+            f"worker-comfyui - [platform] Persisted terminal result manifest for {prompt_id}"
         )
     return uploaded
 
@@ -681,7 +694,7 @@ def get_output_data(filename, subfolder, file_type):
     """
     Fetch output bytes + content-type from the ComfyUI /view endpoint.
 
-    [laimon] Renamed from get_image_data — handles all output categories
+    [platform] Renamed from get_image_data — handles all output categories
     (images, audio, gltf, video, text) and returns the Content-Type header
     from ComfyUI's response so the API side never needs to guess MIME types.
 
@@ -746,8 +759,8 @@ def handler(job):
     # Extract validated data
     workflow = validated_data["workflow"]
     input_images = validated_data.get("images")
-    user_id = validated_data.get("userId")            # [laimon] for R2 key
-    input_prompt_id = validated_data.get("promptId")  # [laimon] API-assigned, for R2 key subfolder
+    user_id = validated_data.get("userId")            # [platform] for R2 key
+    input_prompt_id = validated_data.get("promptId")  # [platform] API-assigned, for R2 key subfolder
 
     # Make sure that the ComfyUI HTTP API is available before proceeding
     if not check_server(
@@ -811,7 +824,7 @@ def handler(job):
 
         # Wait for execution completion via WebSocket.
         #
-        # [laimon] Streaming: yield every WS event so the API consumer can
+        # [platform] Streaming: yield every WS event so the API consumer can
         # forward progress/preview/executing frames to the frontend in real
         # time via RunPod /stream.  Binary messages (live KSampler previews)
         # are yielded as base64 — the consumer decodes and pushes them as
@@ -826,7 +839,7 @@ def handler(job):
                     msg_type = message.get("type")
                     msg_data = message.get("data", {})
 
-                    # [laimon] Forward ALL text events — the consumer relays
+                    # [platform] Forward ALL text events — the consumer relays
                     # them to the frontend as ComfyUI WS text frames.
                     yield {
                         "type": "ws_event",
@@ -862,7 +875,7 @@ def handler(job):
                             execution_done = True
                             break
                 else:
-                    # [laimon] Binary preview frame (type 1/3/4) — base64
+                    # [platform] Binary preview frame (type 1/3/4) — base64
                     # encode and yield.  The consumer decodes and pushes
                     # the raw bytes as a binary WS frame.
                     yield {
@@ -928,12 +941,12 @@ def handler(job):
             if not errors:
                 errors.append(warning_msg)
 
-        # [laimon] ComfyUI output categories that carry file-like entries.
+        # [platform] ComfyUI output categories that carry file-like entries.
         # Each entry in these arrays has the shape {filename, subfolder, type}.
         FILE_OUTPUT_CATEGORIES = ("images", "audio", "gltf", "video", "text")
 
         print(f"worker-comfyui - Processing {len(outputs)} output nodes...")
-        temp_base64_total = 0  # [laimon] accumulated base64 temp size for R2 fallback
+        temp_base64_total = 0  # [platform] accumulated base64 temp size for R2 fallback
         for node_id, node_output in outputs.items():
             for category in FILE_OUTPUT_CATEGORIES:
                 if category not in node_output:
@@ -947,7 +960,7 @@ def handler(job):
                     subfolder = file_info.get("subfolder", "")
                     file_type = file_info.get("type")
 
-                    # [laimon] Temp outputs (PreviewImage and similar) MUST be
+                    # [platform] Temp outputs (PreviewImage and similar) MUST be
                     # surfaced — the cloud platform surfaces them as ephemeral
                     # previews. Consumer (queues/workflow.ts) routes them to KV
                     # with TTL (small temps, base64 path) or R2 at the handler's
@@ -965,10 +978,10 @@ def handler(job):
                     if file_bytes:
                         file_extension = os.path.splitext(filename)[1] or ".bin"
 
-                        # [laimon] R2 direct upload — bypasses RunPod 10MB output
+                        # [platform] R2 direct upload — bypasses RunPod 10MB output
                         # limit. Output images always go to R2; temp images go to
                         # R2 only when accumulated base64 would approach the limit.
-                        r2_enabled = bool(os.environ.get("R2_ENDPOINT"))
+                        r2_enabled = r2_configured()
                         use_r2_for_temp = False
                         if file_type == "temp" and r2_enabled:
                             projected = temp_base64_total + int(len(file_bytes) * 1.34)
@@ -994,7 +1007,7 @@ def handler(job):
                                     }
                                 )
                                 print(
-                                    f"worker-comfyui - [laimon] Uploaded {filename} to R2: {r2_key}"
+                                    f"worker-comfyui - [platform] Uploaded {filename} to R2: {r2_key}"
                                 )
                             else:
                                 # R2 upload failed — degrade to base64
@@ -1013,7 +1026,7 @@ def handler(job):
                                 if file_type == "temp":
                                     temp_base64_total += int(len(file_bytes) * 1.34)
                                 print(
-                                    f"worker-comfyui - [laimon] R2 failed, fell back to base64 for {filename}"
+                                    f"worker-comfyui - [platform] R2 failed, fell back to base64 for {filename}"
                                 )
                         elif os.environ.get("BUCKET_ENDPOINT_URL"):
                             try:
@@ -1062,7 +1075,7 @@ def handler(job):
                                 base64_data = base64.b64encode(file_bytes).decode(
                                     "utf-8"
                                 )
-                                # [laimon] track accumulated temp base64 size
+                                # [platform] track accumulated temp base64 size
                                 if file_type == "temp":
                                     temp_base64_total += int(len(file_bytes) * 1.34)
                                 output_data.append(

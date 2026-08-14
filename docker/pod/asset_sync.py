@@ -1,7 +1,7 @@
-"""Mirror disposable Pod inputs and outputs to the Laimon R2 control plane.
+"""Mirror disposable Pod inputs and outputs to the Compute R2 control plane.
 
 The Pod never receives R2 credentials or object keys. Every request is bound
-to the active runtime lease through ``X-Laimon-Pod-Token``. Inputs are restored
+to the active runtime lease through ``X-Comfy-Pod-Token``. Inputs are restored
 before ComfyUI starts; a small watcher then mirrors stable input/output files
 through bounded R2 multipart requests.
 """
@@ -23,19 +23,28 @@ from pathlib import Path
 from typing import Any
 
 
-TOKEN_HEADER = "X-Laimon-Pod-Token"
+TOKEN_HEADER = "X-Comfy-Pod-Token"
 PART_BYTES = 32 * 1024 * 1024
 MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024
 SCAN_SECONDS = 2
 INPUT_STABLE_SECONDS = 2
 OUTPUT_STABLE_SECONDS = 10
-STATE_FILENAME = ".laimon-asset-sync.json"
+STATE_FILENAME = ".asset-sync.json"
 SHA256_HEX = frozenset("0123456789abcdef")
 STOP = False
 
 
 class AssetSyncError(RuntimeError):
     """A bounded, retryable asset synchronization failure."""
+
+
+def integration_configured() -> bool:
+    """Return whether the optional control-plane integration is configured."""
+    names = ("COMFY_CONTROL_PLANE_URL", "COMFY_INSTANCE_ID", "COMFY_POD_TOKEN")
+    configured = [bool(os.environ.get(name, "").strip()) for name in names]
+    if any(configured) and not all(configured):
+        raise AssetSyncError("control-plane variables must be configured together")
+    return all(configured)
 
 
 def required_env(name: str) -> str:
@@ -46,12 +55,12 @@ def required_env(name: str) -> str:
 
 
 def control_plane_origin() -> str:
-    value = required_env("LAIMON_CONTROL_PLANE_URL")
+    value = required_env("COMFY_CONTROL_PLANE_URL")
     parsed = urllib.parse.urlparse(value)
     if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1"}:
-        raise AssetSyncError("LAIMON_CONTROL_PLANE_URL must use HTTPS")
+        raise AssetSyncError("COMFY_CONTROL_PLANE_URL must use HTTPS")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise AssetSyncError("LAIMON_CONTROL_PLANE_URL must be an origin")
+        raise AssetSyncError("COMFY_CONTROL_PLANE_URL must be an origin")
     return value.rstrip("/")
 
 
@@ -83,7 +92,7 @@ def request(
 ) -> urllib.response.addinfourl:
     merged = {
         TOKEN_HEADER: token,
-        "User-Agent": "laimon-pod-asset-sync/1",
+        "User-Agent": "comfy-pod-asset-sync/1",
         **(headers or {}),
     }
     return urllib.request.urlopen(
@@ -126,8 +135,8 @@ def json_request(
 
 def restore_inputs(instance_root: Path) -> None:
     origin = control_plane_origin()
-    instance_id = required_env("LAIMON_INSTANCE_ID")
-    token = required_env("LAIMON_POD_TOKEN")
+    instance_id = required_env("COMFY_INSTANCE_ID")
+    token = required_env("COMFY_POD_TOKEN")
     manifest = json_request(
         origin,
         "/api/internal/pod-assets/manifest",
@@ -172,7 +181,7 @@ def restore_inputs(instance_root: Path) -> None:
             partial.unlink(missing_ok=True)
             raise AssetSyncError(f"restored input failed verification: {relative}")
         os.replace(partial, target)
-        print(f"laimon-pod: restored input — {relative}", flush=True)
+        print(f"comfy-pod: restored input — {relative}", flush=True)
 
 
 def content_type(path: Path) -> str:
@@ -182,8 +191,8 @@ def content_type(path: Path) -> str:
 
 def upload_file(instance_root: Path, kind: str, path: Path) -> dict[str, object]:
     origin = control_plane_origin()
-    instance_id = required_env("LAIMON_INSTANCE_ID")
-    token = required_env("LAIMON_POD_TOKEN")
+    instance_id = required_env("COMFY_INSTANCE_ID")
+    token = required_env("COMFY_POD_TOKEN")
     root = instance_root / kind
     relative = safe_relative_path(path.relative_to(root).as_posix())
     size = path.stat().st_size
@@ -265,7 +274,7 @@ def upload_file(instance_root: Path, kind: str, path: Path) -> dict[str, object]
         except Exception:
             pass
         raise
-    print(f"laimon-pod: mirrored {kind} asset — {relative} ({size} bytes)", flush=True)
+    print(f"comfy-pod: mirrored {kind} asset — {relative} ({size} bytes)", flush=True)
     stat = path.stat()
     return {"sha256": digest, "size": size, "mtime_ns": stat.st_mtime_ns}
 
@@ -324,7 +333,7 @@ def watch(instance_root: Path) -> None:
                     observed.pop(key, None)
                     changed = True
                 except (AssetSyncError, OSError, urllib.error.URLError, urllib.error.HTTPError) as error:
-                    print(f"laimon-pod: asset sync retry pending — {error}", file=sys.stderr, flush=True)
+                    print(f"comfy-pod: asset sync retry pending — {error}", file=sys.stderr, flush=True)
         if changed:
             save_state(state_path, state)
         time.sleep(SCAN_SECONDS)
@@ -341,6 +350,14 @@ def main() -> None:
     parser.add_argument("--instance-root", type=Path, required=True)
     args = parser.parse_args()
     args.instance_root.mkdir(parents=True, exist_ok=True)
+    if not integration_configured():
+        print(
+            "comfy-pod: control-plane credentials are not configured; "
+            "asset synchronization is disabled",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
     if args.command == "restore":
         restore_inputs(args.instance_root)
         return
@@ -353,5 +370,5 @@ if __name__ == "__main__":
     try:
         main()
     except AssetSyncError as error:
-        print(f"laimon-pod: asset sync failed — {error}", file=sys.stderr, flush=True)
+        print(f"comfy-pod: asset sync failed — {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from error

@@ -24,13 +24,13 @@ class PodGatewayTest(unittest.TestCase):
         self.assertFalse(gateway.token_matches(None, "secret"))
 
     def test_configured_token_fails_closed(self) -> None:
-        previous = os.environ.pop("LAIMON_POD_TOKEN", None)
+        previous = os.environ.pop("COMFY_POD_TOKEN", None)
         try:
-            with self.assertRaisesRegex(RuntimeError, "LAIMON_POD_TOKEN"):
+            with self.assertRaisesRegex(RuntimeError, "COMFY_POD_TOKEN"):
                 gateway.configured_token()
         finally:
             if previous is not None:
-                os.environ["LAIMON_POD_TOKEN"] = previous
+                os.environ["COMFY_POD_TOKEN"] = previous
 
     def test_upstream_defaults_to_loopback(self) -> None:
         old_host = os.environ.pop("COMFY_INTERNAL_HOST", None)
@@ -48,7 +48,7 @@ class PodGatewayTest(unittest.TestCase):
             headers = {
                 "Host": "pod.example",
                 "Content-Length": "42",
-                "X-Laimon-Pod-Token": "secret",
+                "X-Comfy-Pod-Token": "secret",
                 "X-Trace": "trace-1",
             }
 

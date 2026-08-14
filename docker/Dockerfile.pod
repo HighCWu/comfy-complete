@@ -19,9 +19,7 @@ COPY --chmod=755 docker/runpod/comfy-manager-set-mode.sh /usr/local/bin/comfy-ma
 
 RUN ln -sfn /app/comfyui /comfyui
 
-ENV COMFY_INTERNAL_HOST=127.0.0.1 \
-    COMFY_INTERNAL_PORT=8188 \
-    LAIMON_POD_PORT=8189 \
+ENV COMFY_POD_PORT=8189 \
     COMFY_LOG_LEVEL=INFO
 
 EXPOSE 8189

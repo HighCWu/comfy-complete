@@ -64,19 +64,42 @@ def load_verified_manifest(
 
 
 def verify_runtime_tree(runtime_root: Path, manifest: dict[str, object], *, full: bool = False) -> None:
-    """Verify structure plus critical bytes; full hashing is a publisher/audit mode.
+    """Verify launch-critical entries, or the complete tree in hydration mode.
 
-    Hashing a multi-gigabyte runtime from a Network Volume on every paid Pod
+    Walking hundreds of thousands of Network Volume entries on every paid Pod
     start would duplicate the hydrator's work and materially increase startup
-    cost. READY binds the fully verified publication. The launcher still checks
-    every path/type/mode/symlink and hashes executable entrypoint files; CI and
-    the volume publisher use ``full=True``.
+    cost. READY binds the fully verified publication, so the normal launcher
+    checks only the directories and executable files needed to enter ComfyUI.
+    The single-writer volume hydrator must use ``full=True`` before publishing
+    READY.
     """
 
     root = runtime_root.resolve(strict=True)
     file_tree = manifest["file_tree"]
-    critical_files = {manifest["entrypoint"]["path"], "opt/conda/bin/python"}
-    for entry in file_tree["entries"]:
+    entries = file_tree["entries"]
+    if full:
+        selected_entries = entries
+    else:
+        entry_paths = {entry["path"] for entry in entries}
+        critical_paths = {
+            "app/comfyui",
+            "opt/conda",
+            "opt/conda/bin",
+            "opt/conda/bin/python",
+            manifest["entrypoint"]["path"],
+        }
+        critical_paths.update(
+            argument
+            for argument in manifest["entrypoint"]["argv"]
+            if argument in entry_paths
+        )
+        selected_entries = [entry for entry in entries if entry["path"] in critical_paths]
+        found = {entry["path"] for entry in selected_entries}
+        missing = sorted(critical_paths - found)
+        if missing:
+            raise LauncherError("runtime manifest lacks launch-critical entries: " + ", ".join(missing))
+
+    for entry in selected_entries:
         relative = entry["path"]
         path = runtime_root / relative
         try:
@@ -96,7 +119,7 @@ def verify_runtime_tree(runtime_root: Path, manifest: dict[str, object], *, full
                 raise LauncherError(f"runtime type mismatch: {relative}")
             if metadata.st_size != entry["size_bytes"]:
                 raise LauncherError(f"runtime file digest mismatch: {relative}")
-            if (full or relative in critical_files) and _sha256(path) != entry["sha256"]:
+            if _sha256(path) != entry["sha256"]:
                 raise LauncherError(f"runtime file digest mismatch: {relative}")
         elif kind == "symlink":
             if not stat.S_ISLNK(metadata.st_mode) or os.readlink(path) != entry["link_target"]:
@@ -118,7 +141,7 @@ def install_compatibility_link(link: Path, target: Path) -> None:
         raise LauncherError(f"refusing to replace a real compatibility path: {link}")
     if link.is_symlink() and Path(os.readlink(link)) == target:
         return
-    temporary = link.with_name(f".{link.name}.laimon-{os.getpid()}")
+    temporary = link.with_name(f".{link.name}.runtime-{os.getpid()}")
     temporary.unlink(missing_ok=True)
     temporary.symlink_to(target)
     os.replace(temporary, link)
@@ -127,17 +150,30 @@ def install_compatibility_link(link: Path, target: Path) -> None:
 def install_comfy_projection(link: Path, runtime_comfy: Path) -> None:
     """Create a local ComfyUI view without making shared model paths writable."""
 
-    if not runtime_comfy.is_dir():
+    try:
+        runtime_target = runtime_comfy.resolve(strict=True)
+    except OSError as error:
+        raise LauncherError(f"runtime ComfyUI directory is missing: {runtime_comfy}") from error
+    if not runtime_target.is_dir():
         raise LauncherError(f"runtime ComfyUI directory is missing: {runtime_comfy}")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    marker = link.parent / f".{link.name}.runtime-projection"
+    if link.is_dir() and not link.is_symlink() and marker.is_file():
+        try:
+            if marker.read_text(encoding="utf-8").strip() == str(runtime_target):
+                return
+        except OSError:
+            pass
     if link.exists() or link.is_symlink():
         raise LauncherError(f"refusing to replace an existing ComfyUI path: {link}")
-    link.parent.mkdir(parents=True, exist_ok=True)
-    temporary = link.with_name(f".{link.name}.laimon-{os.getpid()}")
+    temporary = link.with_name(f".{link.name}.runtime-{os.getpid()}")
     if temporary.exists() or temporary.is_symlink():
         raise LauncherError(f"temporary ComfyUI projection already exists: {temporary}")
+    marker_temporary = marker.with_name(f"{marker.name}.{os.getpid()}.partial")
+    published = False
     temporary.mkdir()
     try:
-        for child in runtime_comfy.iterdir():
+        for child in runtime_target.iterdir():
             destination = temporary / child.name
             if child.name != "models" or not child.is_dir():
                 destination.symlink_to(child)
@@ -152,18 +188,23 @@ def install_comfy_projection(link: Path, runtime_comfy: Path) -> None:
                 for packaged_model in model_folder.iterdir():
                     (projected_folder / packaged_model.name).symlink_to(packaged_model)
         os.replace(temporary, link)
+        published = True
+        marker_temporary.write_text(str(runtime_target) + "\n", encoding="utf-8")
+        os.replace(marker_temporary, marker)
     except Exception:
-        for path in sorted(temporary.glob("**/*"), key=lambda item: len(item.parts), reverse=True):
+        marker_temporary.unlink(missing_ok=True)
+        cleanup_root = link if published else temporary
+        for path in sorted(cleanup_root.glob("**/*"), key=lambda item: len(item.parts), reverse=True):
             if path.is_symlink() or path.is_file():
                 path.unlink(missing_ok=True)
             elif path.is_dir():
                 path.rmdir()
-        temporary.rmdir()
+        cleanup_root.rmdir()
         raise
 
 
 def launch() -> NoReturn:
-    configured_root = Path(os.environ.get("LAIMON_RUNTIME_ROOT", "/runpod-volume/runtimes/current"))
+    configured_root = Path(os.environ.get("COMFY_RUNTIME_ROOT", "/runpod-volume/runtimes/current"))
     try:
         runtime_root = configured_root.resolve(strict=True)
     except OSError as error:
@@ -171,9 +212,9 @@ def launch() -> NoReturn:
     manifest_path = runtime_root / "manifest.json"
     ready_path = runtime_root / "READY.json"
     required = {
-        "LAIMON_EXPECTED_LAUNCHER_DIGEST": os.environ.get("LAIMON_EXPECTED_LAUNCHER_DIGEST", ""),
-        "LAIMON_EXPECTED_LAUNCHER_ABI": os.environ.get("LAIMON_EXPECTED_LAUNCHER_ABI", ""),
-        "LAIMON_EXPECTED_RUNTIME_PLATFORM": os.environ.get("LAIMON_EXPECTED_RUNTIME_PLATFORM", ""),
+        "COMFY_EXPECTED_LAUNCHER_DIGEST": os.environ.get("COMFY_EXPECTED_LAUNCHER_DIGEST", ""),
+        "COMFY_EXPECTED_LAUNCHER_ABI": os.environ.get("COMFY_EXPECTED_LAUNCHER_ABI", ""),
+        "COMFY_EXPECTED_RUNTIME_PLATFORM": os.environ.get("COMFY_EXPECTED_RUNTIME_PLATFORM", ""),
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
@@ -182,9 +223,9 @@ def launch() -> NoReturn:
     manifest = load_verified_manifest(
         manifest_path,
         ready_path,
-        launcher_digest=required["LAIMON_EXPECTED_LAUNCHER_DIGEST"],
-        launcher_abi=required["LAIMON_EXPECTED_LAUNCHER_ABI"],
-        platform=required["LAIMON_EXPECTED_RUNTIME_PLATFORM"],
+        launcher_digest=required["COMFY_EXPECTED_LAUNCHER_DIGEST"],
+        launcher_abi=required["COMFY_EXPECTED_LAUNCHER_ABI"],
+        platform=required["COMFY_EXPECTED_RUNTIME_PLATFORM"],
     )
     verify_runtime_tree(runtime_root, manifest)
     install_compatibility_link(Path("/opt/conda"), runtime_root / "opt/conda")
@@ -199,5 +240,5 @@ if __name__ == "__main__":
     try:
         launch()
     except LauncherError as error:
-        print(f"laimon-runtime-launcher: {error}", file=sys.stderr, flush=True)
+        print(f"comfy-runtime-launcher: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from error

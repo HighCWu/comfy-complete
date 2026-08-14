@@ -28,6 +28,7 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = 2
 AUDIT_VERSION = "runtime-portability/v2"
+PORTABILITY_GATE_POLICY_VERSION = 2
 CRITICAL_CONFIG_VERSION = 3
 CRITICAL_PROBE_VERSION = 3
 DEFAULT_TARGETS = ("/opt/conda", "/app/comfyui")
@@ -38,6 +39,14 @@ DEFAULT_EXCLUDES = (
     "/app/comfyui/models/_xdgcache",
     "/app/comfyui/models/_xdgconfig",
     "/app/comfyui/models/_xdgdata",
+    # These ICU build metadata links are emitted by the pixi packages but
+    # point at files omitted from the selected runtime.  They are not loaded
+    # by ComfyUI; retaining them would make the runtime launcher reject an
+    # otherwise valid archive because its symlink contract is fail-closed.
+    "/app/comfyui/.ce/envs/geometrypack-nodes/.pixi/envs/default/lib/icu/Makefile.inc",
+    "/app/comfyui/.ce/envs/geometrypack-nodes/.pixi/envs/default/lib/icu/pkgdata.inc",
+    "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/Makefile.inc",
+    "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/pkgdata.inc",
 )
 ALLOWED_TARGETS = frozenset(DEFAULT_TARGETS)
 MUTABLE_PREFIXES = tuple(DEFAULT_EXCLUDES) + ("/runpod-volume",)
@@ -66,6 +75,7 @@ CRITICAL_PROFILE_IMPORTS = {
 CRITICAL_IMPORT_STATUSES = frozenset({"pass", "failed", "timeout", "not_executed"})
 CRITICAL_SKIP_REASON = "environment_unavailable"
 CRITICAL_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CRITICAL_POLICY = {
     "network": "none",
     "rootfs": "read-only",
@@ -236,6 +246,165 @@ def load_launcher_inventory(path: Path) -> LauncherInventory:
         symlinks=tuple(sorted(symlinks)),
         executable_paths=paths("executable_paths"),
     )
+
+
+def validate_portability_gate_policy(value: object) -> dict[str, Any]:
+    """Validate the explicit static-finding release policy.
+
+    The scanner remains conservative and records every finding.  This policy
+    is a second, reviewed layer for findings which are known to belong to an
+    optional environment. Every allowance contains exact full-finding SHA-256
+    identities rather than path globs. Matching is deny-by-default, so a new
+    or modified finding cannot be silently swallowed by an old broad rule.
+    """
+
+    if not isinstance(value, dict):
+        raise RuntimeAuditError("portability gate policy must be an object")
+    required = {
+        "schema_version",
+        "audit_version",
+        "critical_profile",
+        "profile",
+        "default_action",
+        "allowances",
+    }
+    if set(value) != required:
+        raise RuntimeAuditError("portability gate policy has an invalid shape")
+    if value["schema_version"] != PORTABILITY_GATE_POLICY_VERSION:
+        raise RuntimeAuditError("unsupported portability gate policy version")
+    if value["audit_version"] != AUDIT_VERSION:
+        raise RuntimeAuditError("portability gate policy audit_version does not match this scanner")
+    if value["critical_profile"] != "base":
+        raise RuntimeAuditError("portability gate policy critical_profile must be base")
+    profile = _text(value["profile"], "portability gate policy profile", limit=256)
+    if value["default_action"] != "block":
+        raise RuntimeAuditError("portability gate policy default_action must be block")
+    raw_allowances = value["allowances"]
+    if not isinstance(raw_allowances, list):
+        raise RuntimeAuditError("portability gate policy allowances must be an array")
+
+    allowances: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, raw in enumerate(raw_allowances):
+        if not isinstance(raw, dict):
+            raise RuntimeAuditError(f"portability gate allowance {index} must be an object")
+        required_keys = {"id", "finding_fingerprints", "max_matches", "reason"}
+        if set(raw) != required_keys:
+            raise RuntimeAuditError(f"portability gate allowance {index} has an invalid shape")
+        allowance_id = _text(raw.get("id"), f"portability gate allowance {index}.id", limit=128)
+        if allowance_id in seen_ids:
+            raise RuntimeAuditError(f"duplicate portability gate allowance id: {allowance_id}")
+        seen_ids.add(allowance_id)
+        raw_fingerprints = raw.get("finding_fingerprints")
+        if (
+            not isinstance(raw_fingerprints, list)
+            or not raw_fingerprints
+            or not all(isinstance(item, str) and SHA256_RE.fullmatch(item) for item in raw_fingerprints)
+            or raw_fingerprints != sorted(set(raw_fingerprints))
+        ):
+            raise RuntimeAuditError(
+                f"portability gate allowance {index}.finding_fingerprints must be non-empty, sorted, unique SHA-256 values"
+            )
+        max_matches = raw.get("max_matches")
+        if max_matches != len(raw_fingerprints):
+            raise RuntimeAuditError(
+                f"portability gate allowance {index}.max_matches must equal its reviewed fingerprint count"
+            )
+        reason = _text(raw.get("reason"), f"portability gate allowance {index}.reason", limit=MAX_TEXT)
+        allowances.append({
+            "id": allowance_id,
+            "finding_fingerprints": list(raw_fingerprints),
+            "max_matches": max_matches,
+            "reason": reason,
+        })
+    return {
+        "schema_version": PORTABILITY_GATE_POLICY_VERSION,
+        "audit_version": AUDIT_VERSION,
+        "critical_profile": "base",
+        "profile": profile,
+        "default_action": "block",
+        "allowances": allowances,
+    }
+
+
+def load_portability_gate_policy(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeAuditError(f"portability gate policy JSON is invalid: {error}") from error
+    return validate_portability_gate_policy(value)
+
+
+def portability_finding_fingerprint(finding: Mapping[str, Any]) -> str:
+    """Return the exact reviewed identity of one deterministic finding."""
+
+    return hashlib.sha256(
+        json.dumps(dict(finding), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _portability_finding_matches_allowance(
+    finding: Mapping[str, Any], allowance: Mapping[str, Any]
+) -> bool:
+    return portability_finding_fingerprint(finding) in allowance["finding_fingerprints"]
+
+
+def evaluate_portability_gate(
+    findings: Sequence[Mapping[str, Any]],
+    policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Classify blocker findings under a deny-by-default reviewed policy."""
+
+    allowances = policy["allowances"]
+    matches = {str(item["id"]): 0 for item in allowances}
+    unapproved: list[dict[str, Any]] = []
+    blocker_count = sum(1 for item in findings if item.get("severity") == "blocker")
+    for finding in findings:
+        if finding.get("severity") != "blocker":
+            continue
+        matching_allowances = [
+            allowance
+            for allowance in allowances
+            if _portability_finding_matches_allowance(finding, allowance)
+        ]
+        if not matching_allowances:
+            unapproved.append({
+                **dict(finding),
+                "finding_fingerprint": portability_finding_fingerprint(finding),
+                "gate_reason": "no_allowance_match",
+            })
+            continue
+        if len(matching_allowances) > 1:
+            unapproved.append({
+                **dict(finding),
+                "gate_reason": "ambiguous_allowance_match",
+                "allowance_ids": sorted(str(item["id"]) for item in matching_allowances),
+            })
+            continue
+        allowance = matching_allowances[0]
+        allowance_id = str(allowance["id"])
+        matches[allowance_id] += 1
+        if matches[allowance_id] > int(allowance["max_matches"]):
+            unapproved.append({
+                **dict(finding),
+                "gate_reason": "allowance_match_limit_exceeded",
+                "allowance_id": allowance_id,
+            })
+    return {
+        "status": "pass" if not unapproved else "blocker",
+        "profile": policy["profile"],
+        "policy_sha256": hashlib.sha256(
+            json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "raw_blocker_count": blocker_count,
+        "allowed_blocker_count": blocker_count - len(unapproved),
+        "unapproved_blocker_count": len(unapproved),
+        "allowance_matches": [
+            {"id": str(allowance["id"]), "matches": matches[str(allowance["id"])], "max_matches": int(allowance["max_matches"])}
+            for allowance in allowances
+        ],
+        "unapproved_findings": unapproved,
+    }
 
 
 def _critical_module(value: object, name: str) -> str:
@@ -1191,14 +1360,18 @@ def check_elfs(records: Sequence[Record], selected: Mapping[str, Record], invent
             elif name in selected_library_index:
                 # A same-named file elsewhere in the selected tree proves
                 # that the runtime contains the dependency, but not that the
-                # loader can reach it.  Keep it out of launcher requirements;
-                # the image/runtime loader configuration still needs review.
+                # loader can reach it.  This is evidence for a runtime
+                # review, not proof that the binary is broken: Python's
+                # extension loader and package-specific dlopen logic may add
+                # search paths that are not encoded in DT_RPATH/RUNPATH.
+                # Critical imports are checked dynamically by the separate
+                # probe, while a genuinely absent library remains a blocker.
                 candidates = selected_library_index[name]
                 _add(
                     findings,
                     "runtime_library_present_unresolved",
-                    "blocker",
-                    "DT_NEEDED has selected-runtime candidate(s), but static audit cannot prove loader reachability",
+                    "warning",
+                    "DT_NEEDED has selected-runtime candidate(s), but static audit cannot prove loader reachability; dynamic smoke evidence is required for the owning runtime profile",
                     item.path,
                     {"needed": name, "candidates": list(candidates[:16]), "candidate_count": len(candidates)},
                 )
@@ -1261,7 +1434,7 @@ def _sorted_findings(findings: Sequence[dict[str, Any]], limit: int) -> tuple[li
     return ordered[:limit], len(ordered) > limit
 
 
-def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS, app_files: Sequence[str] = (), exclusions: Sequence[str] = DEFAULT_EXCLUDES, launcher_inventory: LauncherInventory | None = None, limits: Limits | None = None, critical_config: Mapping[str, Any] | None = None, critical_probe: Mapping[str, Any] | None = None, critical_profile: str | None = None) -> dict[str, Any]:
+def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS, app_files: Sequence[str] = (), exclusions: Sequence[str] = DEFAULT_EXCLUDES, launcher_inventory: LauncherInventory | None = None, limits: Limits | None = None, critical_config: Mapping[str, Any] | None = None, critical_probe: Mapping[str, Any] | None = None, critical_profile: str | None = None, portability_gate_policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
     active_limits = limits or Limits()
     if active_limits.max_entries <= 0 or active_limits.max_findings <= 0 or active_limits.max_shebang_bytes <= 0:
         raise RuntimeAuditError("audit limits must be positive")
@@ -1294,11 +1467,24 @@ def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS
         "launcher_image_requirements": {"system_paths": sorted(required_paths), "libraries": sorted(required_libraries), "library_search_paths": sorted(required_library_paths)},
         "provided_launcher_inventory": {"system_paths": list(inventory.system_paths), "libraries": list(inventory.libraries), "library_paths": list(inventory.library_paths), "executable_paths": list(inventory.executable_paths), "symlinks": [{"path": source, "target": target} for source, target in inventory.symlinks]},
     }
+    if portability_gate_policy is not None:
+        static_findings = list(findings)
+        if elf_limited:
+            static_findings.append({
+                "code": "elf_analysis_incomplete",
+                "severity": "blocker",
+                "path": "",
+                "detail": "ELF analysis is incomplete",
+            })
+        static_gate = evaluate_portability_gate(static_findings, portability_gate_policy)
+    else:
+        static_gate = None
     if critical_config is not None:
         report["critical"] = _critical_report(critical_config, source_root, selected, inventory, active_limits, critical_probe, critical_profile)
         critical_status = report["critical"]["status"]
+        static_status = static_gate["status"] if static_gate is not None else "pass"
         report["gate"] = {
-            "status": "pass" if critical_status in {"pass", "partial"} else critical_status,
+            "status": "pass" if critical_status in {"pass", "partial"} and static_status == "pass" else "blocker",
             "source": "critical",
             "profile": report["critical"]["profile"],
             "probe_profile": report["critical"]["probe_profile"],
@@ -1306,12 +1492,14 @@ def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS
         }
     else:
         report["gate"] = {
-            "status": status,
-            "source": "whole_rootfs",
+            "status": static_gate["status"] if static_gate is not None else status,
+            "source": "portability_policy" if static_gate is not None else "whole_rootfs",
             "profile": None,
             "probe_profile": None,
             "evidence_status": status,
         }
+    if static_gate is not None:
+        report["gate"]["static_policy"] = static_gate
     return report
 
 
@@ -1330,6 +1518,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--critical-config", type=Path)
     parser.add_argument("--critical-probe", type=Path)
     parser.add_argument("--critical-profile", choices=tuple(CRITICAL_PROFILES))
+    parser.add_argument("--gate-policy", type=Path, help="reviewed deny-by-default static finding policy")
     parser.add_argument("--max-entries", type=int, default=MAX_ENTRIES)
     parser.add_argument("--max-shebang-bytes", type=int, default=MAX_TEXT)
     parser.add_argument("--max-findings", type=int, default=MAX_FINDINGS)
@@ -1344,9 +1533,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         inventory = load_launcher_inventory(args.launcher_inventory) if args.launcher_inventory else None
         critical_config = load_critical_config(args.critical_config) if args.critical_config else None
         critical_probe = load_critical_probe(args.critical_probe) if args.critical_probe else None
+        portability_gate_policy = load_portability_gate_policy(args.gate_policy) if args.gate_policy else None
         if critical_probe is not None and critical_config is None:
             raise RuntimeAuditError("--critical-probe requires --critical-config")
-        report = audit_runtime(source_root=args.source_root, targets=policy["targets"], app_files=policy["include_app"], exclusions=policy["excludes"], launcher_inventory=inventory, limits=Limits(args.max_entries, args.max_shebang_bytes, args.max_findings), critical_config=critical_config, critical_probe=critical_probe, critical_profile=args.critical_profile)
+        report = audit_runtime(source_root=args.source_root, targets=policy["targets"], app_files=policy["include_app"], exclusions=policy["excludes"], launcher_inventory=inventory, limits=Limits(args.max_entries, args.max_shebang_bytes, args.max_findings), critical_config=critical_config, critical_probe=critical_probe, critical_profile=args.critical_profile, portability_gate_policy=portability_gate_policy)
         rendered = render_report(report)
         if args.output:
             args.output.write_text(rendered, encoding="utf-8")

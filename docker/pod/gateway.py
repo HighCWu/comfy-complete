@@ -1,7 +1,7 @@
 """Authenticated streaming gateway for a RunPod Pod-hosted ComfyUI process.
 
 ComfyUI listens only on loopback.  RunPod exposes this gateway's port through
-its HTTPS proxy; the Cloudflare Worker injects ``X-Laimon-Pod-Token`` after it
+its HTTPS proxy; the Cloudflare Worker injects ``X-Comfy-Pod-Token`` after it
 has authenticated and resolved an editor session.  The browser never receives
 the Pod credential or provider URL.
 """
@@ -16,8 +16,8 @@ from collections.abc import AsyncIterator
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
 
-TOKEN_HEADER = "X-Laimon-Pod-Token"
-HEALTH_PATH = "/__laimon/health"
+TOKEN_HEADER = "X-Comfy-Pod-Token"
+HEALTH_PATH = "/__comfy/health"
 HOP_BY_HOP_HEADERS = frozenset(
     {
         "connection",
@@ -33,9 +33,9 @@ HOP_BY_HOP_HEADERS = frozenset(
 
 
 def configured_token() -> str:
-    token = os.environ.get("LAIMON_POD_TOKEN", "")
+    token = os.environ.get("COMFY_POD_TOKEN", "")
     if not token:
-        raise RuntimeError("LAIMON_POD_TOKEN is required")
+        raise RuntimeError("COMFY_POD_TOKEN is required")
     return token
 
 
@@ -184,6 +184,6 @@ if __name__ == "__main__":
     web.run_app(
         create_app(),
         host="0.0.0.0",
-        port=int(os.environ.get("LAIMON_POD_PORT", "8189")),
+        port=int(os.environ.get("COMFY_POD_PORT", "8189")),
         access_log_format='%a "%r" %s %Tf',
     )

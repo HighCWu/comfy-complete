@@ -1,0 +1,8 @@
+{
+  "schema_version": 2,
+  "audit_version": "runtime-portability/v2",
+  "critical_profile": "base",
+  "profile": "comfy-complete-base-bootstrap-2026-08",
+  "default_action": "block",
+  "allowances": []
+}

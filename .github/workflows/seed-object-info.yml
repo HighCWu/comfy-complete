@@ -15,10 +15,10 @@ name: Seed object_info
 #                                    Build, instead of a confusing pull
 #                                    error 60 seconds in
 #
-# Required secrets on HighCWu/comfy-complete (repo → Settings → Secrets):
+# Optional integration secrets (repo → Settings → Secrets):
 #   ADMIN_SECRET    — must match the Worker's `wrangler secret put ADMIN_SECRET`
-#   API_BASE_URL    — Worker origin (e.g. https://laimon-api.hecongw.workers.dev
-#                     or https://laimon.ai), no trailing slash
+#   API_BASE_URL    — Worker origin (e.g. https://example.workers.dev
+#                     or https://example.invalid), no trailing slash
 # Both are injected as step-level env: vars and never enter the image.
 
 on:
@@ -49,8 +49,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Check optional API integration
+        id: config
+        env:
+          ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ADMIN_SECRET" ] && [ -z "$API_BASE_URL" ]; then
+            echo "::notice::ADMIN_SECRET and API_BASE_URL are not configured; object_info publication is skipped."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          elif [ -z "$ADMIN_SECRET" ] || [ -z "$API_BASE_URL" ]; then
+            echo "::error::ADMIN_SECRET and API_BASE_URL must be configured together."
+            exit 1
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Resolve image tag
         id: tag
+        if: steps.config.outputs.enabled == 'true'
         run: |
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
             # Use the SHA that triggered docker-build — build-base pushed
@@ -63,15 +81,18 @@ jobs:
 
       - name: Set image name
         id: img
+        if: steps.config.outputs.enabled == 'true'
         run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete" >> $GITHUB_OUTPUT
 
       - uses: docker/login-action@v4
+        if: steps.config.outputs.enabled == 'true'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check image exists (fail fast with guidance)
+        if: steps.config.outputs.enabled == 'true'
         run: |
           IMAGE="${{ steps.img.outputs.name }}:${{ steps.tag.outputs.value }}"
           echo "Checking ${IMAGE}..."
@@ -84,9 +105,11 @@ jobs:
           echo "Image exists."
 
       - name: Pull image
+        if: steps.config.outputs.enabled == 'true'
         run: docker pull ${{ steps.img.outputs.name }}:${{ steps.tag.outputs.value }}
 
       - name: Start ComfyUI in CPU mode
+        if: steps.config.outputs.enabled == 'true'
         run: |
           docker run -d --name comfy-extractor \
             -p 8188:8188 \
@@ -94,6 +117,7 @@ jobs:
             ${{ steps.img.outputs.name }}:${{ steps.tag.outputs.value }}
 
       - name: Wait for ComfyUI /object_info
+        if: steps.config.outputs.enabled == 'true'
         run: |
           echo "Waiting for ComfyUI to serve /object_info..."
           for i in $(seq 1 90); do
@@ -112,15 +136,11 @@ jobs:
           exit 1
 
       - name: Push object_info to API
+        if: steps.config.outputs.enabled == 'true'
         env:
           ADMIN_SECRET: ${{ secrets.ADMIN_SECRET }}
           API_BASE_URL: ${{ secrets.API_BASE_URL }}
         run: |
-          if [ -z "$ADMIN_SECRET" ] || [ -z "$API_BASE_URL" ]; then
-            echo "::error::ADMIN_SECRET or API_BASE_URL not set in repo secrets."
-            echo "::error::Set both at https://github.com/${{ github.repository }}/settings/secrets/actions"
-            exit 1
-          fi
           echo "Pushing object_info to ${API_BASE_URL}/api/admin/object-info"
           HTTP_CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
             -X POST \

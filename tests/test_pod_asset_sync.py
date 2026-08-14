@@ -29,6 +29,15 @@ class FakeResponse(io.BytesIO):
 
 
 class PodAssetSyncTests(unittest.TestCase):
+    def test_asset_sync_integration_is_optional(self) -> None:
+        with patch.dict(module.os.environ, {}, clear=True):
+            self.assertFalse(module.integration_configured())
+
+    def test_asset_sync_rejects_partial_configuration(self) -> None:
+        with patch.dict(module.os.environ, {"COMFY_POD_TOKEN": "token"}, clear=True):
+            with self.assertRaisesRegex(module.AssetSyncError, "configured together"):
+                module.integration_configured()
+
     def test_rejects_paths_that_escape_the_instance_root(self) -> None:
         for value in ("../secret.png", "/absolute.png", "a\\b.png", "a//b.png"):
             with self.subTest(value=value):
@@ -51,9 +60,9 @@ class PodAssetSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             module.os.environ,
             {
-                "LAIMON_CONTROL_PLANE_URL": "https://laimon.ai",
-                "LAIMON_INSTANCE_ID": "inst_test",
-                "LAIMON_POD_TOKEN": "token",
+                "COMFY_CONTROL_PLANE_URL": "https://example.invalid",
+                "COMFY_INSTANCE_ID": "inst_test",
+                "COMFY_POD_TOKEN": "token",
             },
             clear=False,
         ), patch.object(module, "json_request", return_value=manifest), patch.object(
@@ -96,9 +105,9 @@ class PodAssetSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             module.os.environ,
             {
-                "LAIMON_CONTROL_PLANE_URL": "https://laimon.ai",
-                "LAIMON_INSTANCE_ID": "inst_test",
-                "LAIMON_POD_TOKEN": "token",
+                "COMFY_CONTROL_PLANE_URL": "https://example.invalid",
+                "COMFY_INSTANCE_ID": "inst_test",
+                "COMFY_POD_TOKEN": "token",
             },
             clear=False,
         ), patch.object(module, "json_request", side_effect=fake_json_request), patch.object(

@@ -1,30 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ -z "${LAIMON_POD_TOKEN:-}" ]; then
-    echo "laimon-pod: LAIMON_POD_TOKEN is required" >&2
-    exit 1
-fi
-if [ -z "${LAIMON_CONTROL_PLANE_URL:-}" ]; then
-    echo "laimon-pod: LAIMON_CONTROL_PLANE_URL is required" >&2
-    exit 1
-fi
-
-: "${COMFY_INTERNAL_HOST:=127.0.0.1}"
-: "${COMFY_INTERNAL_PORT:=8188}"
-: "${LAIMON_POD_PORT:=8189}"
+: "${COMFY_POD_PORT:=8189}"
 : "${COMFY_LOG_LEVEL:=INFO}"
 
-if [ -z "${LAIMON_INSTANCE_ID:-}" ]; then
-    echo "laimon-pod: LAIMON_INSTANCE_ID is required" >&2
-    exit 1
+# There are two explicit serving modes:
+#   * with COMFY_POD_TOKEN, ComfyUI stays on loopback and the authenticated gateway
+#     serves COMFY_POD_PORT (managed model/asset sync additionally needs all fields);
+#   * with no control-plane credentials at all, ComfyUI serves COMFY_POD_PORT directly
+#     on 0.0.0.0 for a generic, standalone Pod deployment.
+# A half-configured control plane without a token is rejected so it cannot
+# accidentally turn into an unauthenticated public service.
+managed_mode=0
+gateway_mode=0
+instance_id="${COMFY_INSTANCE_ID:-default}"
+if [ -n "${COMFY_POD_TOKEN:-}" ]; then
+    gateway_mode=1
+    : "${COMFY_INTERNAL_HOST:=127.0.0.1}"
+    : "${COMFY_INTERNAL_PORT:=8188}"
+    if [ -n "${COMFY_INSTANCE_ID:-}" ] && [[ ! "${COMFY_INSTANCE_ID}" =~ ^inst_[A-Za-z0-9]+$ ]]; then
+        echo "comfy-pod: invalid COMFY_INSTANCE_ID" >&2
+        exit 64
+    fi
+    if [ -n "${COMFY_CONTROL_PLANE_URL:-}" ] && [ -n "${COMFY_INSTANCE_ID:-}" ]; then
+        managed_mode=1
+    elif [ -n "${COMFY_CONTROL_PLANE_URL:-}" ] || [ -n "${COMFY_INSTANCE_ID:-}" ]; then
+        echo "comfy-pod: COMFY_CONTROL_PLANE_URL and COMFY_INSTANCE_ID must be configured together" >&2
+        exit 64
+    else
+        echo "comfy-pod: no control-plane lease fields; running gateway-only" >&2
+    fi
+else
+    if [ -n "${COMFY_CONTROL_PLANE_URL:-}" ] || [ -n "${COMFY_INSTANCE_ID:-}" ]; then
+        echo "comfy-pod: COMFY_CONTROL_PLANE_URL or COMFY_INSTANCE_ID requires COMFY_POD_TOKEN" >&2
+        exit 64
+    fi
+    : "${COMFY_INTERNAL_HOST:=0.0.0.0}"
+    : "${COMFY_INTERNAL_PORT:=${COMFY_POD_PORT}}"
+    echo "comfy-pod: no control-plane credentials; running standalone on ${COMFY_INTERNAL_HOST}:${COMFY_INTERNAL_PORT}" >&2
 fi
-if [[ ! "${LAIMON_INSTANCE_ID}" =~ ^inst_[A-Za-z0-9]+$ ]]; then
-    echo "laimon-pod: invalid LAIMON_INSTANCE_ID" >&2
-    exit 1
+if [[ ! "${instance_id}" =~ ^inst_[A-Za-z0-9]+$ ]]; then
+    instance_id="default"
 fi
 
-echo "laimon-pod: checking GPU availability"
+echo "comfy-pod: checking GPU availability"
 python3 - <<'PY'
 import torch
 
@@ -34,14 +53,11 @@ capability = torch.cuda.get_device_capability(0)
 _ = (torch.zeros(8, device="cuda") + 1).sum().item()
 torch.cuda.synchronize()
 print(
-    "laimon-pod: GPU available — "
+    "comfy-pod: GPU available — "
     f"{name} (sm_{capability[0]}{capability[1]}), "
     f"torch {torch.__version__}, cuda {torch.version.cuda}"
 )
 PY
-
-comfy-manager-set-mode offline || \
-    echo "laimon-pod: could not set ComfyUI-Manager network_mode" >&2
 
 comfy_args=(
     --disable-auto-launch
@@ -56,28 +72,40 @@ comfy_args=(
 # runtime data. They stay on the container disk and are mirrored to R2 where
 # persistence is required. A mounted network volume is reserved exclusively
 # for platform-managed, content-addressed public models.
-instance_root="/tmp/laimon-runtime/${LAIMON_INSTANCE_ID}"
-echo "laimon-pod: disposable instance runtime at ${instance_root}"
+instance_root="/tmp/comfy-runtime/${instance_id}"
+echo "comfy-pod: disposable instance runtime at ${instance_root}"
 
 mkdir -p \
     "${instance_root}/input" \
     "${instance_root}/output" \
     "${instance_root}/temp" \
     "${instance_root}/user"
-model_paths_config="/tmp/laimon-extra-model-paths.json"
-python -u /pod-model-bootstrap.py \
-    --instance-root "${instance_root}" \
-    --config "${model_paths_config}" \
-    --comfy-model-root /app/comfyui/models \
-    --shared-volume-root /runpod-volume
-python -u /pod-asset-sync.py restore --instance-root "${instance_root}"
+# Keep ComfyUI-Manager state on the disposable per-instance filesystem.  The
+# runtime tree on the shared Network Volume is immutable and may be mounted by
+# multiple Pods concurrently; writing its default config here would create a
+# cross-instance race (and could invalidate the published runtime cache).
+export COMFYUI_MANAGER_CONFIG="${instance_root}/user/default/ComfyUI-Manager/config.ini"
+comfy-manager-set-mode offline || \
+    echo "comfy-pod: could not set ComfyUI-Manager network_mode" >&2
+
+model_paths_config="/tmp/comfy-extra-model-paths.json"
+if [ "${managed_mode}" -eq 1 ]; then
+    python -u /pod-model-bootstrap.py \
+        --instance-root "${instance_root}" \
+        --config "${model_paths_config}" \
+        --comfy-model-root /app/comfyui/models \
+        --shared-volume-root /runpod-volume
+    python -u /pod-asset-sync.py restore --instance-root "${instance_root}"
+fi
 comfy_args+=(
     --input-directory "${instance_root}/input"
     --output-directory "${instance_root}/output"
     --temp-directory "${instance_root}/temp"
     --user-directory "${instance_root}/user"
-    --extra-model-paths-config "${model_paths_config}"
 )
+if [ "${managed_mode}" -eq 1 ]; then
+    comfy_args+=(--extra-model-paths-config "${model_paths_config}")
+fi
 
 if [ -n "${COMFY_EXTRA_ARGS:-}" ]; then
     # Operator-controlled image configuration, never user input. Word splitting
@@ -106,11 +134,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "laimon-pod: waiting for ComfyUI on ${COMFY_INTERNAL_HOST}:${COMFY_INTERNAL_PORT}"
+echo "comfy-pod: waiting for ComfyUI on ${COMFY_INTERNAL_HOST}:${COMFY_INTERNAL_PORT}"
 ready=0
 for _ in $(seq 1 1200); do
     if ! kill -0 "${comfy_pid}" 2>/dev/null; then
-        echo "laimon-pod: ComfyUI exited during startup" >&2
+        echo "comfy-pod: ComfyUI exited during startup" >&2
         wait "${comfy_pid}"
         exit 1
     fi
@@ -129,19 +157,28 @@ PY
 done
 
 if [ "${ready}" -ne 1 ]; then
-    echo "laimon-pod: ComfyUI did not become ready within 300 seconds" >&2
+    echo "comfy-pod: ComfyUI did not become ready within 300 seconds" >&2
     exit 1
 fi
 
-echo "laimon-pod: starting authenticated gateway on 0.0.0.0:${LAIMON_POD_PORT}"
-python -u /pod-gateway.py &
-gateway_pid=$!
-python -u /pod-asset-sync.py watch --instance-root "${instance_root}" &
-asset_sync_pid=$!
+if [ "${gateway_mode}" -eq 1 ]; then
+    echo "comfy-pod: starting authenticated gateway on 0.0.0.0:${COMFY_POD_PORT}"
+    python -u /pod-gateway.py &
+    gateway_pid=$!
+else
+    echo "comfy-pod: COMFY_POD_TOKEN is not set; authenticated gateway is disabled" >&2
+fi
+if [ "${managed_mode}" -eq 1 ]; then
+    python -u /pod-asset-sync.py watch --instance-root "${instance_root}" &
+    asset_sync_pid=$!
+fi
 
 # The container is healthy only while both processes remain alive. Exiting when
 # either child dies lets RunPod surface the failure instead of leaving a paid,
 # unreachable Pod running indefinitely.
-wait -n "${comfy_pid}" "${gateway_pid}" "${asset_sync_pid}"
-echo "laimon-pod: a supervised process exited; stopping Pod container" >&2
+supervised_pids=("${comfy_pid}")
+[ -n "${gateway_pid}" ] && supervised_pids+=("${gateway_pid}")
+[ -n "${asset_sync_pid}" ] && supervised_pids+=("${asset_sync_pid}")
+wait -n "${supervised_pids[@]}"
+echo "comfy-pod: a supervised process exited; stopping Pod container" >&2
 exit 1
