@@ -212,25 +212,50 @@ def _resolve_symlink_chain(
     entry: CollectedEntry,
     by_path: dict[str, CollectedEntry],
 ) -> CollectedEntry:
-    """Resolve a selected symlink to its final selected tree entry."""
+    """Resolve a selected symlink, including symlinked ancestor directories."""
 
-    current = entry
+    current_path = entry.bundle_path
     seen: set[str] = set()
-    while current.kind == "symlink":
-        if current.bundle_path in seen:
+    while True:
+        if current_path in seen:
             raise RuntimeExportError(f"symlink cycle in runtime tree at {entry.bundle_path}")
-        seen.add(current.bundle_path)
-        if current.link_target is None:
-            raise RuntimeExportError(f"symlink metadata is incomplete: {current.bundle_path}")
-        resolved = _link_resolved_path(current.bundle_path, current.link_target)
-        next_entry = by_path.get(resolved)
-        if next_entry is None:
+        seen.add(current_path)
+
+        current = by_path.get(current_path)
+        if current is not None:
+            if current.kind != "symlink":
+                return current
+            if current.link_target is None:
+                raise RuntimeExportError(f"symlink metadata is incomplete: {current.bundle_path}")
+            current_path = _link_resolved_path(current.bundle_path, current.link_target)
+            continue
+
+        # Collection deliberately does not follow directory symlinks, so a
+        # path such as ``lib/icu/current/Makefile.inc`` has no direct entry
+        # when ``current`` is itself a symlink. Resolve path components in the
+        # same left-to-right order as the filesystem before declaring it
+        # absent from the selected tree.
+        parts = current_path.split("/")
+        rewritten: str | None = None
+        for index in range(1, len(parts)):
+            prefix = "/".join(parts[:index])
+            ancestor = by_path.get(prefix)
+            if ancestor is None or ancestor.kind != "symlink":
+                continue
+            if ancestor.link_target is None:
+                raise RuntimeExportError(f"symlink metadata is incomplete: {ancestor.bundle_path}")
+            resolved_prefix = _link_resolved_path(ancestor.bundle_path, ancestor.link_target)
+            suffix = "/".join(parts[index:])
+            rewritten = posixpath.normpath(posixpath.join(resolved_prefix, suffix))
+            if not is_safe_relative_path(rewritten):
+                raise RuntimeExportError(f"symlink escapes runtime bundle: {entry.bundle_path}")
+            break
+        if rewritten is None:
             raise RuntimeExportError(
                 f"symlink target is not part of the selected runtime tree: "
-                f"{current.bundle_path} -> {current.link_target}"
+                f"{entry.bundle_path} -> {entry.link_target}"
             )
-        current = next_entry
-    return current
+        current_path = rewritten
 
 
 def collect_entries(

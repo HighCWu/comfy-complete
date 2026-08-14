@@ -225,6 +225,36 @@ class RuntimeExportTests(unittest.TestCase):
             with self.assertRaisesRegex(export_module.RuntimeExportError, "not part of the selected"):
                 export_module.collect_entries(root, ["/app/comfyui"], [], [])
 
+    def test_accepts_file_symlink_through_a_symlinked_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            icu = root / "app/comfyui/lib/icu"
+            (icu / "76.1").mkdir(parents=True)
+            (icu / "76.1/Makefile.inc").write_text("icu\n", encoding="utf-8")
+            os.symlink("76.1", icu / "current", target_is_directory=True)
+            os.symlink("current/Makefile.inc", icu / "Makefile.inc")
+
+            entries = export_module.collect_entries(root, ["/app/comfyui"], [], [])
+            by_path = {entry.bundle_path: entry for entry in entries}
+            resolved = export_module._resolve_symlink_chain(
+                by_path["app/comfyui/lib/icu/Makefile.inc"],
+                by_path,
+            )
+            self.assertEqual(resolved.bundle_path, "app/comfyui/lib/icu/76.1/Makefile.inc")
+            self.assertEqual(resolved.kind, "file")
+
+    def test_rejects_cycle_reached_through_a_symlinked_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            icu = root / "app/comfyui/lib/icu"
+            icu.mkdir(parents=True)
+            os.symlink("other", icu / "current", target_is_directory=True)
+            os.symlink("current", icu / "other", target_is_directory=True)
+            os.symlink("current/Makefile.inc", icu / "Makefile.inc")
+
+            with self.assertRaisesRegex(export_module.RuntimeExportError, "symlink cycle"):
+                export_module.collect_entries(root, ["/app/comfyui"], [], [])
+
     def test_rejects_selected_root_that_escapes_via_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
