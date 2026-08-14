@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Fail-closed launcher for an already-materialized ComfyComplete runtime."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+from typing import NoReturn
+
+sys.path.insert(0, "/launcher-lib")
+
+from runtime_manifest import RuntimeManifestError, validate_manifest  # noqa: E402
+
+
+class LauncherError(RuntimeError):
+    """The selected runtime cannot be launched safely."""
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_verified_manifest(
+    manifest_path: Path,
+    ready_path: Path,
+    *,
+    launcher_digest: str,
+    launcher_abi: str,
+    platform: str,
+) -> dict[str, object]:
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = validate_manifest(json.loads(manifest_bytes))
+        ready = json.loads(ready_path.read_bytes())
+    except (OSError, json.JSONDecodeError, RuntimeManifestError) as error:
+        raise LauncherError(f"runtime metadata is invalid: {error}") from error
+
+    expected_ready = {
+        "schema_version": 1,
+        "runtime_digest": manifest["runtime_digest"],
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    if ready != expected_ready:
+        raise LauncherError("runtime READY marker does not match the manifest")
+
+    compatibility = manifest["compatibility"]
+    expected = {
+        "launcher_digest": launcher_digest,
+        "launcher_abi": launcher_abi,
+        "platform": platform,
+    }
+    for name, value in expected.items():
+        if compatibility[name] != value:
+            raise LauncherError(f"runtime compatibility mismatch: {name}")
+    return manifest
+
+
+def verify_runtime_tree(runtime_root: Path, manifest: dict[str, object], *, full: bool = False) -> None:
+    """Verify structure plus critical bytes; full hashing is a publisher/audit mode.
+
+    Hashing a multi-gigabyte runtime from a Network Volume on every paid Pod
+    start would duplicate the hydrator's work and materially increase startup
+    cost. READY binds the fully verified publication. The launcher still checks
+    every path/type/mode/symlink and hashes executable entrypoint files; CI and
+    the volume publisher use ``full=True``.
+    """
+
+    root = runtime_root.resolve(strict=True)
+    file_tree = manifest["file_tree"]
+    critical_files = {manifest["entrypoint"]["path"], "opt/conda/bin/python"}
+    for entry in file_tree["entries"]:
+        relative = entry["path"]
+        path = runtime_root / relative
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise LauncherError(f"runtime entry is missing: {relative}") from error
+
+        kind = entry["type"]
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode != entry["mode"]:
+            raise LauncherError(f"runtime mode mismatch: {relative}")
+        if kind == "directory":
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise LauncherError(f"runtime type mismatch: {relative}")
+        elif kind == "file":
+            if not stat.S_ISREG(metadata.st_mode):
+                raise LauncherError(f"runtime type mismatch: {relative}")
+            if metadata.st_size != entry["size_bytes"]:
+                raise LauncherError(f"runtime file digest mismatch: {relative}")
+            if (full or relative in critical_files) and _sha256(path) != entry["sha256"]:
+                raise LauncherError(f"runtime file digest mismatch: {relative}")
+        elif kind == "symlink":
+            if not stat.S_ISLNK(metadata.st_mode) or os.readlink(path) != entry["link_target"]:
+                raise LauncherError(f"runtime symlink mismatch: {relative}")
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError) as error:
+                raise LauncherError(f"runtime symlink escapes or is broken: {relative}") from error
+        else:
+            raise LauncherError(f"unsupported runtime entry type: {relative}")
+
+
+def install_compatibility_link(link: Path, target: Path) -> None:
+    if not target.exists():
+        raise LauncherError(f"runtime compatibility target is missing: {target}")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.exists() and not link.is_symlink():
+        raise LauncherError(f"refusing to replace a real compatibility path: {link}")
+    if link.is_symlink() and Path(os.readlink(link)) == target:
+        return
+    temporary = link.with_name(f".{link.name}.laimon-{os.getpid()}")
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(target)
+    os.replace(temporary, link)
+
+
+def install_comfy_projection(link: Path, runtime_comfy: Path) -> None:
+    """Create a local ComfyUI view without making shared model paths writable."""
+
+    if not runtime_comfy.is_dir():
+        raise LauncherError(f"runtime ComfyUI directory is missing: {runtime_comfy}")
+    if link.exists() or link.is_symlink():
+        raise LauncherError(f"refusing to replace an existing ComfyUI path: {link}")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link.with_name(f".{link.name}.laimon-{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        raise LauncherError(f"temporary ComfyUI projection already exists: {temporary}")
+    temporary.mkdir()
+    try:
+        for child in runtime_comfy.iterdir():
+            destination = temporary / child.name
+            if child.name != "models" or not child.is_dir():
+                destination.symlink_to(child)
+                continue
+            destination.mkdir()
+            for model_folder in child.iterdir():
+                projected_folder = destination / model_folder.name
+                if not model_folder.is_dir():
+                    projected_folder.symlink_to(model_folder)
+                    continue
+                projected_folder.mkdir()
+                for packaged_model in model_folder.iterdir():
+                    (projected_folder / packaged_model.name).symlink_to(packaged_model)
+        os.replace(temporary, link)
+    except Exception:
+        for path in sorted(temporary.glob("**/*"), key=lambda item: len(item.parts), reverse=True):
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                path.rmdir()
+        temporary.rmdir()
+        raise
+
+
+def launch() -> NoReturn:
+    configured_root = Path(os.environ.get("LAIMON_RUNTIME_ROOT", "/runpod-volume/runtimes/current"))
+    try:
+        runtime_root = configured_root.resolve(strict=True)
+    except OSError as error:
+        raise LauncherError(f"runtime root is unavailable: {configured_root}") from error
+    manifest_path = runtime_root / "manifest.json"
+    ready_path = runtime_root / "READY.json"
+    required = {
+        "LAIMON_EXPECTED_LAUNCHER_DIGEST": os.environ.get("LAIMON_EXPECTED_LAUNCHER_DIGEST", ""),
+        "LAIMON_EXPECTED_LAUNCHER_ABI": os.environ.get("LAIMON_EXPECTED_LAUNCHER_ABI", ""),
+        "LAIMON_EXPECTED_RUNTIME_PLATFORM": os.environ.get("LAIMON_EXPECTED_RUNTIME_PLATFORM", ""),
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise LauncherError("missing launcher identity: " + ", ".join(missing))
+
+    manifest = load_verified_manifest(
+        manifest_path,
+        ready_path,
+        launcher_digest=required["LAIMON_EXPECTED_LAUNCHER_DIGEST"],
+        launcher_abi=required["LAIMON_EXPECTED_LAUNCHER_ABI"],
+        platform=required["LAIMON_EXPECTED_RUNTIME_PLATFORM"],
+    )
+    verify_runtime_tree(runtime_root, manifest)
+    install_compatibility_link(Path("/opt/conda"), runtime_root / "opt/conda")
+    install_comfy_projection(Path("/app/comfyui"), runtime_root / "app/comfyui")
+    install_compatibility_link(Path("/comfyui"), Path("/app/comfyui"))
+    os.environ["PATH"] = "/opt/conda/bin:" + os.environ.get("PATH", "")
+    os.chdir("/app/comfyui")
+    os.execv("/start-pod.sh", ["/start-pod.sh"])
+
+
+if __name__ == "__main__":
+    try:
+        launch()
+    except LauncherError as error:
+        print(f"laimon-runtime-launcher: {error}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from error

@@ -15,8 +15,11 @@ fi
 : "${LAIMON_POD_PORT:=8189}"
 : "${COMFY_LOG_LEVEL:=INFO}"
 
-if [ -n "${LAIMON_INSTANCE_ID:-}" ] &&
-   [[ ! "${LAIMON_INSTANCE_ID}" =~ ^inst_[A-Za-z0-9]+$ ]]; then
+if [ -z "${LAIMON_INSTANCE_ID:-}" ]; then
+    echo "laimon-pod: LAIMON_INSTANCE_ID is required" >&2
+    exit 1
+fi
+if [[ ! "${LAIMON_INSTANCE_ID}" =~ ^inst_[A-Za-z0-9]+$ ]]; then
     echo "laimon-pod: invalid LAIMON_INSTANCE_ID" >&2
     exit 1
 fi
