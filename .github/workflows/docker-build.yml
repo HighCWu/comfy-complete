@@ -758,3 +758,213 @@ jobs:
             fi
           done
           rm -rf "${{ steps.audit-paths.outputs.audit_dir }}"
+
+  # Export and verify the exact immutable runtime, then publish only the thin
+  # launcher image. The large archive remains local to this runner until the
+  # separate R2 publisher is introduced; GitHub Artifacts receives metadata
+  # only, avoiding multi-gigabyte artifact storage and transfer charges.
+  publish-runtime-slim:
+    needs: [build-base, audit-base-runtime]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free disk space and move Docker data to /mnt
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/share/edge \
+            /usr/local/share/firefox \
+            /opt/hostedtoolcache/CodeQL
+          docker system prune -af --volumes || true
+          sudo systemctl stop docker
+          sudo rm -rf /var/lib/docker
+          sudo mkdir -p /mnt/docker-data
+          sudo ln -s /mnt/docker-data /var/lib/docker
+          sudo systemctl start docker
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 /mnt/runtime-export
+          df -h / /mnt /var/lib/docker
+
+      - uses: actions/checkout@v7
+
+      - name: Set immutable image identities
+        id: identity
+        run: |
+          set -euo pipefail
+          IMAGE_BASE="ghcr.io/$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete"
+          LAUNCHER_ABI="comfy-pod-launcher/v1"
+          LAUNCHER_HASH=$({
+            printf 'launcher_abi=%s\n' "$LAUNCHER_ABI"
+            sha256sum \
+              docker/Dockerfile.pod-slim \
+              docker/pod/runtime_launcher.py \
+              docker/pod/start.sh \
+              docker/pod/gateway.py \
+              docker/pod/model_bootstrap.py \
+              docker/pod/asset_sync.py \
+              docker/runpod/comfy-manager-set-mode.sh \
+              scripts/runtime_manifest.py | LC_ALL=C sort
+          } | sha256sum | cut -d' ' -f1)
+          echo "base_image=${IMAGE_BASE}:${{ needs.build-base.outputs.base_tag }}" >> "$GITHUB_OUTPUT"
+          echo "slim_image=${IMAGE_BASE}-pod-slim:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "launcher_abi=$LAUNCHER_ABI" >> "$GITHUB_OUTPUT"
+          echo "launcher_digest=sha256:$LAUNCHER_HASH" >> "$GITHUB_OUTPUT"
+          echo "runtime_dir=/mnt/runtime-export" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the audited base image
+        run: |
+          set -euo pipefail
+          docker pull "${{ steps.identity.outputs.base_image }}"
+
+      - name: Build the runtime exporter helper
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/Dockerfile.runtime-exporter" <<'EOF'
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+          USER root
+          RUN apt-get -o Acquire::Retries=3 update && \
+              apt-get install -y --no-install-recommends zstd && \
+              apt-get clean && rm -rf /var/lib/apt/lists/*
+          COPY scripts/export_runtime.py scripts/runtime_manifest.py /runtime-tools/
+          ENTRYPOINT ["/opt/conda/bin/python", "/runtime-tools/export_runtime.py"]
+          EOF
+          DOCKER_BUILDKIT=1 docker build \
+            -f "$RUNNER_TEMP/Dockerfile.runtime-exporter" \
+            --build-arg BASE_IMAGE="${{ steps.identity.outputs.base_image }}" \
+            -t comfy-runtime-exporter:${{ github.sha }} \
+            .
+
+      - name: Export and fully verify the immutable runtime
+        run: |
+          set -euo pipefail
+          BASE_IMAGE="${{ steps.identity.outputs.base_image }}"
+          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
+          REPO_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE")"
+          IMAGE_DIGEST="sha256:${REPO_DIGEST##*@sha256:}"
+          test "$IMAGE_DIGEST" != "sha256:"
+          rm -rf "$RUNTIME_DIR"/*
+          docker run --rm \
+            --network none \
+            --pids-limit 512 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -v "$RUNTIME_DIR:/runtime-output" \
+            comfy-runtime-exporter:${{ github.sha }} \
+            --source-root / \
+            --output-dir /runtime-output \
+            --runtime-version "${{ github.sha }}" \
+            --source-image "$BASE_IMAGE" \
+            --source-image-digest "$IMAGE_DIGEST" \
+            --build-sha "${{ github.sha }}" \
+            --platform linux/amd64 \
+            --launcher-digest "${{ steps.identity.outputs.launcher_digest }}" \
+            --launcher-abi "${{ steps.identity.outputs.launcher_abi }}" \
+            --entrypoint /opt/conda/bin/python \
+            --entrypoint-arg /app/comfyui/main.py
+          MANIFEST="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.json' -print -quit)"
+          ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
+          test -n "$MANIFEST" -a -n "$ARCHIVE"
+          cp "$MANIFEST" "$RUNTIME_DIR/manifest.json"
+          python3 scripts/runtime_ready.py \
+            --manifest "$RUNTIME_DIR/manifest.json" \
+            --output "$RUNTIME_DIR/READY.json"
+          python3 - "$RUNTIME_DIR/manifest.json" "$RUNTIME_DIR/READY.json" "$ARCHIVE" "$RUNTIME_DIR/runtime-summary.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          manifest_path, ready_path, archive_path, summary_path = map(Path, sys.argv[1:])
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          ready = json.loads(ready_path.read_text(encoding="utf-8"))
+          Path(summary_path).write_text(
+              json.dumps(
+                  {
+                      "runtime_digest": manifest["runtime_digest"],
+                      "launcher_digest": manifest["compatibility"]["launcher_digest"],
+                      "launcher_abi": manifest["compatibility"]["launcher_abi"],
+                      "runtime_tree_bytes": manifest["file_tree"]["total_bytes"],
+                      "runtime_entry_count": manifest["file_tree"]["entry_count"],
+                      "archive_bytes": archive_path.stat().st_size,
+                      "archive_sha256": manifest["archive"]["sha256"],
+                      "manifest_sha256": ready["manifest_sha256"],
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          cat "$RUNTIME_DIR/runtime-summary.json"
+          df -h "$RUNNER_TEMP"
+
+      - name: Build and inspect the slim launcher image
+        run: |
+          set -euo pipefail
+          DOCKER_BUILDKIT=1 docker build \
+            -f docker/Dockerfile.pod-slim \
+            --build-arg LAUNCHER_DIGEST="${{ steps.identity.outputs.launcher_digest }}" \
+            --build-arg LAUNCHER_ABI="${{ steps.identity.outputs.launcher_abi }}" \
+            -t "${{ steps.identity.outputs.slim_image }}" \
+            .
+          SIZE="$(docker image inspect --format '{{.Size}}' '${{ steps.identity.outputs.slim_image }}')"
+          test "$SIZE" -lt 524288000
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' '${{ steps.identity.outputs.slim_image }}')" = '["/usr/bin/dumb-init","--","/runtime-launcher.py"]'
+          python3 - "$SIZE" "${{ steps.identity.outputs.runtime_dir }}/slim-image.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          size, destination = sys.argv[1:]
+          Path(destination).write_text(
+              json.dumps(
+                  {
+                      "image": "${{ steps.identity.outputs.slim_image }}",
+                      "size_bytes": int(size),
+                      "launcher_digest": "${{ steps.identity.outputs.launcher_digest }}",
+                      "launcher_abi": "${{ steps.identity.outputs.launcher_abi }}",
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Push the immutable slim launcher image
+        run: docker push "${{ steps.identity.outputs.slim_image }}"
+
+      - name: Upload runtime publication metadata
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-publication-${{ github.run_id }}
+          path: |
+            ${{ steps.identity.outputs.runtime_dir }}/manifest.json
+            ${{ steps.identity.outputs.runtime_dir }}/READY.json
+            ${{ steps.identity.outputs.runtime_dir }}/runtime-summary.json
+            ${{ steps.identity.outputs.runtime_dir }}/slim-image.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Delete the runner-local runtime archive
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          rm -rf "${{ steps.identity.outputs.runtime_dir }}"
+          docker image rm comfy-runtime-exporter:${{ github.sha }} >/dev/null 2>&1 || true

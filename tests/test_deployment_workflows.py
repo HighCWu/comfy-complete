@@ -60,12 +60,36 @@ def test_runtime_audit_job_reuses_published_base_and_is_read_only():
 
     assert job["needs"] == "build-base"
     assert job["permissions"] == {"contents": "read", "packages": "read"}
-    assert "packages: write" not in workflow.split("audit-base-runtime:", 1)[1]
+    audit_block = workflow.split("  audit-base-runtime:\n", 1)[1].split("\n  publish-runtime-slim:", 1)[0]
+    assert "packages: write" not in audit_block
+
+
+def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifacts():
+    workflow = DOCKER_BUILD.read_text()
+    parsed = yaml.safe_load(workflow)
+    job = parsed["jobs"]["publish-runtime-slim"]
+
+    assert job["needs"] == ["build-base", "audit-base-runtime"]
+    assert job["permissions"] == {"contents": "read", "packages": "write"}
+    block = workflow.split("  publish-runtime-slim:\n", 1)[1]
+    assert "scripts/export_runtime.py" in block
+    assert "scripts/runtime_ready.py" in block
+    assert "docker/Dockerfile.pod-slim" in block
+    assert "--network none" in block
+    assert "--cap-drop ALL" in block
+    assert "--security-opt no-new-privileges" in block
+    assert "runtime-summary.json" in block
+    assert "slim-image.json" in block
+    upload = block.split("actions/upload-artifact@v4", 1)[1].split("Delete the runner-local runtime archive", 1)[0]
+    assert ".tar.zst" not in upload
+    assert "docker push" in block
+    assert "-pod-slim:${{ github.sha }}" in block
+    assert "-pod-slim:latest" not in block
 
 
 def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure():
     workflow = DOCKER_BUILD.read_text()
-    block = workflow.split("  audit-base-runtime:\n", 1)[1]
+    block = workflow.split("  audit-base-runtime:\n", 1)[1].split("\n  publish-runtime-slim:", 1)[0]
 
     pull = block.index("docker pull")
     create = block.index("docker create")
@@ -127,7 +151,7 @@ def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure()
 
 def test_runtime_audit_uses_named_volumes_for_container_artifacts():
     workflow = DOCKER_BUILD.read_text()
-    block = workflow.split("  audit-base-runtime:\n", 1)[1]
+    block = workflow.split("  audit-base-runtime:\n", 1)[1].split("\n  publish-runtime-slim:", 1)[0]
 
     assert "--output /audit/critical-probe.json" in block
     assert "--output /audit-output/runtime-portability.json" in block
@@ -153,7 +177,7 @@ def test_runtime_audit_uses_named_volumes_for_container_artifacts():
 
 def test_runtime_audit_has_critical_probe_and_uploads_its_evidence():
     workflow = DOCKER_BUILD.read_text()
-    block = workflow.split("  audit-base-runtime:\n", 1)[1]
+    block = workflow.split("  audit-base-runtime:\n", 1)[1].split("\n  publish-runtime-slim:", 1)[0]
     assert "runtime-critical-entrypoints.json" in block
     assert "runtime_critical_probe.py" in block
     assert "critical-probe.json" in block
