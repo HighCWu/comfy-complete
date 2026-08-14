@@ -152,6 +152,7 @@ jobs:
               docker/entrypoint.sh \
               requirements.txt \
               scripts/install_custom_nodes.py \
+              scripts/sanitize_elf_search_paths.py \
               supported_nodes.yaml \
               version_lock.yaml
           } | sha256sum | cut -d' ' -f1)
@@ -1165,6 +1166,219 @@ jobs:
           '
           SH
 
+      # The base and exporter images have already done their work by this
+      # point. Release their local layers before creating the second copy of
+      # the runtime on the runner. The archive and its manifest remain in
+      # RUNTIME_DIR until the publisher and final cleanup have completed.
+      - name: Release base and exporter images before local volume materialization
+        run: |
+          set -euo pipefail
+          docker image rm "comfy-runtime-exporter:${{ github.sha }}" >/dev/null 2>&1 || true
+          docker image rm "${{ steps.identity.outputs.base_image }}" >/dev/null 2>&1 || true
+          df -h / /mnt "${{ steps.identity.outputs.runtime_dir }}"
+
+      - name: Materialize runtime into a local simulated Network Volume
+        id: runtime-materializer
+        run: |
+          set -euo pipefail
+          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
+          RUNTIME_VOLUME="$RUNTIME_DIR/.runtime-volume"
+          SMOKE_AUDIT="$RUNTIME_DIR/.runtime-volume-smoke"
+          rm -rf "$RUNTIME_VOLUME" "$SMOKE_AUDIT"
+          mkdir -p "$RUNTIME_VOLUME" "$SMOKE_AUDIT"
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends zstd
+            sudo rm -rf /var/lib/apt/lists/*
+          fi
+          ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
+          test -n "$ARCHIVE"
+          python3 scripts/materialize_runtime.py \
+            --archive "$ARCHIVE" \
+            --manifest "$RUNTIME_DIR/manifest.json" \
+            --volume-root "$RUNTIME_VOLUME" \
+            > "$RUNTIME_DIR/runtime-materializer.json"
+          python3 - "$RUNTIME_DIR/runtime-materializer.json" "$RUNTIME_VOLUME" <<'PY'
+          from __future__ import annotations
+
+          import json
+          from pathlib import Path
+          import sys
+
+          result_path, volume_root = map(Path, sys.argv[1:])
+          result = json.loads(result_path.read_text(encoding="utf-8"))
+          if result.get("status") != "materialized":
+              raise SystemExit(f"runtime materializer did not publish a fresh generation: {result!r}")
+          if result.get("current_updated") is not True:
+              raise SystemExit(f"runtime materializer did not update current: {result!r}")
+          current = volume_root / "runtimes" / "current"
+          if not current.is_symlink() or not current.resolve(strict=True).is_dir():
+              raise SystemExit("materialized runtime current symlink is invalid")
+          PY
+          echo "runtime_volume=$RUNTIME_VOLUME" >> "$GITHUB_OUTPUT"
+          echo "smoke_audit=$SMOKE_AUDIT" >> "$GITHUB_OUTPUT"
+          test -s "$ARCHIVE"
+
+      - name: Smoke-test materialized runtime through slim launcher contracts
+        run: |
+          set -euo pipefail
+          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
+          RUNTIME_VOLUME="${{ steps.runtime-materializer.outputs.runtime_volume }}"
+          SMOKE_AUDIT="${{ steps.runtime-materializer.outputs.smoke_audit }}"
+          IMAGE="${{ steps.identity.outputs.slim_image }}"
+          CURRENT="$RUNTIME_VOLUME/runtimes/current"
+          test -L "$CURRENT"
+          test -f "$CURRENT/manifest.json"
+          test -f "$CURRENT/READY.json"
+          docker run --rm \
+            --network none \
+            --read-only \
+            --pids-limit 256 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
+            --tmpfs /opt:rw,nosuid,nodev,size=16m \
+            --tmpfs /app:rw,nosuid,nodev,noexec,size=32m \
+            --mount type=bind,source="$RUNTIME_VOLUME",destination=/runpod-volume,readonly \
+            --mount type=bind,source="$SMOKE_AUDIT",destination=/audit \
+            -v "$PWD/scripts/runtime_critical_probe.py:/runtime-audit/runtime_critical_probe.py:ro" \
+            -v "$PWD/scripts/runtime_portability_audit.py:/runtime-audit/runtime_portability_audit.py:ro" \
+            -v "$PWD/ci:/runtime-audit/ci:ro" \
+            -e COMFY_EXPECTED_LAUNCHER_DIGEST="${{ steps.identity.outputs.launcher_digest }}" \
+            -e COMFY_EXPECTED_LAUNCHER_ABI="${{ steps.identity.outputs.launcher_abi }}" \
+            -e COMFY_EXPECTED_RUNTIME_PLATFORM=linux/amd64 \
+            -e CUDA_VISIBLE_DEVICES= \
+            -e HOME=/tmp \
+            -e XDG_CACHE_HOME=/tmp/xdg-cache \
+            -e XDG_CONFIG_HOME=/tmp/xdg-config \
+            -e XDG_DATA_HOME=/tmp/xdg-data \
+            -e TMPDIR=/tmp \
+            -e PYTHONNOUSERSITE=1 \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e PYTHONPATH= \
+            --entrypoint /bin/sh \
+            "$IMAGE" \
+            -eu -s <<'SH'
+          RUNTIME_ROOT=/runpod-volume/runtimes/current
+          PYTHONPATH=/launcher-lib python3 - "$RUNTIME_ROOT" <<'PY'
+          from __future__ import annotations
+
+          import importlib.util
+          import os
+          from pathlib import Path
+          import sys
+
+          runtime_root = Path(sys.argv[1]).resolve(strict=True)
+          spec = importlib.util.spec_from_file_location("runtime_launcher", "/runtime-launcher.py")
+          if spec is None or spec.loader is None:
+              raise SystemExit("runtime launcher import spec is missing")
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          manifest_path = runtime_root / "manifest.json"
+          ready_path = runtime_root / "READY.json"
+          manifest = module.load_verified_manifest(
+              manifest_path,
+              ready_path,
+              launcher_digest=os.environ["COMFY_EXPECTED_LAUNCHER_DIGEST"],
+              launcher_abi=os.environ["COMFY_EXPECTED_LAUNCHER_ABI"],
+              platform=os.environ["COMFY_EXPECTED_RUNTIME_PLATFORM"],
+          )
+          # This is the same launch-critical verification the real launcher
+          # performs. Do not call launch(): it would enter the GPU supervisor.
+          module.verify_runtime_tree(runtime_root, manifest)
+          module.install_compatibility_link(Path("/opt/conda"), runtime_root / "opt/conda")
+          module.install_comfy_projection(Path("/app/comfyui"), runtime_root / "app/comfyui")
+          if not Path("/opt/conda").is_symlink():
+              raise SystemExit("/opt/conda compatibility link was not installed")
+          projected = Path("/app/comfyui")
+          if not projected.is_dir() or projected.is_symlink():
+              raise SystemExit("ComfyUI runtime projection was not installed")
+          PY
+
+          /opt/conda/bin/python - <<'PY'
+          from __future__ import annotations
+
+          import aiohttp
+          import importlib.util
+          from pathlib import Path
+          import sys
+
+          conda_root = Path("/opt/conda").resolve(strict=True)
+          aiohttp_file = Path(aiohttp.__file__).resolve(strict=True)
+          try:
+              aiohttp_file.relative_to(conda_root)
+          except ValueError as error:
+              raise SystemExit(f"aiohttp was not imported from projected /opt/conda: {aiohttp_file}") from error
+          spec = importlib.util.spec_from_file_location("pod_gateway", "/pod-gateway.py")
+          if spec is None or spec.loader is None:
+              raise SystemExit("gateway import spec is missing")
+          gateway = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = gateway
+          spec.loader.exec_module(gateway)
+          if gateway.ClientSession is not aiohttp.ClientSession:
+              raise SystemExit("gateway did not bind the projected aiohttp ClientSession")
+          PY
+
+          /opt/conda/bin/python /runtime-audit/runtime_critical_probe.py \
+            --config /runtime-audit/ci/runtime-critical-entrypoints.json \
+            --profile cpu \
+            --output /audit/critical-probe.json
+          /opt/conda/bin/python - /audit/critical-probe.json <<'PY'
+          from __future__ import annotations
+
+          import json
+          from pathlib import Path
+          import sys
+
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if report.get("probe_profile") != "cpu" or report.get("status") == "blocker":
+              raise SystemExit(f"projected runtime CPU critical probe failed: {report.get('status')}")
+          aiohttp_results = [item for item in report.get("imports", []) if item.get("module") == "aiohttp"]
+          if len(aiohttp_results) != 1 or aiohttp_results[0].get("status") != "pass":
+              raise SystemExit("projected runtime CPU probe did not pass aiohttp")
+          PY
+          SH
+          test -s "$SMOKE_AUDIT/critical-probe.json"
+          cp "$SMOKE_AUDIT/critical-probe.json" "$RUNTIME_DIR/runtime-critical-probe.json"
+          python3 - "$RUNTIME_DIR/runtime-launcher-smoke.json" "$CURRENT/manifest.json" "$SMOKE_AUDIT/critical-probe.json" <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          destination, manifest_path, probe_path = map(Path, sys.argv[1:])
+          manifest_bytes = manifest_path.read_bytes()
+          manifest = json.loads(manifest_bytes)
+          probe = json.loads(probe_path.read_text(encoding="utf-8"))
+          destination.write_text(
+              json.dumps(
+                  {
+                      "runtime_digest": manifest["runtime_digest"],
+                      "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                      "probe_profile": probe["probe_profile"],
+                      "probe_status": probe["status"],
+                      "probe_coverage": probe["coverage"],
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Remove local simulated runtime volume after smoke
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          RUNTIME_VOLUME="${{ steps.runtime-materializer.outputs.runtime_volume }}"
+          SMOKE_AUDIT="${{ steps.runtime-materializer.outputs.smoke_audit }}"
+          if [ -n "$RUNTIME_VOLUME" ]; then rm -rf "$RUNTIME_VOLUME"; fi
+          if [ -n "$SMOKE_AUDIT" ]; then rm -rf "$SMOKE_AUDIT"; fi
+
       - name: Push the immutable slim launcher image
         run: docker push "${{ steps.identity.outputs.slim_image }}"
 
@@ -1244,6 +1458,9 @@ jobs:
             ${{ steps.identity.outputs.runtime_dir }}/READY.json
             ${{ steps.identity.outputs.runtime_dir }}/runtime-summary.json
             ${{ steps.identity.outputs.runtime_dir }}/slim-image.json
+            ${{ steps.identity.outputs.runtime_dir }}/runtime-materializer.json
+            ${{ steps.identity.outputs.runtime_dir }}/runtime-launcher-smoke.json
+            ${{ steps.identity.outputs.runtime_dir }}/runtime-critical-probe.json
             ${{ steps.identity.outputs.runtime_dir }}/runtime-publisher.json
           if-no-files-found: warn
           retention-days: 14

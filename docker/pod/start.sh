@@ -43,6 +43,54 @@ if [[ ! "${instance_id}" =~ ^inst_[A-Za-z0-9]+$ ]]; then
     instance_id="default"
 fi
 
+# Establish the disposable write boundary before importing torch for the GPU
+# preflight. The verified Python environment and ComfyUI sources may be backed
+# by a shared Network Volume even though all process-local caches belong here.
+instance_root="/tmp/comfy-runtime/${instance_id}"
+echo "comfy-pod: disposable instance runtime at ${instance_root}"
+mkdir -p \
+    "${instance_root}/input" \
+    "${instance_root}/output" \
+    "${instance_root}/temp" \
+    "${instance_root}/user" \
+    "${instance_root}/home" \
+    "${instance_root}/cache/cuda" \
+    "${instance_root}/cache/huggingface" \
+    "${instance_root}/cache/matplotlib" \
+    "${instance_root}/cache/numba" \
+    "${instance_root}/cache/pip" \
+    "${instance_root}/cache/pycache" \
+    "${instance_root}/cache/torch" \
+    "${instance_root}/cache/transparent-background" \
+    "${instance_root}/cache/triton" \
+    "${instance_root}/cache/uv" \
+    "${instance_root}/xdg/cache" \
+    "${instance_root}/xdg/config" \
+    "${instance_root}/xdg/data"
+# Keep interpreter bytecode and common library/model caches off the shared
+# runtime so one Pod cannot dirty the verified tree used by another.
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPYCACHEPREFIX="${instance_root}/cache/pycache"
+export HOME="${instance_root}/home"
+export TMPDIR="${instance_root}/temp"
+export TMP="${instance_root}/temp"
+export TEMP="${instance_root}/temp"
+export XDG_CACHE_HOME="${instance_root}/xdg/cache"
+export XDG_CONFIG_HOME="${instance_root}/xdg/config"
+export XDG_DATA_HOME="${instance_root}/xdg/data"
+export CUDA_CACHE_PATH="${instance_root}/cache/cuda"
+export HF_HOME="${instance_root}/cache/huggingface"
+export HF_HUB_CACHE="${instance_root}/cache/huggingface/hub"
+export HUGGINGFACE_HUB_CACHE="${instance_root}/cache/huggingface/hub"
+export TRANSFORMERS_CACHE="${instance_root}/cache/huggingface/transformers"
+export MPLCONFIGDIR="${instance_root}/cache/matplotlib"
+export NUMBA_CACHE_DIR="${instance_root}/cache/numba"
+export PIP_CACHE_DIR="${instance_root}/cache/pip"
+export TORCH_HOME="${instance_root}/cache/torch"
+export TRANSPARENT_BACKGROUND_FILE_PATH="${instance_root}/cache/transparent-background"
+export TRITON_CACHE_DIR="${instance_root}/cache/triton"
+export UV_CACHE_DIR="${instance_root}/cache/uv"
+
 echo "comfy-pod: checking GPU availability"
 python3 - <<'PY'
 import torch
@@ -68,18 +116,9 @@ comfy_args=(
     --log-stdout
 )
 
-# User inputs, outputs, temporary files, and ComfyUI state are disposable
-# runtime data. They stay on the container disk and are mirrored to R2 where
-# persistence is required. A mounted network volume is reserved exclusively
-# for platform-managed, content-addressed public models.
-instance_root="/tmp/comfy-runtime/${instance_id}"
-echo "comfy-pod: disposable instance runtime at ${instance_root}"
-
-mkdir -p \
-    "${instance_root}/input" \
-    "${instance_root}/output" \
-    "${instance_root}/temp" \
-    "${instance_root}/user"
+# User inputs, outputs, temporary files, and ComfyUI state stay on the
+# disposable container disk and are mirrored externally where persistence is
+# required. The mounted Network Volume is reserved for managed shared caches.
 # Keep ComfyUI-Manager state on the disposable per-instance filesystem.  The
 # runtime tree on the shared Network Volume is immutable and may be mounted by
 # multiple Pods concurrently; writing its default config here would create a

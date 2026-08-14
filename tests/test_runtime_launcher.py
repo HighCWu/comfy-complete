@@ -53,7 +53,7 @@ class RuntimeLauncherTests(unittest.TestCase):
             "compatibility": {"platform": "linux/amd64", "launcher_digest": f"sha256:{'d' * 64}", "launcher_abi": "comfy-pod-launcher/v1"},
             "entrypoint": {"path": "opt/conda/bin/python", "argv": ["opt/conda/bin/python", "app/comfyui/main.py"]},
             "targets": ["/app/comfyui", "/opt/conda"],
-            "selection_policy": {"targets": ["/app/comfyui", "/opt/conda"], "include_app": [], "excludes": []},
+            "selection_policy": {"targets": ["/app/comfyui", "/opt/conda"], "include_app": [], "excludes": [], "exclude_directory_names": [".git"]},
             "file_tree": {"entry_count": len(entries), "total_bytes": 10, "tree_sha256": tree_digest, "entries": entries},
             "archive": {"format": "tar.zst", "object_name": f"sha256-{archive_sha}.tar.zst", "size_bytes": 1, "sha256": archive_sha},
         }

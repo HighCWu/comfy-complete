@@ -52,6 +52,7 @@ ALLOWED_TARGETS = frozenset(DEFAULT_TARGETS)
 MUTABLE_PREFIXES = tuple(DEFAULT_EXCLUDES) + ("/runpod-volume",)
 ELF_MAGIC = b"\x7fELF"
 MAX_PATH = 4096
+MAX_DIRECTORY_NAME = 255
 MAX_TEXT = 64 * 1024
 MAX_SHEBANG = 4096
 MAX_ENTRIES = 500_000
@@ -92,6 +93,10 @@ CRITICAL_PROFILE_POLICIES = {
 }
 SEVERITIES = ("blocker", "warning", "info")
 SEVERITY_ORDER = {value: index for index, value in enumerate(SEVERITIES)}
+# A limited ELF scan is an evidence failure, not an optional runtime finding.
+# It must remain a gate blocker even when a reviewed allowance is present for
+# other static findings.
+NON_ALLOWABLE_FINDING_CODES = frozenset({"elf_analysis_incomplete"})
 
 
 class RuntimeAuditError(ValueError):
@@ -170,7 +175,35 @@ def _prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(prefix + "/")
 
 
-def _policy(targets: Sequence[str], app_files: Sequence[str], excludes: Sequence[str]) -> dict[str, list[str]]:
+DEFAULT_EXCLUDE_DIRECTORY_NAMES = (".git",)
+
+
+def _exclude_directory_names(values: object, *, name: str = "exclude_directory_names") -> list[str]:
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise RuntimeAuditError(f"{name} must be a string array")
+    if values != sorted(values) or len(set(values)) != len(values):
+        raise RuntimeAuditError(f"{name} must be sorted and unique")
+    result: list[str] = []
+    for index, value in enumerate(values):
+        if (
+            not value
+            or len(value) > MAX_DIRECTORY_NAME
+            or value in (".", "..")
+            or "/" in value
+            or "\\" in value
+            or _control(value)
+        ):
+            raise RuntimeAuditError(f"{name}[{index}] must be a safe single directory name")
+        result.append(value)
+    return result
+
+
+def _policy(
+    targets: Sequence[str],
+    app_files: Sequence[str],
+    excludes: Sequence[str],
+    exclude_directory_names: Sequence[str] = DEFAULT_EXCLUDE_DIRECTORY_NAMES,
+) -> dict[str, list[str]]:
     selected = sorted({_absolute(value, "target") for value in targets})
     if not selected or any(value not in ALLOWED_TARGETS for value in selected):
         raise RuntimeAuditError("targets must contain only /opt/conda and /app/comfyui")
@@ -180,7 +213,13 @@ def _policy(targets: Sequence[str], app_files: Sequence[str], excludes: Sequence
     excluded = sorted({_absolute(value, "exclude") for value in excludes})
     if any(not any(_prefix(value, target) for target in selected) for value in excluded):
         raise RuntimeAuditError("excludes must be inside selected targets")
-    return {"targets": selected, "include_app": included, "excludes": excluded}
+    names = _exclude_directory_names(list(exclude_directory_names))
+    return {
+        "targets": selected,
+        "include_app": included,
+        "excludes": excluded,
+        "exclude_directory_names": names,
+    }
 
 
 def load_selection_policy(path: Path) -> dict[str, list[str]]:
@@ -192,11 +231,26 @@ def load_selection_policy(path: Path) -> dict[str, list[str]]:
         raise RuntimeAuditError(f"selection policy JSON is invalid: {error}") from error
     if isinstance(value, dict) and "selection_policy" in value:
         value = value["selection_policy"]
-    if not isinstance(value, dict) or set(value) != {"targets", "include_app", "excludes"}:
-        raise RuntimeAuditError("selection policy must contain targets, include_app, and excludes")
-    if not all(isinstance(value[name], list) for name in ("targets", "include_app", "excludes")):
+    if not isinstance(value, dict) or set(value) != {
+        "targets",
+        "include_app",
+        "excludes",
+        "exclude_directory_names",
+    }:
+        raise RuntimeAuditError(
+            "selection policy must contain targets, include_app, excludes, and exclude_directory_names"
+        )
+    if not all(
+        isinstance(value[name], list)
+        for name in ("targets", "include_app", "excludes", "exclude_directory_names")
+    ):
         raise RuntimeAuditError("selection policy fields must be arrays")
-    return _policy(value["targets"], value["include_app"], value["excludes"])
+    return _policy(
+        value["targets"],
+        value["include_app"],
+        value["excludes"],
+        value["exclude_directory_names"],
+    )
 
 
 def _library_names(values: object) -> tuple[str, ...]:
@@ -361,6 +415,12 @@ def evaluate_portability_gate(
     blocker_count = sum(1 for item in findings if item.get("severity") == "blocker")
     for finding in findings:
         if finding.get("severity") != "blocker":
+            continue
+        if finding.get("code") in NON_ALLOWABLE_FINDING_CODES:
+            unapproved.append({
+                **dict(finding),
+                "gate_reason": "analysis_incomplete",
+            })
             continue
         matching_allowances = [
             allowance
@@ -767,12 +827,23 @@ def collect_records(root: Path, policy: Mapping[str, Sequence[str]], limits: Lim
         raise RuntimeAuditError(f"source root is not a directory: {root}")
     records: dict[str, Record] = {}
     findings: list[dict[str, Any]] = []
+    exclude_directory_names = frozenset(policy["exclude_directory_names"])
 
     def finding(code: str, severity: str, detail: str, path: str = "") -> None:
         findings.append({"code": code, "severity": severity, "path": path, "detail": detail})
 
     def collect(host_path: Path, relative: str) -> None:
         if any(_prefix("/" + relative, exclusion) for exclusion in policy["excludes"]):
+            return
+        try:
+            info = host_path.lstat()
+        except OSError as error:
+            finding("unsafe_selected_path", "blocker", str(error), relative)
+            return
+        # Exclude only real directories. A symlink named `.git` must remain in
+        # the selected tree so the symlink closure check can reject an
+        # escaping target instead of silently skipping it.
+        if stat.S_ISDIR(info.st_mode) and host_path.name in exclude_directory_names:
             return
         if len(records) >= limits.max_entries:
             finding("entry_limit_exceeded", "blocker", "selected entry limit exceeded", relative)
@@ -1229,10 +1300,39 @@ def _readelf(path: Record, limits: Limits) -> tuple[str, bool] | None:
 
 
 def _elf_metadata(output: str) -> dict[str, Any]:
-    interpreter = re.search(r"Requesting program interpreter:\s*([^\]]*)\]", output)
-    interpreter_value = interpreter.group(1).strip() if interpreter else None
+    # ``patchelf``/wheel repair can leave a one-byte PT_INTERP segment in a
+    # shared object.  GNU readelf renders that segment as
+    # ``[Requesting program interpreter: ]``.  It is equivalent to no usable
+    # interpreter for a DYN shared object, but treating the empty body as
+    # malformed metadata makes the whole ELF scan appear incomplete.  Keep
+    # this normalization narrow: an executable with an empty PT_INTERP is
+    # still malformed and must fail closed.
+    elf_type = re.search(
+        r"^\s*Elf file type is\s+(\S+)(?:\s+\(([^)]*)\))?\s*$",
+        output,
+        re.MULTILINE,
+    )
+    elf_kind = elf_type.group(1) if elf_type else None
+    elf_description = elf_type.group(2) if elf_type else None
+    shared_object = elf_kind == "DYN" and elf_description == "Shared object file"
+
+    interpreter_marker = "Requesting program interpreter:"
+    interpreter_matches = re.findall(
+        r"^\s*\[?Requesting program interpreter:\s*([^\]\r\n]*)\]\s*$",
+        output,
+        re.MULTILINE,
+    )
+    if interpreter_marker in output and not interpreter_matches:
+        raise RuntimeAuditError("readelf metadata contains malformed interpreter text")
+    if len(interpreter_matches) > 1:
+        raise RuntimeAuditError("readelf metadata contains duplicate interpreter text")
+    interpreter_value = interpreter_matches[0].strip() if interpreter_matches else None
+    if interpreter_value == "":
+        if not shared_object:
+            raise RuntimeAuditError("readelf metadata contains unsafe interpreter text")
+        interpreter_value = None
     if interpreter_value is not None and (
-        not interpreter_value or len(interpreter_value) > MAX_PATH or _control(interpreter_value)
+        len(interpreter_value) > MAX_PATH or _control(interpreter_value)
     ):
         raise RuntimeAuditError("readelf metadata contains unsafe interpreter text")
 
@@ -1434,11 +1534,11 @@ def _sorted_findings(findings: Sequence[dict[str, Any]], limit: int) -> tuple[li
     return ordered[:limit], len(ordered) > limit
 
 
-def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS, app_files: Sequence[str] = (), exclusions: Sequence[str] = DEFAULT_EXCLUDES, launcher_inventory: LauncherInventory | None = None, limits: Limits | None = None, critical_config: Mapping[str, Any] | None = None, critical_probe: Mapping[str, Any] | None = None, critical_profile: str | None = None, portability_gate_policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def audit_runtime(*, source_root: Path, targets: Sequence[str] = DEFAULT_TARGETS, app_files: Sequence[str] = (), exclusions: Sequence[str] = DEFAULT_EXCLUDES, exclude_directory_names: Sequence[str] = DEFAULT_EXCLUDE_DIRECTORY_NAMES, launcher_inventory: LauncherInventory | None = None, limits: Limits | None = None, critical_config: Mapping[str, Any] | None = None, critical_probe: Mapping[str, Any] | None = None, critical_profile: str | None = None, portability_gate_policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
     active_limits = limits or Limits()
     if active_limits.max_entries <= 0 or active_limits.max_findings <= 0 or active_limits.max_shebang_bytes <= 0:
         raise RuntimeAuditError("audit limits must be positive")
-    policy = _policy(targets, app_files, exclusions)
+    policy = _policy(targets, app_files, exclusions, exclude_directory_names)
     inventory = launcher_inventory or LauncherInventory()
     records, findings = collect_records(source_root, policy, active_limits)
     selected = {"/" + item.path: item for item in records}
@@ -1536,7 +1636,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         portability_gate_policy = load_portability_gate_policy(args.gate_policy) if args.gate_policy else None
         if critical_probe is not None and critical_config is None:
             raise RuntimeAuditError("--critical-probe requires --critical-config")
-        report = audit_runtime(source_root=args.source_root, targets=policy["targets"], app_files=policy["include_app"], exclusions=policy["excludes"], launcher_inventory=inventory, limits=Limits(args.max_entries, args.max_shebang_bytes, args.max_findings), critical_config=critical_config, critical_probe=critical_probe, critical_profile=args.critical_profile, portability_gate_policy=portability_gate_policy)
+        report = audit_runtime(source_root=args.source_root, targets=policy["targets"], app_files=policy["include_app"], exclusions=policy["excludes"], exclude_directory_names=policy["exclude_directory_names"], launcher_inventory=inventory, limits=Limits(args.max_entries, args.max_shebang_bytes, args.max_findings), critical_config=critical_config, critical_probe=critical_probe, critical_profile=args.critical_profile, portability_gate_policy=portability_gate_policy)
         rendered = render_report(report)
         if args.output:
             args.output.write_text(rendered, encoding="utf-8")

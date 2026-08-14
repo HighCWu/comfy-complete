@@ -54,6 +54,7 @@ class RuntimeReadyTests(unittest.TestCase):
                 "targets": ["/app/comfyui", "/opt/conda"],
                 "include_app": [],
                 "excludes": [],
+                "exclude_directory_names": [".git"],
             },
             "file_tree": {
                 "entry_count": len(entries),

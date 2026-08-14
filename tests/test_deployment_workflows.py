@@ -373,6 +373,95 @@ def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
     assert ".tar.zst" not in metadata
 
 
+def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local():
+    workflow = DOCKER_BUILD.read_text()
+    block = workflow.split("  publish-runtime-slim:\n", 1)[1]
+
+    release = block.index("Release base and exporter images before local volume materialization")
+    materialize = block.index("Materialize runtime into a local simulated Network Volume")
+    smoke = block.index("Smoke-test materialized runtime through slim launcher contracts")
+    remove_volume = block.index("Remove local simulated runtime volume after smoke")
+    push = block.index("Push the immutable slim launcher image")
+    publisher = block.index("Publish verified runtime archive to object store")
+    cleanup = block.index("Delete the runner-local runtime archive")
+    assert release < materialize < smoke < remove_volume < push < publisher < cleanup
+
+    materializer_block = block.split(
+        "      - name: Materialize runtime into a local simulated Network Volume\n", 1
+    )[1].split(
+        "      - name: Smoke-test materialized runtime through slim launcher contracts\n", 1
+    )[0]
+    assert "scripts/materialize_runtime.py" in materializer_block
+    assert "--archive \"$ARCHIVE\"" in materializer_block
+    assert "--manifest \"$RUNTIME_DIR/manifest.json\"" in materializer_block
+    assert "--volume-root \"$RUNTIME_VOLUME\"" in materializer_block
+    assert "runtime-materializer.json" in materializer_block
+    assert "command -v zstd" in materializer_block
+    assert "apt-get install -y --no-install-recommends zstd" in materializer_block
+    assert 'result.get("status") != "materialized"' in materializer_block
+    assert 'result.get("current_updated") is not True' in materializer_block
+    assert "rm -rf \"$RUNTIME_DIR\"" not in materializer_block
+    assert "OBJECT_STORE_" not in materializer_block
+    assert "secrets." not in materializer_block
+
+    smoke_block = block.split(
+        "      - name: Smoke-test materialized runtime through slim launcher contracts\n", 1
+    )[1].split(
+        "      - name: Remove local simulated runtime volume after smoke\n", 1
+    )[0]
+    for option in (
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        '--mount type=bind,source="$RUNTIME_VOLUME",destination=/runpod-volume,readonly',
+        "runtime_launcher",
+        "load_verified_manifest",
+        "verify_runtime_tree",
+        "install_compatibility_link",
+        "install_comfy_projection",
+        "runtime_critical_probe.py",
+        "--profile cpu",
+        "aiohttp",
+        "/opt/conda/bin/python",
+    ):
+        assert option in smoke_block
+    assert "--gpus" not in smoke_block
+    assert "start.sh" not in smoke_block
+    assert "OBJECT_STORE_" not in smoke_block
+    assert "secrets." not in smoke_block
+
+    cleanup_block = block.split(
+        "      - name: Remove local simulated runtime volume after smoke\n", 1
+    )[1].split(
+        "      - name: Push the immutable slim launcher image\n", 1
+    )[0]
+    assert "if: ${{ always() }}" in cleanup_block
+    assert 'rm -rf "$RUNTIME_VOLUME"' in cleanup_block
+    assert 'rm -rf "$SMOKE_AUDIT"' in cleanup_block
+
+    upload = block.split("actions/upload-artifact@v4", 1)[1].split(
+        "Delete the runner-local runtime archive", 1
+    )[0]
+    for metadata in (
+        "runtime-materializer.json",
+        "runtime-launcher-smoke.json",
+        "runtime-critical-probe.json",
+    ):
+        assert metadata in upload
+    assert ".tar.zst" not in upload
+
+
+def test_runtime_materializer_documentation_is_offline_only_and_mentions_smoke_boundary():
+    documentation = (REPO_ROOT / "docs" / "runtime-volume-materializer.md").read_text()
+    assert "offline local `archive -> mounted volume`" in documentation
+    assert "not an R2 downloader" in documentation
+    assert "scripts/materialize_runtime.py" in documentation
+    assert "READY.json" in documentation
+    assert "current" in documentation
+    assert "zstd" in documentation
+
+
 def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure():
     workflow = DOCKER_BUILD.read_text()
     block = workflow.split("  audit-base-runtime:\n", 1)[1].split("\n  publish-runtime-slim:", 1)[0]

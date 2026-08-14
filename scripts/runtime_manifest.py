@@ -24,6 +24,7 @@ CONTENT_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 BUILD_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_METADATA_STRING_LENGTH = 512
 MAX_PATH_LENGTH = 4096
+MAX_DIRECTORY_NAME_LENGTH = 255
 MAX_ENTRYPOINT_ARG_LENGTH = 4096
 MAX_ENTRYPOINT_ARG_COUNT = 128
 
@@ -112,6 +113,28 @@ def _validate_path(value: object, *, name: str) -> str:
     if not isinstance(value, str) or not is_safe_relative_path(value):
         raise RuntimeManifestError(f"{name} is unsafe")
     return value
+
+
+def validate_exclude_directory_names(value: object, *, name: str = "exclude_directory_names") -> list[str]:
+    """Validate basename-only directory exclusions used by export and audit."""
+
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise RuntimeManifestError(f"{name} must be a string array")
+    if value != sorted(value) or len(set(value)) != len(value):
+        raise RuntimeManifestError(f"{name} must be sorted and unique")
+    validated: list[str] = []
+    for index, item in enumerate(value):
+        if (
+            not item
+            or len(item) > MAX_DIRECTORY_NAME_LENGTH
+            or item in (".", "..")
+            or "/" in item
+            or "\\" in item
+            or any(unicodedata.category(char).startswith("C") for char in item)
+        ):
+            raise RuntimeManifestError(f"{name}[{index}] must be a safe single directory name")
+        validated.append(item)
+    return validated
 
 
 def _validate_entries(entries: object) -> tuple[list[FileEntry], int, str]:
@@ -285,7 +308,12 @@ def validate_manifest(value: object) -> RuntimeManifest:
         raise RuntimeManifestError("targets must be absolute, traversal-free source paths")
 
     selection = raw["selection_policy"]
-    if not isinstance(selection, dict) or set(selection) != {"targets", "include_app", "excludes"}:
+    if not isinstance(selection, dict) or set(selection) != {
+        "targets",
+        "include_app",
+        "excludes",
+        "exclude_directory_names",
+    }:
         raise RuntimeManifestError("selection_policy metadata is invalid")
     if selection["targets"] != targets:
         raise RuntimeManifestError("selection_policy.targets must equal targets")
@@ -309,6 +337,10 @@ def validate_manifest(value: object) -> RuntimeManifest:
     if any(not path.startswith("/app/") for path in include_app):
         raise RuntimeManifestError("selection_policy.include_app paths must be under /app")
     excludes = validate_absolute_policy_paths(selection["excludes"], name="excludes")
+    exclude_directory_names = validate_exclude_directory_names(
+        selection["exclude_directory_names"],
+        name="selection_policy.exclude_directory_names",
+    )
 
     selected_prefixes = [path[1:] for path in [*targets, *include_app]]
     excluded_prefixes = [path[1:] for path in excludes]
@@ -335,6 +367,17 @@ def validate_manifest(value: object) -> RuntimeManifest:
             raise RuntimeManifestError(f"file-tree entry is outside selection policy: {entry_path}")
         if any(entry_path == prefix or entry_path.startswith(prefix + "/") for prefix in excluded_prefixes):
             raise RuntimeManifestError(f"file-tree entry is excluded by selection policy: {entry_path}")
+        parts = entry_path.split("/")
+        for index, part in enumerate(parts):
+            if part not in exclude_directory_names:
+                continue
+            # The policy excludes real directories, not a symlink or regular
+            # file whose basename happens to match.  Any descendant, however,
+            # would require that component to be a directory and is forbidden.
+            if index < len(parts) - 1 or entry["type"] == "directory":
+                raise RuntimeManifestError(
+                    f"file-tree entry is inside excluded directory: {entry_path}"
+                )
 
     archive = raw["archive"]
     if not isinstance(archive, dict) or set(archive) != {
