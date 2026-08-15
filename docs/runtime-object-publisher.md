@@ -93,6 +93,13 @@ The smoke test runs the image read-only with a shell entrypoint,
 `--network none`, dropped capabilities, and a bounded `/tmp`; it does not
 start the launcher, contact RunPod, or request a GPU.
 
+The materialized-runtime smoke writes its critical-probe evidence to a
+runner-owned bind mount. It therefore runs that container as the runner's
+`$(id -u):$(id -g)` UID/GID: with `--cap-drop ALL`, container UID 0 cannot
+bypass the bind mount's host mode bits. The workflow keeps the source
+directory owner-only writable and does not rely on `chmod 0777`, host
+`chown`, or a capability exception.
+
 The job pushes the immutable slim launcher image first, then invokes the
 publisher, and only then removes the runner-local archive. This means a
 publisher failure cannot be mistaken for a successful publication, and the
