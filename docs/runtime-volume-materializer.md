@@ -10,11 +10,11 @@ The materializer owns this layout below the supplied volume root:
 ```text
 <volume-root>/runtimes/
 ├── .materialize.lock
-├── .staging/                       # private, removed after failed attempts
-├── <runtime-tree-sha256-hex>/       # immutable published generation
+├── .staging/                       # private (0700), removed after failed attempts
+├── <runtime-tree-sha256-hex>/       # immutable published generation (0755)
 │   ├── <manifest file-tree>
-│   ├── manifest.json                # exact input bytes
-│   └── READY.json                   # runtime_ready.py contract
+│   ├── manifest.json                # exact input bytes (0644)
+│   └── READY.json                   # runtime_ready.py contract (0644)
 └── current -> <runtime-tree-sha256-hex>
 ```
 
@@ -22,6 +22,15 @@ The generation name is the manifest's `runtime_digest` without the
 `sha256:` prefix. Older generations are never deleted or overwritten.
 `current` is a relative symlink and is changed only after a complete staged
 verification succeeds.
+
+The generation root and any parent directories synthesized for manifest paths
+are published with mode `0755`, so a Pod running under an arbitrary UID can
+traverse the verified runtime while group/other users cannot write those
+directories. `manifest.json` and `READY.json` are published with mode `0644`.
+Modes of files, symlinks, and directories present in the runtime manifest are
+never broadened or rewritten. The provider-supplied volume root is not chmod'd;
+it must already grant the runtime UID read and traverse access (a permissive
+`0777` mount is accepted).
 
 This is only the offline local `archive -> mounted volume` materialization
 step. It is not an R2 downloader, a control-plane worker, or a RunPod
@@ -51,11 +60,16 @@ walked again to detect corruption or unmanifested files.
 
 Only then are the exact manifest bytes and a separately fsynced `READY.json`
 written atomically. The completed staging directory is atomically renamed to
-the immutable generation, and `current` is atomically replaced last. A
+the immutable generation. The materializer then seals only its own generation
+metadata directories before replacing `current` last. A
 failure before that rename removes only the private staging directory, so an
 existing `current` remains untouched. If updating `current` fails after the
 generation rename, the new generation is retained for audit/retry and the
 previous `current` is not removed by this tool.
+
+If the process stops after the generation rename but before metadata sealing,
+the next invocation fully verifies that generation, repairs its materializer
+owned directory modes, and only then exposes it through `current`.
 
 If the same runtime digest already exists, the helper does not re-extract it.
 It first performs the same full manifest/READY/tree verification and requires

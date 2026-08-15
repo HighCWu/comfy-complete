@@ -52,6 +52,20 @@ LOCK_NAME = ".materialize.lock"
 CURRENT_NAME = "current"
 MANIFEST_NAME = "manifest.json"
 READY_NAME = "READY.json"
+# The materializer's control directories are not part of the exported image
+# tree.  They therefore have a small, provider-neutral publication contract:
+#
+# * ``.staging`` stays private while an archive is being expanded;
+# * a published generation and any implicit parent directories are traversable
+#   by an arbitrary runtime UID, but are not writable by group/other users;
+# * generated metadata is readable by arbitrary runtime UIDs, but is not
+#   writable by them.
+#
+# Modes of entries that came from the runtime manifest are never changed here.
+PRIVATE_DIRECTORY_MODE = 0o700
+RUNTIME_ROOT_MODE = 0o755
+PUBLISHED_DIRECTORY_MODE = 0o755
+PUBLISHED_METADATA_MODE = 0o644
 
 
 class RuntimeMaterializerError(RuntimeError):
@@ -100,6 +114,37 @@ def _ensure_real_directory(path: Path, *, create: bool = False) -> None:
         raise _error("volume_io") from error
     if not _is_real_directory(path):
         raise _error("unsafe_volume_root")
+
+
+def _chmod_directory(path: Path, mode: int, *, error_code: str) -> None:
+    """Set an exact mode on a directory without following a symlink."""
+
+    try:
+        os.chmod(path, mode, follow_symlinks=False)
+    except OSError as error:
+        raise _error(error_code) from error
+
+
+def _require_volume_root_traversable(path: Path) -> None:
+    """Require the caller-supplied mount root to admit arbitrary readers.
+
+    We deliberately do not chmod the volume root: it may contain unrelated
+    provider-managed data and RunPod may mount it with permissive directory
+    bits (for example ``0777``).  A runtime UID must nevertheless be able to
+    read and traverse it to reach ``runtimes/current``.  The published
+    ``runtimes`` directory and generations carry the actual no-write-by-other
+    contract below; the provider's mount root is outside that contract.
+    """
+
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise _error("volume_root_permissions") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _error("unsafe_volume_root")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (mode & 0o005) != 0o005:
+        raise _error("volume_root_permissions")
 
 
 def _read_regular_file(path: Path, *, max_bytes: int | None = None) -> bytes:
@@ -666,6 +711,11 @@ def _verify_metadata(root: Path, manifest_bytes: bytes, manifest: RuntimeManifes
         raise _error("metadata_missing") from error
     if not stat.S_ISREG(actual_manifest.st_mode) or not stat.S_ISREG(actual_ready.st_mode):
         raise _error("metadata_invalid")
+    if (
+        stat.S_IMODE(actual_manifest.st_mode) != PUBLISHED_METADATA_MODE
+        or stat.S_IMODE(actual_ready.st_mode) != PUBLISHED_METADATA_MODE
+    ):
+        raise _error("metadata_mode_mismatch")
     try:
         if manifest_path.read_bytes() != manifest_bytes:
             raise _error("metadata_manifest_mismatch")
@@ -684,6 +734,31 @@ def _verify_metadata(root: Path, manifest_bytes: bytes, manifest: RuntimeManifes
 def _verify_generation(root: Path, manifest_bytes: bytes, manifest: RuntimeManifest) -> None:
     _verify_metadata(root, manifest_bytes, manifest)
     _verify_tree(root, manifest)
+
+
+def _seal_published_generation(root: Path, manifest: RuntimeManifest) -> None:
+    """Seal only materializer-owned directories after full verification.
+
+    The exported runtime entries retain the exact modes recorded in the
+    manifest.  Only the generation root and parent directories that were
+    synthesized because they were absent from that manifest are materializer
+    metadata; making those directories ``0755`` lets a Pod running as any UID
+    reach the verified runtime without making the shared volume writable by
+    that UID.  The operation is intentionally idempotent so a crash between
+    generation rename and ``current`` publication can be repaired on retry.
+    """
+
+    expected = _expected_entries(manifest)
+    directories = [root, *(root / path for path in sorted(_implicit_directories(expected)))]
+    for directory in directories:
+        try:
+            metadata = directory.lstat()
+        except OSError as error:
+            raise _error("publication_permissions") from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise _error("publication_permissions")
+        _chmod_directory(directory, PUBLISHED_DIRECTORY_MODE, error_code="publication_permissions")
+        _fsync_directory(directory)
 
 
 def _atomic_update_current(runtime_root: Path, generation_name: str) -> bool:
@@ -748,6 +823,10 @@ def _materialize_locked(
         if not _is_real_directory(generation):
             raise _error("generation_conflict")
         _verify_generation(generation, manifest_bytes, manifest)
+        # A previous process may have been interrupted after the immutable
+        # generation rename but before sealing its materializer-owned parent
+        # directories.  Repair that state before exposing it through current.
+        _seal_published_generation(generation, manifest)
         current_updated = _atomic_update_current(runtime_root, generation_name)
         return {
             "status": "reused",
@@ -760,9 +839,10 @@ def _materialize_locked(
 
     staging_root = runtime_root / STAGING_DIRECTORY
     _ensure_real_directory(staging_root, create=True)
+    _chmod_directory(staging_root, PRIVATE_DIRECTORY_MODE, error_code="staging_io")
     staging = staging_root / f"{runtime_hex}.{uuid.uuid4().hex}"
     try:
-        staging.mkdir(mode=0o700)
+        staging.mkdir(mode=PRIVATE_DIRECTORY_MODE)
     except OSError as error:
         raise _error("staging_io") from error
     published = False
@@ -770,17 +850,25 @@ def _materialize_locked(
         _stream_extract(archive_path, staging, expected)
         _verify_tree(staging, manifest)
 
-        _atomic_write(staging / MANIFEST_NAME, manifest_bytes, mode=0o644)
+        _atomic_write(staging / MANIFEST_NAME, manifest_bytes, mode=PUBLISHED_METADATA_MODE)
         try:
             ready = build_ready_marker(manifest_bytes, manifest)
         except RuntimeReadyError as error:
             raise _error("metadata_invalid") from error
-        _atomic_write(staging / READY_NAME, canonical_json(ready) + b"\n", mode=0o644)
+        _atomic_write(
+            staging / READY_NAME,
+            canonical_json(ready) + b"\n",
+            mode=PUBLISHED_METADATA_MODE,
+        )
         _verify_generation(staging, manifest_bytes, manifest)
         _fsync_tree_directories(staging)
 
         _publish_generation(runtime_root, staging, generation)
         published = True
+        # Keep the rename-before-seal order: staging remains private until it
+        # is complete, while an interrupted seal is recoverable by the
+        # existing-generation path above and never becomes current.
+        _seal_published_generation(generation, manifest)
         current_updated = _atomic_update_current(runtime_root, generation_name)
         return {
             "status": "materialized",
@@ -815,7 +903,9 @@ class RuntimeMaterializer:
         archive_size, archive_sha256 = _validate_archive_input(Path(archive_path), manifest)
 
         _ensure_real_directory(self.volume_root, create=True)
+        _require_volume_root_traversable(self.volume_root)
         _ensure_real_directory(self.runtime_root, create=True)
+        _chmod_directory(self.runtime_root, RUNTIME_ROOT_MODE, error_code="volume_io")
         lock_path = self.runtime_root / LOCK_NAME
         with _writer_lock(lock_path):
             return _materialize_locked(
