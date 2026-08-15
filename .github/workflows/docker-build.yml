@@ -1262,6 +1262,9 @@ jobs:
           test -L "$CURRENT"
           test -f "$CURRENT/manifest.json"
           test -f "$CURRENT/READY.json"
+          # SMOKE_AUDIT is a runner-owned bind mount.  With every capability
+          # dropped, container UID 0 cannot bypass its host mode bits; match
+          # the runner UID/GID instead of weakening the host directory.
           docker run --rm \
             -i \
             --network none \
@@ -1269,6 +1272,7 @@ jobs:
             --pids-limit 256 \
             --cap-drop ALL \
             --security-opt no-new-privileges \
+            --user "$(id -u):$(id -g)" \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
             --tmpfs /opt:rw,nosuid,nodev,size=16m \
             --tmpfs /app:rw,nosuid,nodev,noexec,size=32m \

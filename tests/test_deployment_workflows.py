@@ -449,6 +449,7 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
         "--read-only",
         "--cap-drop ALL",
         "--security-opt no-new-privileges",
+        '--user "$(id -u):$(id -g)"',
         '--mount type=bind,source="$RUNTIME_VOLUME",destination=/runpod-volume,readonly',
         "runtime_launcher",
         "load_verified_manifest",
