@@ -336,17 +336,45 @@ def test_runtime_object_publisher_is_explicit_dispatch_only_and_secret_gated():
 def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
     workflow = DOCKER_BUILD.read_text()
     block = workflow.split("  publish-runtime-slim:\n", 1)[1]
+    runtime_dir_setup = block.index('sudo install -d -o 0 -g "$(id -g)" -m 0770 /mnt/runtime-export')
+    slim = block.index("Build and inspect the slim launcher image")
+    inventory = block.index("Generate and verify the slim launcher inventory")
+    slim_smoke = block.index("Smoke-test slim launcher image contract")
     export = block.index("Export and fully verify the immutable runtime")
     ready = block.index("scripts/runtime_ready.py")
-    slim = block.index("Build and inspect the slim launcher image")
-    smoke = block.index("Smoke-test slim launcher image contract")
+    slim_metadata = block.index('python3 - "$SIZE" "$RUNNER_TEMP/slim-image.json"')
+    export_cleanup = block.index('rm -rf "$RUNTIME_DIR"/*')
+    slim_metadata_copy = block.index('cp "$RUNNER_TEMP/slim-image.json" "$RUNTIME_DIR/slim-image.json"')
+    release = block.index("Release base and exporter images before local volume materialization")
+    materialize = block.index("Materialize runtime into a local simulated Network Volume")
+    projected_smoke = block.index("Smoke-test materialized runtime through slim launcher contracts")
+    remove_volume = block.index("Remove local simulated runtime volume after smoke")
     push = block.index("Push the immutable slim launcher image")
     publish = block.index("Publish verified runtime archive to object store")
     upload = block.index("Upload runtime publication metadata")
     cleanup = block.index("Delete the runner-local runtime archive")
-    assert export < ready < slim < smoke < push < publish < upload < cleanup
+    assert (
+        runtime_dir_setup
+        < slim
+        < slim_metadata
+        < inventory
+        < slim_smoke
+        < export
+        < export_cleanup
+        < ready
+        < slim_metadata_copy
+        < release
+        < materialize
+        < projected_smoke
+        < remove_volume
+        < push
+        < publish
+        < upload
+        < cleanup
+    )
+    assert 'python3 - "$SIZE" "${{ steps.identity.outputs.runtime_dir }}/slim-image.json"' not in block
     smoke_block = block.split("      - name: Smoke-test slim launcher image contract\n", 1)[1]
-    smoke_block = smoke_block.split("      - name: Push the immutable slim launcher image\n", 1)[0]
+    smoke_block = smoke_block.split("      - name: Export and fully verify the immutable runtime\n", 1)[0]
     for path in (
         "/runtime-launcher.py",
         "/start-pod.sh",
@@ -370,6 +398,8 @@ def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
     assert "spec_from_file_location" in smoke_block
     assert "import runtime_manifest" in smoke_block
     assert "for command in bash python3 dumb-init env" in smoke_block
+    assert "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/launcher-lib python3 - <<'PY'" in smoke_block
+    assert "python3 -c" not in smoke_block
     assert "--gpus" not in smoke_block
     assert "RUNPOD" not in smoke_block
     assert "runtime-publisher.json" in block

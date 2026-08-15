@@ -1015,70 +1015,6 @@ jobs:
             -t comfy-runtime-exporter:${{ github.sha }} \
             .
 
-      - name: Export and fully verify the immutable runtime
-        run: |
-          set -euo pipefail
-          BASE_IMAGE="${{ steps.identity.outputs.base_image }}"
-          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
-          REPO_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE")"
-          IMAGE_DIGEST="sha256:${REPO_DIGEST##*@sha256:}"
-          test "$IMAGE_DIGEST" != "sha256:"
-          rm -rf "$RUNTIME_DIR"/*
-          docker run --rm \
-            --network none \
-            --pids-limit 512 \
-            --cap-drop ALL \
-            --cap-add DAC_READ_SEARCH \
-            --security-opt no-new-privileges \
-            -v "$RUNTIME_DIR:/runtime-output" \
-            comfy-runtime-exporter:${{ github.sha }} \
-            --source-root / \
-            --output-dir /runtime-output \
-            --runtime-version "${{ github.sha }}" \
-            --source-image "$BASE_IMAGE" \
-            --source-image-digest "$IMAGE_DIGEST" \
-            --build-sha "${{ github.sha }}" \
-            --platform linux/amd64 \
-            --launcher-digest "${{ steps.identity.outputs.launcher_digest }}" \
-            --launcher-abi "${{ steps.identity.outputs.launcher_abi }}" \
-            --entrypoint /opt/conda/bin/python \
-            --entrypoint-arg /app/comfyui/main.py
-          MANIFEST="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.json' -print -quit)"
-          ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
-          test -n "$MANIFEST" -a -n "$ARCHIVE"
-          cp "$MANIFEST" "$RUNTIME_DIR/manifest.json"
-          python3 scripts/runtime_ready.py \
-            --manifest "$RUNTIME_DIR/manifest.json" \
-            --output "$RUNTIME_DIR/READY.json"
-          python3 - "$RUNTIME_DIR/manifest.json" "$RUNTIME_DIR/READY.json" "$ARCHIVE" "$RUNTIME_DIR/runtime-summary.json" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-
-          manifest_path, ready_path, archive_path, summary_path = map(Path, sys.argv[1:])
-          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-          ready = json.loads(ready_path.read_text(encoding="utf-8"))
-          Path(summary_path).write_text(
-              json.dumps(
-                  {
-                      "runtime_digest": manifest["runtime_digest"],
-                      "launcher_digest": manifest["compatibility"]["launcher_digest"],
-                      "launcher_abi": manifest["compatibility"]["launcher_abi"],
-                      "runtime_tree_bytes": manifest["file_tree"]["total_bytes"],
-                      "runtime_entry_count": manifest["file_tree"]["entry_count"],
-                      "archive_bytes": archive_path.stat().st_size,
-                      "archive_sha256": manifest["archive"]["sha256"],
-                      "manifest_sha256": ready["manifest_sha256"],
-                  },
-                  sort_keys=True,
-                  separators=(",", ":"),
-              ) + "\n",
-              encoding="utf-8",
-          )
-          PY
-          cat "$RUNTIME_DIR/runtime-summary.json"
-          df -h "$RUNNER_TEMP"
-
       - name: Build and inspect the slim launcher image
         run: |
           set -euo pipefail
@@ -1094,7 +1030,7 @@ jobs:
           # reviewed closure; the runtime payload itself is still excluded.
           test "$SIZE" -lt 671088640
           test "$(docker image inspect --format '{{json .Config.Entrypoint}}' '${{ steps.identity.outputs.slim_image }}')" = '["/usr/bin/dumb-init","--","/runtime-launcher.py"]'
-          python3 - "$SIZE" "${{ steps.identity.outputs.runtime_dir }}/slim-image.json" <<'PY'
+          python3 - "$SIZE" "$RUNNER_TEMP/slim-image.json" <<'PY'
           import json
           from pathlib import Path
           import sys
@@ -1110,7 +1046,7 @@ jobs:
                   },
                   sort_keys=True,
                   separators=(",", ":"),
-          ) + "\n",
+              ) + "\n",
               encoding="utf-8",
           )
           PY
@@ -1175,7 +1111,7 @@ jobs:
           done
           bash -n /start-pod.sh
           bash -n /usr/local/bin/comfy-manager-set-mode
-          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/launcher-lib python3 -c '
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/launcher-lib python3 - <<'PY'
           import importlib.util
           import runtime_manifest
           import sys
@@ -1194,8 +1130,73 @@ jobs:
           for path in ("/pod-gateway.py", "/pod-model-bootstrap.py", "/pod-asset-sync.py"):
               with open(path, "rb") as source:
                   compile(source.read(), path, "exec")
-          '
+          PY
           SH
+
+      - name: Export and fully verify the immutable runtime
+        run: |
+          set -euo pipefail
+          BASE_IMAGE="${{ steps.identity.outputs.base_image }}"
+          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
+          REPO_DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$BASE_IMAGE")"
+          IMAGE_DIGEST="sha256:${REPO_DIGEST##*@sha256:}"
+          test "$IMAGE_DIGEST" != "sha256:"
+          rm -rf "$RUNTIME_DIR"/*
+          docker run --rm \
+            --network none \
+            --pids-limit 512 \
+            --cap-drop ALL \
+            --cap-add DAC_READ_SEARCH \
+            --security-opt no-new-privileges \
+            -v "$RUNTIME_DIR:/runtime-output" \
+            comfy-runtime-exporter:${{ github.sha }} \
+            --source-root / \
+            --output-dir /runtime-output \
+            --runtime-version "${{ github.sha }}" \
+            --source-image "$BASE_IMAGE" \
+            --source-image-digest "$IMAGE_DIGEST" \
+            --build-sha "${{ github.sha }}" \
+            --platform linux/amd64 \
+            --launcher-digest "${{ steps.identity.outputs.launcher_digest }}" \
+            --launcher-abi "${{ steps.identity.outputs.launcher_abi }}" \
+            --entrypoint /opt/conda/bin/python \
+            --entrypoint-arg /app/comfyui/main.py
+          MANIFEST="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.json' -print -quit)"
+          ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
+          test -n "$MANIFEST" -a -n "$ARCHIVE"
+          cp "$MANIFEST" "$RUNTIME_DIR/manifest.json"
+          python3 scripts/runtime_ready.py \
+            --manifest "$RUNTIME_DIR/manifest.json" \
+            --output "$RUNTIME_DIR/READY.json"
+          python3 - "$RUNTIME_DIR/manifest.json" "$RUNTIME_DIR/READY.json" "$ARCHIVE" "$RUNTIME_DIR/runtime-summary.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          manifest_path, ready_path, archive_path, summary_path = map(Path, sys.argv[1:])
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          ready = json.loads(ready_path.read_text(encoding="utf-8"))
+          Path(summary_path).write_text(
+              json.dumps(
+                  {
+                      "runtime_digest": manifest["runtime_digest"],
+                      "launcher_digest": manifest["compatibility"]["launcher_digest"],
+                      "launcher_abi": manifest["compatibility"]["launcher_abi"],
+                      "runtime_tree_bytes": manifest["file_tree"]["total_bytes"],
+                      "runtime_entry_count": manifest["file_tree"]["entry_count"],
+                      "archive_bytes": archive_path.stat().st_size,
+                      "archive_sha256": manifest["archive"]["sha256"],
+                      "manifest_sha256": ready["manifest_sha256"],
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          cat "$RUNTIME_DIR/runtime-summary.json"
+          cp "$RUNNER_TEMP/slim-image.json" "$RUNTIME_DIR/slim-image.json"
+          df -h "$RUNNER_TEMP"
 
       # The base and exporter images have already done their work by this
       # point. Release their local layers before creating the second copy of
