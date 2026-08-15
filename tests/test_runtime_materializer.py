@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -199,6 +200,66 @@ class RuntimeMaterializerTests(unittest.TestCase):
         self.assertEqual(ready["runtime_digest"], result["runtime_digest"])
         self.assertEqual(len(entries), result["entry_count"])
         self.assertEqual((generation / "app/comfyui/main.py").read_bytes(), b"runtime")
+
+    def test_published_control_paths_are_uid_neutral_but_staging_stays_private(self) -> None:
+        archive, manifest, _ = self._valid_inputs()
+
+        result = materializer.materialize_runtime(archive, manifest, self.volume)
+
+        runtime_root = self.volume / "runtimes"
+        generation = runtime_root / str(result["runtime_digest"])[len("sha256:") :]
+        implicit_parent = generation / "app"
+        metadata_paths = (generation / "manifest.json", generation / "READY.json")
+
+        # These are materializer-owned control paths.  Other UIDs can traverse
+        # and read them, while group/other users cannot write them.  The
+        # manifest-owned app/comfyui and payload modes remain byte-for-byte
+        # faithful to the source runtime.
+        self.assertEqual(stat.S_IMODE(runtime_root.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((runtime_root / ".staging").stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(generation.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(implicit_parent.stat().st_mode), 0o755)
+        for path in metadata_paths:
+            mode = stat.S_IMODE(path.stat().st_mode)
+            self.assertEqual(mode, 0o644)
+            self.assertTrue(mode & 0o004)
+            self.assertEqual(mode & 0o002, 0)
+        self.assertEqual(stat.S_IMODE((generation / "app/comfyui").stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((generation / "app/comfyui/main.py").stat().st_mode), 0o755)
+
+    def test_interrupted_seal_is_repaired_before_current_is_exposed(self) -> None:
+        archive, manifest, _ = self._valid_inputs()
+        first = materializer.materialize_runtime(archive, manifest, self.volume)
+        generation = self.volume / "runtimes" / str(first["runtime_digest"])[len("sha256:") :]
+
+        # Simulate a process dying after the generation rename but before its
+        # materializer-owned directories were sealed.  The generation remains
+        # valid, but the retry must repair its access contract before reusing it.
+        (self.volume / "runtimes" / "current").unlink()
+        generation.chmod(0o700)
+        (generation / "app").chmod(0o700)
+        second = materializer.materialize_runtime(archive, manifest, self.volume)
+
+        self.assertEqual(second["status"], "reused")
+        self.assertTrue((self.volume / "runtimes" / "current").is_symlink())
+        self.assertEqual(stat.S_IMODE(generation.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((generation / "app").stat().st_mode), 0o755)
+
+    def test_rejects_a_nontraversable_volume_root(self) -> None:
+        self.volume.mkdir(mode=0o700)
+        archive, manifest, _ = self._valid_inputs()
+
+        with self.assertRaisesRegex(materializer.RuntimeMaterializerError, "volume_root_permissions"):
+            materializer.materialize_runtime(archive, manifest, self.volume)
+
+    def test_accepts_a_provider_permissive_volume_root(self) -> None:
+        self.volume.mkdir(mode=0o777)
+        self.volume.chmod(0o777)
+        archive, manifest, _ = self._valid_inputs()
+
+        result = materializer.materialize_runtime(archive, manifest, self.volume)
+
+        self.assertEqual(result["status"], "materialized")
 
     def test_same_digest_is_reused_only_after_complete_verification(self) -> None:
         archive, manifest, _ = self._valid_inputs()
