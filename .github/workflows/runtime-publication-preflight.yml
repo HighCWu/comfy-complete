@@ -1,0 +1,138 @@
+name: Runtime publication credential preflight
+
+# This workflow is deliberately independent from Docker Build. It is a
+# manual, read-only connectivity check for the object store used by runtime
+# publication; it never publishes an archive or changes bucket contents.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  runtime-publication-preflight:
+    # Keep the environment out of every non-main run, including a manual
+    # dispatch made from an unreviewed branch.
+    if: ${{ github.ref == 'refs/heads/main' }}
+    environment: runtime-publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned read-only S3 client
+        run: |
+          set -euo pipefail
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            --no-cache-dir \
+            --only-binary=:all: \
+            'boto3==1.40.0' \
+            'botocore==1.40.0'
+
+      - name: Validate credentials with read-only bucket probes
+        env:
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_CONFIG_FILE: /dev/null
+          AWS_SHARED_CREDENTIALS_FILE: /dev/null
+          OBJECT_STORE_ENDPOINT: ${{ secrets.OBJECT_STORE_ENDPOINT }}
+          OBJECT_STORE_BUCKET: ${{ secrets.OBJECT_STORE_BUCKET }}
+          OBJECT_STORE_ACCESS_KEY_ID: ${{ secrets.OBJECT_STORE_ACCESS_KEY_ID }}
+          OBJECT_STORE_SECRET_ACCESS_KEY: ${{ secrets.OBJECT_STORE_SECRET_ACCESS_KEY }}
+          OBJECT_STORE_REGION: ${{ secrets.OBJECT_STORE_REGION }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import logging
+          import os
+          from urllib.parse import urlparse
+
+          import boto3
+          from botocore.config import Config
+
+
+          REQUIRED = (
+              "OBJECT_STORE_ENDPOINT",
+              "OBJECT_STORE_BUCKET",
+              "OBJECT_STORE_ACCESS_KEY_ID",
+              "OBJECT_STORE_SECRET_ACCESS_KEY",
+              "OBJECT_STORE_REGION",
+          )
+
+          values = {name: os.environ.get(name, "") for name in REQUIRED}
+          missing = [name for name, value in values.items() if not value]
+          if missing:
+              print(
+                  "::error::runtime-publication preflight configuration is incomplete: "
+                  + ", ".join(missing)
+              )
+              raise SystemExit(1)
+
+          # Reject control characters before any value can reach a log line or
+          # the client configuration. Secrets are never printed.
+          if any(
+              any(ord(character) < 32 for character in value)
+              for value in values.values()
+          ):
+              print("::error::runtime-publication preflight configuration contains control characters")
+              raise SystemExit(1)
+
+          endpoint = values["OBJECT_STORE_ENDPOINT"]
+          parsed = urlparse(endpoint)
+          endpoint_host = parsed.hostname
+          if (
+              parsed.scheme != "https"
+              or not endpoint_host
+              or parsed.username is not None
+              or parsed.password is not None
+              or parsed.query
+              or parsed.fragment
+          ):
+              print("::error::OBJECT_STORE_ENDPOINT must be an HTTPS URL without embedded credentials or query data")
+              raise SystemExit(1)
+
+          bucket = values["OBJECT_STORE_BUCKET"]
+          region = values["OBJECT_STORE_REGION"]
+          if any(character.isspace() for character in bucket) or any(
+              character.isspace() for character in region
+          ):
+              print("::error::runtime-publication bucket and region must not contain whitespace")
+              raise SystemExit(1)
+
+          # Keep botocore's provider errors out of the log: they can include
+          # request metadata that is not useful for this preflight.
+          logging.disable(logging.CRITICAL)
+          client = boto3.client(
+              "s3",
+              endpoint_url=endpoint,
+              aws_access_key_id=values["OBJECT_STORE_ACCESS_KEY_ID"],
+              aws_secret_access_key=values["OBJECT_STORE_SECRET_ACCESS_KEY"],
+              region_name=region,
+              config=Config(
+                  connect_timeout=5,
+                  read_timeout=10,
+                  retries={"max_attempts": 2, "mode": "standard"},
+                  signature_version="s3v4",
+              ),
+          )
+
+          print(
+              f"runtime-publication preflight target bucket={bucket} "
+              f"endpoint_host={endpoint_host}"
+          )
+          try:
+              client.head_bucket(Bucket=bucket)
+              print("runtime-publication preflight result=head_bucket:ok")
+              client.list_objects_v2(Bucket=bucket, MaxKeys=1)
+              print("runtime-publication preflight result=list_objects_v2:ok")
+          except Exception:
+              print("::error::runtime-publication preflight read-only bucket probes failed")
+              raise SystemExit(1)
+
+          print("runtime-publication preflight result=ok")
+          PY
