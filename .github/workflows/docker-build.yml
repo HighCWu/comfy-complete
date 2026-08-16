@@ -1265,6 +1265,10 @@ jobs:
           # SMOKE_AUDIT is a runner-owned bind mount.  With every capability
           # dropped, container UID 0 cannot bypass its host mode bits; match
           # the runner UID/GID instead of weakening the host directory.
+          # Keep every writable tmpfs explicitly owned by the runner. The
+          # launcher creates atomic links/projections below /opt and /app;
+          # Docker otherwise mounts those paths root-owned even when the
+          # container runs as the runner UID/GID.
           docker run --rm \
             -i \
             --network none \
@@ -1273,9 +1277,9 @@ jobs:
             --cap-drop ALL \
             --security-opt no-new-privileges \
             --user "$(id -u):$(id -g)" \
-            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
-            --tmpfs /opt:rw,nosuid,nodev,size=16m \
-            --tmpfs /app:rw,nosuid,nodev,noexec,size=32m \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,uid=$(id -u),gid=$(id -g),mode=1777 \
+            --tmpfs /opt:rw,nosuid,nodev,size=16m,uid=$(id -u),gid=$(id -g),mode=0755 \
+            --tmpfs /app:rw,nosuid,nodev,noexec,size=32m,uid=$(id -u),gid=$(id -g),mode=0755 \
             --mount type=bind,source="$RUNTIME_VOLUME",destination=/runpod-volume,readonly \
             --mount type=bind,source="$SMOKE_AUDIT",destination=/audit \
             -v "$PWD/scripts/runtime_critical_probe.py:/runtime-audit/runtime_critical_probe.py:ro" \
