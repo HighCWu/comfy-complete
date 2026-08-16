@@ -100,6 +100,14 @@ bypass the bind mount's host mode bits. The workflow keeps the source
 directory owner-only writable and does not rely on `chmod 0777`, host
 `chown`, or a capability exception.
 
+The smoke's writable tmpfs contract is explicit as well: `/tmp` is mounted
+runner-owned with mode `1777` for ordinary temporary files, while `/opt` and
+`/app` are runner-owned with mode `0755`. The launcher needs those latter two
+mount points to create its atomic compatibility links and ComfyUI projection;
+without explicit `uid`, `gid`, and `mode` options Docker leaves them
+root-owned, which fails under the required runner UID/GID and dropped
+capabilities.
+
 The job pushes the immutable slim launcher image first, then invokes the
 publisher, and only then removes the runner-local archive. This means a
 publisher failure cannot be mistaken for a successful publication, and the
