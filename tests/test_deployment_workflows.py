@@ -12,6 +12,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKER_BUILD = REPO_ROOT / ".github" / "workflows" / "docker-build.yml"
 SEED_OBJECT_INFO = REPO_ROOT / ".github" / "workflows" / "seed-object-info.yml"
+RUNTIME_PUBLICATION_PREFLIGHT = (
+    REPO_ROOT / ".github" / "workflows" / "runtime-publication-preflight.yml"
+)
 DOCKER_PULL_RETRY = REPO_ROOT / ".github" / "scripts" / "docker-pull-with-retry.sh"
 CONFIGURE_DOCKER_PULLS = REPO_ROOT / ".github" / "scripts" / "configure-docker-pulls.py"
 
@@ -331,6 +334,65 @@ def test_runtime_object_publisher_is_explicit_dispatch_only_and_secret_gated():
         assert f"{secret}: ${{{{ secrets.{secret} }}}}" in publisher
     assert "--require-config" in publisher
     assert "S3_" not in publisher
+
+
+def test_runtime_publication_preflight_is_manual_main_only_and_minimal():
+    workflow = RUNTIME_PUBLICATION_PREFLIGHT.read_text()
+    parsed = yaml.safe_load(workflow)
+    trigger = parsed.get("on", parsed.get(True))
+    assert trigger == {"workflow_dispatch": None}
+
+    job = parsed["jobs"]["runtime-publication-preflight"]
+    assert job["if"] == "${{ github.ref == 'refs/heads/main' }}"
+    assert job["environment"] == "runtime-publication"
+    assert job["permissions"] == {}
+    assert job["timeout-minutes"] <= 10
+    assert "push:" not in workflow
+    assert "pull_request:" not in workflow
+    assert "workflow_run:" not in workflow
+    assert "actions/checkout" not in workflow
+
+
+def test_runtime_publication_preflight_requires_pinned_client_and_all_secrets():
+    workflow = RUNTIME_PUBLICATION_PREFLIGHT.read_text()
+    for package in ("boto3==1.40.0", "botocore==1.40.0"):
+        assert f"'{package}'" in workflow
+
+    probe = workflow.split("      - name: Validate credentials with read-only bucket probes\n", 1)[1]
+    for secret in (
+        "OBJECT_STORE_ENDPOINT",
+        "OBJECT_STORE_BUCKET",
+        "OBJECT_STORE_ACCESS_KEY_ID",
+        "OBJECT_STORE_SECRET_ACCESS_KEY",
+        "OBJECT_STORE_REGION",
+    ):
+        assert f"{secret}: ${{{{ secrets.{secret} }}}}" in probe
+    assert "set -euo pipefail" in workflow
+    assert "parsed.scheme != \"https\"" in probe
+    assert "endpoint_host" in probe
+    assert "missing" in probe
+
+
+def test_runtime_publication_preflight_performs_only_bounded_read_probes():
+    workflow = RUNTIME_PUBLICATION_PREFLIGHT.read_text()
+    assert "client.head_bucket(Bucket=bucket)" in workflow
+    assert "client.list_objects_v2(Bucket=bucket, MaxKeys=1)" in workflow
+    assert "connect_timeout=5" in workflow
+    assert "read_timeout=10" in workflow
+    assert '"max_attempts": 2' in workflow
+    assert "logging.disable(logging.CRITICAL)" in workflow
+    for forbidden in (
+        "put_object",
+        "delete_object",
+        "create_multipart_upload",
+        "upload_part",
+        "complete_multipart_upload",
+        "abort_multipart_upload",
+        "copy_object",
+    ):
+        assert forbidden not in workflow
+    assert "print(result" not in workflow
+    assert "print(response" not in workflow
 
 
 def test_runtime_object_publisher_runs_after_all_verification_and_image_push():

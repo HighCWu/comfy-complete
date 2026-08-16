@@ -77,6 +77,31 @@ an overwrite. Multipart failures call `AbortMultipartUpload`; a completed
 upload is re-checked with HEAD. The publisher never uses `CopyObject`, never
 deletes old versions, and does not manage lifecycle rules.
 
+## Read-only credential preflight
+
+The independent
+`.github/workflows/runtime-publication-preflight.yml` workflow is a manual
+(`workflow_dispatch`) connectivity check for the `runtime-publication`
+GitHub Environment. Its job condition is restricted to `refs/heads/main`, and
+the repository environment should independently allow deployments from the
+`main` branch only. The workflow has no repository write permissions.
+
+The preflight requires all five environment secrets:
+`OBJECT_STORE_ENDPOINT`, `OBJECT_STORE_BUCKET`,
+`OBJECT_STORE_ACCESS_KEY_ID`, `OBJECT_STORE_SECRET_ACCESS_KEY`, and
+`OBJECT_STORE_REGION`. It rejects non-HTTPS endpoints before creating a
+client, installs the pinned `boto3==1.40.0` and `botocore==1.40.0` client, and
+uses short connect/read timeouts with bounded retries.
+
+After validation, the client performs only `HeadBucket` and one bounded
+`ListObjectsV2` request (`MaxKeys=1`). It does not upload, delete, copy,
+start multipart work, or read object bodies. The workflow prints only the
+bucket name, endpoint host, and operation results; credentials, provider
+request/resource identifiers, and object contents are never written to the
+log. A successful preflight proves that the configured credentials can reach
+the selected bucket, but does not publish a runtime or verify publication
+permissions.
+
 ## Workflow integration
 
 The explicit publish step belongs in the `publish-runtime-slim` job, after it
