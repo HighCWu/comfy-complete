@@ -245,6 +245,19 @@ class RuntimeMaterializerTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(generation.stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE((generation / "app").stat().st_mode), 0o755)
 
+    def test_reuse_tolerates_runtime_created_pycache(self) -> None:
+        archive, manifest, _ = self._valid_inputs()
+        first = materializer.materialize_runtime(archive, manifest, self.volume)
+        generation = self.volume / "runtimes" / str(first["runtime_digest"])[len("sha256:") :]
+        pycache = generation / "app/comfyui/__pycache__"
+        pycache.mkdir()
+        (pycache / "main.cpython-312.pyc").write_bytes(b"trusted-cache")
+
+        second = materializer.materialize_runtime(archive, manifest, self.volume)
+
+        self.assertEqual(second["status"], "reused")
+        self.assertTrue((pycache / "main.cpython-312.pyc").is_file())
+
     def test_rejects_a_nontraversable_volume_root(self) -> None:
         self.volume.mkdir(mode=0o700)
         archive, manifest, _ = self._valid_inputs()

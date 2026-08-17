@@ -15,23 +15,33 @@ jobs:
     environment: runtime-publication
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions: {}
+    permissions:
+      contents: read
     steps:
+      - name: Check out reviewed publisher requirements
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install pinned read-only S3 client
+      - name: Install hash-locked read-only S3 client
         run: |
           set -euo pipefail
-          python -m pip install \
+          PREFLIGHT_VENV="$RUNNER_TEMP/runtime-publication-preflight-venv"
+          python -m venv "$PREFLIGHT_VENV"
+          "$PREFLIGHT_VENV/bin/python" -m pip install \
             --disable-pip-version-check \
             --no-input \
             --no-cache-dir \
+            --require-hashes \
             --only-binary=:all: \
-            'boto3==1.40.0' \
-            'botocore==1.40.0'
+            --no-deps \
+            --requirement scripts/runtime-publisher-requirements.txt
 
       - name: Validate credentials with read-only bucket probes
         env:
@@ -45,7 +55,7 @@ jobs:
           OBJECT_STORE_REGION: ${{ secrets.OBJECT_STORE_REGION }}
         run: |
           set -euo pipefail
-          python - <<'PY'
+          "$RUNNER_TEMP/runtime-publication-preflight-venv/bin/python" - <<'PY'
           from __future__ import annotations
 
           import logging

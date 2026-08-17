@@ -39,8 +39,15 @@ Secrets are passed directly to boto3 and are never printed.
 The credential needs object read and write access to the selected bucket:
 publishing uses HEAD as well as multipart/PUT operations, but does not require
 bucket-administration permission. The workflow creates an isolated Python
-virtual environment and installs the reviewed `boto3==1.40.0` client only in
-the explicitly enabled publication step.
+virtual environment in a dependency-only step. It installs the complete
+publisher dependency closure from
+[`scripts/runtime-publisher-requirements.txt`](../scripts/runtime-publisher-requirements.txt)
+with `--require-hashes --only-binary=:all:`. The file pins and hashes
+`boto3`, `botocore`, `s3transfer`, `jmespath`, `python-dateutil`, `six`, and
+`urllib3`; no dependency is resolved from an unpinned requirement or a source
+distribution. The step has no object-store environment. The following
+explicitly enabled step receives the object-store secrets and runs only the
+already-installed local `scripts/publish_runtime.py` entry point.
 
 When all four required values are absent, the command exits quickly and
 successfully with `status=skipped`, without opening the potentially very large
@@ -89,9 +96,11 @@ the repository environment should independently allow deployments from the
 The preflight requires all five environment secrets:
 `OBJECT_STORE_ENDPOINT`, `OBJECT_STORE_BUCKET`,
 `OBJECT_STORE_ACCESS_KEY_ID`, `OBJECT_STORE_SECRET_ACCESS_KEY`, and
-`OBJECT_STORE_REGION`. It rejects non-HTTPS endpoints before creating a
-client, installs the pinned `boto3==1.40.0` and `botocore==1.40.0` client, and
-uses short connect/read timeouts with bounded retries.
+`OBJECT_STORE_REGION`. It checks out the reviewed dependency lock, creates an
+isolated environment, and installs the same complete hash-locked, wheel-only
+publisher dependency closure before any secret-bearing probe step. It rejects
+non-HTTPS endpoints before creating a client and uses short connect/read
+timeouts with bounded retries.
 
 After validation, the client performs only `HeadBucket` and one bounded
 `ListObjectsV2` request (`MaxKeys=1`). It does not upload, delete, copy,
@@ -118,20 +127,13 @@ The smoke test runs the image read-only with a shell entrypoint,
 `--network none`, dropped capabilities, and a bounded `/tmp`; it does not
 start the launcher, contact RunPod, or request a GPU.
 
-The materialized-runtime smoke writes its critical-probe evidence to a
-runner-owned bind mount. It therefore runs that container as the runner's
-`$(id -u):$(id -g)` UID/GID: with `--cap-drop ALL`, container UID 0 cannot
-bypass the bind mount's host mode bits. The workflow keeps the source
-directory owner-only writable and does not rely on `chmod 0777`, host
-`chown`, or a capability exception.
-
-The smoke's writable tmpfs contract is explicit as well: `/tmp` is mounted
-runner-owned with mode `1777` for ordinary temporary files, while `/opt` and
-`/app` are runner-owned with mode `0755`. The launcher needs those latter two
-mount points to create its atomic compatibility links and ComfyUI projection;
-without explicit `uid`, `gid`, and `mode` options Docker leaves them
-root-owned, which fails under the required runner UID/GID and dropped
-capabilities.
+The materialized-runtime smoke runs with the image's normal root identity and
+a root-owned simulated Network Volume, matching the product launcher. The
+container root filesystem remains read-only and capabilities are dropped, but
+the runtime mount is writable. The smoke explicitly creates Python bytecode in
+the projected ComfyUI source tree and checks that it lands in the shared
+runtime generation. `/opt` and `/app` remain writable tmpfs mount points for
+the launcher's compatibility links and the container-local `models/` view.
 
 The job pushes the immutable slim launcher image first, then invokes the
 publisher, and only then removes the runner-local archive. This means a
@@ -151,12 +153,17 @@ The publisher step runs only when `github.event_name` is
 `..`. Ordinary pushes to `main` skip both the validation and publisher steps, receive no
 `OBJECT_STORE_*` secrets, and make no object-store writes.
 
-The enabled step passes these GitHub secrets as environment variables:
+The dependency-install and archive-discovery step has no object-store secrets.
+The enabled publisher step passes these GitHub secrets as environment variables:
 `OBJECT_STORE_ENDPOINT`, `OBJECT_STORE_BUCKET`,
 `OBJECT_STORE_ACCESS_KEY_ID`, `OBJECT_STORE_SECRET_ACCESS_KEY`, with optional
 `OBJECT_STORE_REGION` and `OBJECT_STORE_PREFIX`. It invokes
-`scripts/publish_runtime.py --require-config`, so an enabled release fails
-closed if the configuration is absent or partial.
+only the already-installed `scripts/publish_runtime.py --require-config`
+entry point, so an enabled release fails closed if the configuration is absent
+or partial. Result validation and summary formatting run afterward in a
+separate step with no object-store environment. This separation ensures no
+`pip install`, dependency resolver, archive discovery, or result parser can
+inherit publication credentials.
 
 The command's JSON output is saved as the small
 `runtime-publisher.json` metadata file and copied into the GitHub step

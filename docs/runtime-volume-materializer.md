@@ -11,7 +11,7 @@ The materializer owns this layout below the supplied volume root:
 <volume-root>/runtimes/
 ├── .materialize.lock
 ├── .staging/                       # private (0700), removed after failed attempts
-├── <runtime-tree-sha256-hex>/       # immutable published generation (0755)
+├── <runtime-tree-sha256-hex>/       # verified base generation (0755)
 │   ├── <manifest file-tree>
 │   ├── manifest.json                # exact input bytes (0644)
 │   └── READY.json                   # runtime_ready.py contract (0644)
@@ -31,6 +31,12 @@ Modes of files, symlinks, and directories present in the runtime manifest are
 never broadened or rewritten. The provider-supplied volume root is not chmod'd;
 it must already grant the runtime UID read and traverse access (a permissive
 `0777` mount is accepted).
+
+Product Pods mount the trusted runtime cache read-write. The curated ComfyUI
+and custom-node bundle may create ordinary interpreter caches or other benign
+runtime-local files. User inputs, outputs, temporary assets, and user settings
+still use the disposable per-instance tree; the writable runtime cache is not
+used as user-data storage or as a tenant isolation boundary.
 
 This is only the offline local `archive -> mounted volume` materialization
 step. It is not an R2 downloader, a control-plane worker, or a RunPod
@@ -72,8 +78,11 @@ the next invocation fully verifies that generation, repairs its materializer
 owned directory modes, and only then exposes it through `current`.
 
 If the same runtime digest already exists, the helper does not re-extract it.
-It first performs the same full manifest/READY/tree verification and requires
-the exact manifest bytes to match; only a verified generation can be reused.
+It requires the exact manifest and READY bytes and re-verifies every
+manifest-owned entry. Additional runtime-created files such as `__pycache__`
+are tolerated on this reuse path because product Pods use the curated shared
+runtime as a trusted writable cache. Initial extraction remains strict and
+rejects every unmanifested archive or staging entry.
 
 ## Output contract
 
