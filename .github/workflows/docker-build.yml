@@ -1359,7 +1359,11 @@ jobs:
           # Product Pods permit the curated Python runtime to create bytecode
           # in the shared generation. Compile a source in the runtime tree and
           # prove the cache resolves into the simulated Network Volume.
-          source = Path("/app/comfyui/comfy/__init__.py")
+          # `comfy` is a namespace-style package and intentionally has no
+          # `__init__.py`. Use the launch-critical ComfyUI entrypoint so this
+          # smoke proves bytecode writes land in the mounted runtime without
+          # assuming a package marker that upstream does not provide.
+          source = Path("/app/comfyui/main.py")
           if not source.is_file():
               raise SystemExit(f"runtime bytecode smoke source is missing: {source}")
           py_compile.compile(str(source), doraise=True)
