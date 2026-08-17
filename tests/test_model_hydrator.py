@@ -36,10 +36,14 @@ class FakeResponse(io.BytesIO):
 
 def manifest(payload: bytes) -> dict[str, object]:
     sha256 = hashlib.sha256(payload).hexdigest()
-    path = f"shared/models/objects/{sha256[:2]}/{sha256}/artifact"
+    folder = "LLM/Qwen-VL"
+    filename = "nested/model.safetensors"
+    path = f"models/{folder}/{filename}"
     return {
         "sha256": sha256,
         "size_bytes": len(payload),
+        "folder": folder,
+        "filename": filename,
         "artifact_path": path,
         "marker_path": path + ".manifest.json",
         "reserve_bytes": 0,
@@ -63,12 +67,14 @@ class ModelHydratorTests(unittest.TestCase):
             with self.assertRaisesRegex(module.HydrationError, "configured together"):
                 module.integration_configured()
 
-    def test_rejects_path_not_bound_to_hash(self) -> None:
+    def test_rejects_path_not_bound_to_catalogue(self) -> None:
         value = {
             "sha256": "a" * 64,
             "size_bytes": 10,
-            "artifact_path": "shared/models/objects/bb/" + "b" * 64 + "/artifact",
-            "marker_path": "shared/models/objects/bb/" + "b" * 64 + "/artifact.manifest.json",
+            "folder": "checkpoints",
+            "filename": "model.safetensors",
+            "artifact_path": "models/other/model.safetensors",
+            "marker_path": "models/other/model.safetensors.manifest.json",
             "reserve_bytes": 0,
             "overhead_bps": 0,
             "source": {
@@ -76,7 +82,7 @@ class ModelHydratorTests(unittest.TestCase):
                 "download_url": "https://huggingface.co/owner/repo/resolve/main/model.bin",
             },
         }
-        with self.assertRaisesRegex(module.HydrationError, "metadata is invalid"):
+        with self.assertRaisesRegex(module.HydrationError, "not canonical"):
             module.validate_manifest(value)
 
     def test_publishes_artifact_then_immutable_marker(self) -> None:

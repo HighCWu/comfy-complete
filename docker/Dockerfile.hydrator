@@ -3,7 +3,7 @@ FROM python:3.12-slim
 COPY --chmod=555 docker/hydrator/model_hydrator.py /model_hydrator.py
 
 # RunPod mounts Network Volumes with provider-owned permissions. The hydrator
-# needs to create the content-addressed tree on that mount, so it deliberately
+# needs to create catalogue-defined model paths on that mount, so it deliberately
 # runs as the container root user; it has no shell server, exposed port, or
 # long-lived process and receives only one lease-scoped download assignment.
 WORKDIR /tmp
