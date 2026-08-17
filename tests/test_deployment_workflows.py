@@ -15,6 +15,7 @@ SEED_OBJECT_INFO = REPO_ROOT / ".github" / "workflows" / "seed-object-info.yml"
 RUNTIME_PUBLICATION_PREFLIGHT = (
     REPO_ROOT / ".github" / "workflows" / "runtime-publication-preflight.yml"
 )
+RUNTIME_PUBLISHER_REQUIREMENTS = REPO_ROOT / "scripts" / "runtime-publisher-requirements.txt"
 DOCKER_PULL_RETRY = REPO_ROOT / ".github" / "scripts" / "docker-pull-with-retry.sh"
 CONFIGURE_DOCKER_PULLS = REPO_ROOT / ".github" / "scripts" / "configure-docker-pulls.py"
 
@@ -318,7 +319,7 @@ def test_runtime_object_publisher_is_explicit_dispatch_only_and_secret_gated():
         "github.ref == 'refs/heads/main' && inputs.publish_runtime == true }}"
     )
     publisher = block.split("      - name: Publish verified runtime archive to object store\n", 1)[1]
-    publisher = publisher.split("      - name: Upload runtime publication metadata\n", 1)[0]
+    publisher = publisher.split("      - name: Verify runtime publication result\n", 1)[0]
     assert publisher.count(gate) == 1
     assert "    environment: runtime-publication\n" in block
     assert "Validate runtime publication channel" in block
@@ -345,18 +346,21 @@ def test_runtime_publication_preflight_is_manual_main_only_and_minimal():
     job = parsed["jobs"]["runtime-publication-preflight"]
     assert job["if"] == "${{ github.ref == 'refs/heads/main' }}"
     assert job["environment"] == "runtime-publication"
-    assert job["permissions"] == {}
+    assert job["permissions"] == {"contents": "read"}
     assert job["timeout-minutes"] <= 10
     assert "push:" not in workflow
     assert "pull_request:" not in workflow
     assert "workflow_run:" not in workflow
-    assert "actions/checkout" not in workflow
+    assert "actions/checkout@v7" in workflow
+    assert "persist-credentials: false" in workflow
 
 
 def test_runtime_publication_preflight_requires_pinned_client_and_all_secrets():
     workflow = RUNTIME_PUBLICATION_PREFLIGHT.read_text()
-    for package in ("boto3==1.40.0", "botocore==1.40.0"):
-        assert f"'{package}'" in workflow
+    assert "scripts/runtime-publisher-requirements.txt" in workflow
+    assert "--require-hashes" in workflow
+    assert "--only-binary=:all:" in workflow
+    assert "--no-deps" in workflow
 
     probe = workflow.split("      - name: Validate credentials with read-only bucket probes\n", 1)[1]
     for secret in (
@@ -465,7 +469,9 @@ def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
     assert "--gpus" not in smoke_block
     assert "RUNPOD" not in smoke_block
     assert "runtime-publisher.json" in block
-    assert "'boto3==1.40.0'" in block
+    assert "scripts/runtime-publisher-requirements.txt" in block
+    assert "--require-hashes" in block
+    assert "--only-binary=:all:" in block
     metadata = block.split("actions/upload-artifact@v4", 1)[1].split("Delete the runner-local runtime archive", 1)[0]
     assert ".tar.zst" not in metadata
 
@@ -495,6 +501,8 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
     assert "runtime-materializer.json" in materializer_block
     assert "command -v zstd" in materializer_block
     assert "apt-get install -y --no-install-recommends zstd" in materializer_block
+    assert 'sudo chown 0:0 "$RUNTIME_VOLUME" "$SMOKE_AUDIT"' in materializer_block
+    assert "sudo python3 scripts/materialize_runtime.py" in materializer_block
     assert 'result.get("status") != "materialized"' in materializer_block
     assert 'result.get("current_updated") is not True' in materializer_block
     assert "rm -rf \"$RUNTIME_DIR\"" not in materializer_block
@@ -511,11 +519,10 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
         "--read-only",
         "--cap-drop ALL",
         "--security-opt no-new-privileges",
-        '--user "$(id -u):$(id -g)"',
-        "--tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,uid=$(id -u),gid=$(id -g),mode=1777",
-        "--tmpfs /opt:rw,nosuid,nodev,size=16m,uid=$(id -u),gid=$(id -g),mode=0755",
-        "--tmpfs /app:rw,nosuid,nodev,noexec,size=32m,uid=$(id -u),gid=$(id -g),mode=0755",
-        '--mount type=bind,source="$RUNTIME_VOLUME",destination=/runpod-volume,readonly',
+        "--tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777",
+        "--tmpfs /opt:rw,nosuid,nodev,size=16m,mode=0755",
+        "--tmpfs /app:rw,nosuid,nodev,noexec,size=32m,mode=0755",
+        '--mount type=bind,source="$RUNTIME_VOLUME",destination=/runpod-volume',
         "runtime_launcher",
         "load_verified_manifest",
         "verify_runtime_tree",
@@ -524,9 +531,12 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
         "runtime_critical_probe.py",
         "--profile cpu",
         "aiohttp",
+        "py_compile.compile",
+        "runtime bytecode was not written to the shared generation",
         "/opt/conda/bin/python",
     ):
         assert option in smoke_block
+    assert "PYTHONDONTWRITEBYTECODE" not in smoke_block
     assert "--gpus" not in smoke_block
     assert "start.sh" not in smoke_block
     assert "OBJECT_STORE_" not in smoke_block
@@ -539,8 +549,8 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
         "      - name: Push the immutable slim launcher image\n", 1
     )[0]
     assert "if: ${{ always() }}" in cleanup_block
-    assert 'rm -rf "$RUNTIME_VOLUME"' in cleanup_block
-    assert 'rm -rf "$SMOKE_AUDIT"' in cleanup_block
+    assert 'sudo rm -rf "$RUNTIME_VOLUME"' in cleanup_block
+    assert 'sudo rm -rf "$SMOKE_AUDIT"' in cleanup_block
 
     upload = block.split("actions/upload-artifact@v4", 1)[1].split(
         "Delete the runner-local runtime archive", 1
@@ -562,6 +572,7 @@ def test_runtime_materializer_documentation_is_offline_only_and_mentions_smoke_b
     assert "READY.json" in documentation
     assert "current" in documentation
     assert "zstd" in documentation
+    assert "read-write" in documentation
 
 
 def test_runtime_audit_job_materializes_before_auditing_and_uploads_on_failure():
@@ -729,3 +740,71 @@ def test_runtime_audit_launcher_inventory_is_the_evidence_backed_critical_closur
         "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/Makefile.inc",
         "/app/comfyui/.ce/envs/sam3/.pixi/envs/default/lib/icu/pkgdata.inc",
     ]
+
+
+def test_runtime_publisher_requirements_are_complete_hash_locked_wheels():
+    requirements = [
+        line.strip()
+        for line in RUNTIME_PUBLISHER_REQUIREMENTS.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    expected = {
+        "boto3",
+        "botocore",
+        "jmespath",
+        "python-dateutil",
+        "s3transfer",
+        "six",
+        "urllib3",
+    }
+    assert {line.split("==", 1)[0].lower() for line in requirements} == expected
+    assert len(requirements) == len(expected)
+    for line in requirements:
+        assert "==" in line
+        assert "--hash=sha256:" in line
+
+
+def test_runtime_publisher_secrets_are_isolated_from_install_and_validation_steps():
+    workflow = DOCKER_BUILD.read_text()
+    prepare = workflow.split("- name: Prepare isolated runtime publisher environment\n", 1)[1].split(
+        "- name: Publish verified runtime archive to object store\n", 1
+    )[0]
+    publish = workflow.split("- name: Publish verified runtime archive to object store\n", 1)[1].split(
+        "- name: Verify runtime publication result\n", 1
+    )[0]
+    verify = workflow.split("- name: Verify runtime publication result\n", 1)[1].split(
+        "- name: Upload runtime publication metadata\n", 1
+    )[0]
+
+    assert "OBJECT_STORE_" not in prepare
+    assert "scripts/runtime-publisher-requirements.txt" in prepare
+    assert "--require-hashes" in prepare
+    assert "--only-binary=:all:" in prepare
+    assert "--no-deps" in prepare
+    assert "pip install" in prepare
+    assert "OBJECT_STORE_" in publish
+    assert publish.count("scripts/publish_runtime.py") == 1
+    assert "pip install" not in publish
+    assert "python3 -" not in publish
+    assert "find " not in publish
+    assert "OBJECT_STORE_" not in verify
+    assert "scripts/publish_runtime.py" not in verify
+    assert "steps.runtime-publisher-prepare.outputs.result" in verify
+
+
+def test_runtime_publication_preflight_uses_the_same_secret_free_dependency_install():
+    workflow = RUNTIME_PUBLICATION_PREFLIGHT.read_text()
+    install = workflow.split("- name: Install hash-locked read-only S3 client\n", 1)[1].split(
+        "- name: Validate credentials with read-only bucket probes\n", 1
+    )[0]
+    probe = workflow.split("- name: Validate credentials with read-only bucket probes\n", 1)[1]
+
+    assert "actions/checkout@v7" in workflow
+    assert "persist-credentials: false" in workflow
+    assert "scripts/runtime-publisher-requirements.txt" in install
+    assert "--require-hashes" in install
+    assert "--only-binary=:all:" in install
+    assert "--no-deps" in install
+    assert "OBJECT_STORE_" not in install
+    assert "OBJECT_STORE_ENDPOINT: ${{ secrets.OBJECT_STORE_ENDPOINT }}" in probe
+    assert "pip install" not in probe

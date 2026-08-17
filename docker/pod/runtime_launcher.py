@@ -148,7 +148,7 @@ def install_compatibility_link(link: Path, target: Path) -> None:
 
 
 def install_comfy_projection(link: Path, runtime_comfy: Path) -> None:
-    """Create a local ComfyUI view without making shared model paths writable."""
+    """Keep instance model links local while source writes reach shared runtime."""
 
     try:
         runtime_target = runtime_comfy.resolve(strict=True)

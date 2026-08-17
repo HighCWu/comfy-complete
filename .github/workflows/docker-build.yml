@@ -1216,8 +1216,9 @@ jobs:
           RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
           RUNTIME_VOLUME="$RUNTIME_DIR/.runtime-volume"
           SMOKE_AUDIT="$RUNTIME_DIR/.runtime-volume-smoke"
-          rm -rf "$RUNTIME_VOLUME" "$SMOKE_AUDIT"
+          sudo rm -rf "$RUNTIME_VOLUME" "$SMOKE_AUDIT"
           mkdir -p "$RUNTIME_VOLUME" "$SMOKE_AUDIT"
+          sudo chown 0:0 "$RUNTIME_VOLUME" "$SMOKE_AUDIT"
           if ! command -v zstd >/dev/null 2>&1; then
             sudo apt-get update
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends zstd
@@ -1225,7 +1226,7 @@ jobs:
           fi
           ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
           test -n "$ARCHIVE"
-          python3 scripts/materialize_runtime.py \
+          sudo python3 scripts/materialize_runtime.py \
             --archive "$ARCHIVE" \
             --manifest "$RUNTIME_DIR/manifest.json" \
             --volume-root "$RUNTIME_VOLUME" \
@@ -1262,13 +1263,9 @@ jobs:
           test -L "$CURRENT"
           test -f "$CURRENT/manifest.json"
           test -f "$CURRENT/READY.json"
-          # SMOKE_AUDIT is a runner-owned bind mount.  With every capability
-          # dropped, container UID 0 cannot bypass its host mode bits; match
-          # the runner UID/GID instead of weakening the host directory.
-          # Keep every writable tmpfs explicitly owned by the runner. The
-          # launcher creates atomic links/projections below /opt and /app;
-          # Docker otherwise mounts those paths root-owned even when the
-          # container runs as the runner UID/GID.
+          # The smoke keeps its root filesystem read-only while mounting the
+          # simulated Network Volume read-write, matching the trusted runtime
+          # cache used by product Pods.
           docker run --rm \
             -i \
             --network none \
@@ -1276,11 +1273,10 @@ jobs:
             --pids-limit 256 \
             --cap-drop ALL \
             --security-opt no-new-privileges \
-            --user "$(id -u):$(id -g)" \
-            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,uid=$(id -u),gid=$(id -g),mode=1777 \
-            --tmpfs /opt:rw,nosuid,nodev,size=16m,uid=$(id -u),gid=$(id -g),mode=0755 \
-            --tmpfs /app:rw,nosuid,nodev,noexec,size=32m,uid=$(id -u),gid=$(id -g),mode=0755 \
-            --mount type=bind,source="$RUNTIME_VOLUME",destination=/runpod-volume,readonly \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777 \
+            --tmpfs /opt:rw,nosuid,nodev,size=16m,mode=0755 \
+            --tmpfs /app:rw,nosuid,nodev,noexec,size=32m,mode=0755 \
+            --mount type=bind,source="$RUNTIME_VOLUME",destination=/runpod-volume \
             --mount type=bind,source="$SMOKE_AUDIT",destination=/audit \
             -v "$PWD/scripts/runtime_critical_probe.py:/runtime-audit/runtime_critical_probe.py:ro" \
             -v "$PWD/scripts/runtime_portability_audit.py:/runtime-audit/runtime_portability_audit.py:ro" \
@@ -1295,7 +1291,6 @@ jobs:
             -e XDG_DATA_HOME=/tmp/xdg-data \
             -e TMPDIR=/tmp \
             -e PYTHONNOUSERSITE=1 \
-            -e PYTHONDONTWRITEBYTECODE=1 \
             -e PYTHONPATH= \
             --entrypoint /bin/sh \
             "$IMAGE" \
@@ -1343,6 +1338,7 @@ jobs:
           import aiohttp
           import importlib.util
           from pathlib import Path
+          import py_compile
           import sys
 
           conda_root = Path("/opt/conda").resolve(strict=True)
@@ -1359,6 +1355,21 @@ jobs:
           spec.loader.exec_module(gateway)
           if gateway.ClientSession is not aiohttp.ClientSession:
               raise SystemExit("gateway did not bind the projected aiohttp ClientSession")
+
+          # Product Pods permit the curated Python runtime to create bytecode
+          # in the shared generation. Compile a source below a projected
+          # directory and prove the cache resolves through that directory link
+          # into the simulated Network Volume, not into instance-local state.
+          source = Path("/app/comfyui/comfy/__init__.py")
+          if not source.is_file():
+              raise SystemExit(f"runtime bytecode smoke source is missing: {source}")
+          py_compile.compile(str(source), doraise=True)
+          bytecode = Path(importlib.util.cache_from_source(str(source)))
+          runtime_root = Path("/runpod-volume/runtimes/current").resolve(strict=True)
+          try:
+              bytecode.resolve(strict=True).relative_to(runtime_root)
+          except (OSError, ValueError) as error:
+              raise SystemExit(f"runtime bytecode was not written to the shared generation: {bytecode}") from error
           PY
 
           /opt/conda/bin/python /runtime-audit/runtime_critical_probe.py \
@@ -1417,8 +1428,8 @@ jobs:
           set -euo pipefail
           RUNTIME_VOLUME="${{ steps.runtime-materializer.outputs.runtime_volume }}"
           SMOKE_AUDIT="${{ steps.runtime-materializer.outputs.smoke_audit }}"
-          if [ -n "$RUNTIME_VOLUME" ]; then rm -rf "$RUNTIME_VOLUME"; fi
-          if [ -n "$SMOKE_AUDIT" ]; then rm -rf "$SMOKE_AUDIT"; fi
+          if [ -n "$RUNTIME_VOLUME" ]; then sudo rm -rf "$RUNTIME_VOLUME"; fi
+          if [ -n "$SMOKE_AUDIT" ]; then sudo rm -rf "$SMOKE_AUDIT"; fi
 
       - name: Push the immutable slim launcher image
         run: docker push "${{ steps.identity.outputs.slim_image }}"
@@ -1439,6 +1450,29 @@ jobs:
           fi
           printf 'channel=%s\n' "$RUNTIME_CHANNEL" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare isolated runtime publisher environment
+        id: runtime-publisher-prepare
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish_runtime == true }}
+        run: |
+          set -euo pipefail
+          PUBLISH_VENV="$RUNNER_TEMP/runtime-publisher-venv"
+          python3 -m venv "$PUBLISH_VENV"
+          "$PUBLISH_VENV/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            --no-cache-dir \
+            --require-hashes \
+            --only-binary=:all: \
+            --no-deps \
+            --requirement scripts/runtime-publisher-requirements.txt
+          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
+          ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
+          test -n "$ARCHIVE"
+          printf 'venv=%s\n' "$PUBLISH_VENV" >> "$GITHUB_OUTPUT"
+          printf 'archive=%s\n' "$ARCHIVE" >> "$GITHUB_OUTPUT"
+          printf 'manifest=%s/manifest.json\n' "$RUNTIME_DIR" >> "$GITHUB_OUTPUT"
+          printf 'result=%s/runtime-publisher.json\n' "$RUNTIME_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Publish verified runtime archive to object store
         id: runtime-publisher
         if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish_runtime == true }}
@@ -1452,23 +1486,18 @@ jobs:
           RUNTIME_CHANNEL: ${{ steps.runtime-publication-inputs.outputs.channel }}
         run: |
           set -euo pipefail
-          PUBLISH_VENV="$RUNNER_TEMP/runtime-publisher-venv"
-          python3 -m venv "$PUBLISH_VENV"
-          "$PUBLISH_VENV/bin/python" -m pip install \
-            --disable-pip-version-check \
-            --no-input \
-            'boto3==1.40.0'
-          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
-          ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
-          test -n "$ARCHIVE"
-          PUBLISH_RESULT="$RUNTIME_DIR/runtime-publisher.json"
-          "$PUBLISH_VENV/bin/python" scripts/publish_runtime.py \
-            --archive "$ARCHIVE" \
-            --manifest "$RUNTIME_DIR/manifest.json" \
+          "${{ steps.runtime-publisher-prepare.outputs.venv }}/bin/python" scripts/publish_runtime.py \
+            --archive "${{ steps.runtime-publisher-prepare.outputs.archive }}" \
+            --manifest "${{ steps.runtime-publisher-prepare.outputs.manifest }}" \
             --channel "$RUNTIME_CHANNEL" \
             --require-config \
-            > "$PUBLISH_RESULT"
-          python3 - "$PUBLISH_RESULT" "$GITHUB_STEP_SUMMARY" <<'PY'
+            > "${{ steps.runtime-publisher-prepare.outputs.result }}"
+
+      - name: Verify runtime publication result
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish_runtime == true }}
+        run: |
+          set -euo pipefail
+          python3 - "${{ steps.runtime-publisher-prepare.outputs.result }}" "$GITHUB_STEP_SUMMARY" <<'PY'
           from __future__ import annotations
 
           import json
@@ -1487,7 +1516,7 @@ jobs:
                   + "\n```\n"
               )
           PY
-          cat "$PUBLISH_RESULT"
+          cat "${{ steps.runtime-publisher-prepare.outputs.result }}"
 
       - name: Upload runtime publication metadata
         if: ${{ always() }}

@@ -43,9 +43,9 @@ if [[ ! "${instance_id}" =~ ^inst_[A-Za-z0-9]+$ ]]; then
     instance_id="default"
 fi
 
-# Establish the disposable write boundary before importing torch for the GPU
-# preflight. The verified Python environment and ComfyUI sources may be backed
-# by a shared Network Volume even though all process-local caches belong here.
+# Establish the disposable per-instance data boundary before importing torch
+# for the GPU preflight. The curated runtime itself remains writable on the
+# shared Network Volume; only user input/output/state is kept instance-local.
 instance_root="/tmp/comfy-runtime/${instance_id}"
 echo "comfy-pod: disposable instance runtime at ${instance_root}"
 mkdir -p \
@@ -59,7 +59,6 @@ mkdir -p \
     "${instance_root}/cache/matplotlib" \
     "${instance_root}/cache/numba" \
     "${instance_root}/cache/pip" \
-    "${instance_root}/cache/pycache" \
     "${instance_root}/cache/torch" \
     "${instance_root}/cache/transparent-background" \
     "${instance_root}/cache/triton" \
@@ -67,10 +66,6 @@ mkdir -p \
     "${instance_root}/xdg/cache" \
     "${instance_root}/xdg/config" \
     "${instance_root}/xdg/data"
-# Keep interpreter bytecode and common library/model caches off the shared
-# runtime so one Pod cannot dirty the verified tree used by another.
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPYCACHEPREFIX="${instance_root}/cache/pycache"
 export HOME="${instance_root}/home"
 export TMPDIR="${instance_root}/temp"
 export TMP="${instance_root}/temp"
@@ -120,9 +115,8 @@ comfy_args=(
 # disposable container disk and are mirrored externally where persistence is
 # required. The mounted Network Volume is reserved for managed shared caches.
 # Keep ComfyUI-Manager state on the disposable per-instance filesystem.  The
-# runtime tree on the shared Network Volume is immutable and may be mounted by
-# multiple Pods concurrently; writing its default config here would create a
-# cross-instance race (and could invalidate the published runtime cache).
+# ComfyUI-Manager state is instance-specific even though the curated runtime
+# itself is trusted and writable on the shared Network Volume.
 export COMFYUI_MANAGER_CONFIG="${instance_root}/user/default/ComfyUI-Manager/config.ini"
 comfy-manager-set-mode offline || \
     echo "comfy-pod: could not set ComfyUI-Manager network_mode" >&2

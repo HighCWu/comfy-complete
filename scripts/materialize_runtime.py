@@ -643,8 +643,13 @@ def _verify_symlink_inside(root: Path, path: Path, allowed: set[str]) -> None:
         raise _error("verification_symlink", "runtime symlink target is not in the runtime tree")
 
 
-def _verify_tree(root: Path, manifest: RuntimeManifest) -> None:
-    """Complete filesystem verification, including unlisted extra entries."""
+def _verify_tree(
+    root: Path,
+    manifest: RuntimeManifest,
+    *,
+    allow_unmanifested: bool = False,
+) -> None:
+    """Verify all published entries and optionally tolerate runtime-created files."""
 
     if not _is_real_directory(root):
         raise _error("verification_root")
@@ -657,7 +662,9 @@ def _verify_tree(root: Path, manifest: RuntimeManifest) -> None:
             continue
         actual.add(relative)
         if relative not in expected:
-            if relative not in implicit or not stat.S_ISDIR(metadata.st_mode):
+            if not allow_unmanifested and (
+                relative not in implicit or not stat.S_ISDIR(metadata.st_mode)
+            ):
                 raise _error("extra_materialized_entry", "materialized tree contains an unmanifested entry")
 
     if actual & {MANIFEST_NAME, READY_NAME}:
@@ -731,9 +738,15 @@ def _verify_metadata(root: Path, manifest_bytes: bytes, manifest: RuntimeManifes
         raise _error("metadata_ready_mismatch")
 
 
-def _verify_generation(root: Path, manifest_bytes: bytes, manifest: RuntimeManifest) -> None:
+def _verify_generation(
+    root: Path,
+    manifest_bytes: bytes,
+    manifest: RuntimeManifest,
+    *,
+    allow_unmanifested: bool = False,
+) -> None:
     _verify_metadata(root, manifest_bytes, manifest)
-    _verify_tree(root, manifest)
+    _verify_tree(root, manifest, allow_unmanifested=allow_unmanifested)
 
 
 def _seal_published_generation(root: Path, manifest: RuntimeManifest) -> None:
@@ -822,10 +835,19 @@ def _materialize_locked(
     if _lexists(generation):
         if not _is_real_directory(generation):
             raise _error("generation_conflict")
-        _verify_generation(generation, manifest_bytes, manifest)
-        # A previous process may have been interrupted after the immutable
-        # generation rename but before sealing its materializer-owned parent
-        # directories.  Repair that state before exposing it through current.
+        # Product Pods may add trusted runtime-local caches such as
+        # ``__pycache__`` after initial publication. Reuse still verifies every
+        # manifest-owned entry and the exact manifest/READY metadata, but does
+        # not reject additional files created by the curated runtime.
+        _verify_generation(
+            generation,
+            manifest_bytes,
+            manifest,
+            allow_unmanifested=True,
+        )
+        # A previous process may have been interrupted after the generation
+        # rename but before sealing its materializer-owned parent directories.
+        # Repair that state before exposing it through current.
         _seal_published_generation(generation, manifest)
         current_updated = _atomic_update_current(runtime_root, generation_name)
         return {

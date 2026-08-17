@@ -31,13 +31,11 @@ def test_pod_start_does_not_write_manager_state_before_instance_root_exists() ->
     assert instance_root < create_dirs < gpu_preflight < set_mode
 
 
-def test_shared_runtime_cache_writes_are_redirected_to_disposable_state() -> None:
+def test_instance_specific_cache_roots_stay_on_disposable_state() -> None:
     script = START.read_text(encoding="utf-8")
     create_dirs = script.index('"${instance_root}/xdg/data"')
 
     for assignment in (
-        'export PYTHONDONTWRITEBYTECODE=1',
-        'export PYTHONPYCACHEPREFIX="${instance_root}/cache/pycache"',
         'export HOME="${instance_root}/home"',
         'export TMPDIR="${instance_root}/temp"',
         'export XDG_CACHE_HOME="${instance_root}/xdg/cache"',
@@ -52,10 +50,12 @@ def test_shared_runtime_cache_writes_are_redirected_to_disposable_state() -> Non
         assert script.index(assignment) > create_dirs
 
     dockerfile = SLIM_DOCKERFILE.read_text(encoding="utf-8")
-    assert "PYTHONDONTWRITEBYTECODE=1" in dockerfile
+    assert "PYTHONPYCACHEPREFIX" not in script
+    assert "PYTHONDONTWRITEBYTECODE" not in script
+    assert "PYTHONDONTWRITEBYTECODE" not in dockerfile
 
 
-def test_slim_launcher_installs_every_system_tool_used_before_runtime_projection() -> None:
+def test_slim_launcher_installs_every_system_tool_used_before_runtime_linking() -> None:
     dockerfile = SLIM_DOCKERFILE.read_text(encoding="utf-8")
     install = dockerfile[dockerfile.index("apt-get install"):dockerfile.index("rm -rf /var/lib/apt/lists")]
 

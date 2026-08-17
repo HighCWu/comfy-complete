@@ -19,6 +19,14 @@ assert SPEC and SPEC.loader
 launcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launcher)
 
+BOOTSTRAP_SPEC = importlib.util.spec_from_file_location(
+    "pod_model_bootstrap",
+    ROOT / "docker/pod/model_bootstrap.py",
+)
+assert BOOTSTRAP_SPEC and BOOTSTRAP_SPEC.loader
+model_bootstrap = importlib.util.module_from_spec(BOOTSTRAP_SPEC)
+BOOTSTRAP_SPEC.loader.exec_module(model_bootstrap)
+
 
 class RuntimeLauncherTests(unittest.TestCase):
     def fixture(self, root: Path) -> tuple[Path, Path, dict[str, object]]:
@@ -153,11 +161,13 @@ class RuntimeLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(launcher.LauncherError, "real compatibility"):
                 launcher.install_compatibility_link(link, target)
 
-    def test_comfy_projection_keeps_model_folders_local(self) -> None:
+    def test_comfy_projection_keeps_model_folders_local_but_source_writes_shared(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runtime = root / "runtime"
             (runtime / "models/checkpoints").mkdir(parents=True)
+            (runtime / "comfy").mkdir()
+            (runtime / "comfy/__init__.py").write_text("", encoding="utf-8")
             (runtime / "models/checkpoints/bundled.safetensors").write_bytes(b"model")
             (runtime / "main.py").write_text("pass\n", encoding="utf-8")
             projected = root / "app/comfyui"
@@ -170,6 +180,8 @@ class RuntimeLauncherTests(unittest.TestCase):
             self.assertTrue((projected / "models/checkpoints/bundled.safetensors").is_symlink())
             (projected / "models/checkpoints/instance.safetensors").symlink_to(root / "instance-model")
             self.assertFalse((runtime / "models/checkpoints/instance.safetensors").exists())
+            (projected / "comfy/__pycache__").mkdir()
+            self.assertTrue((runtime / "comfy/__pycache__").is_dir())
 
     def test_comfy_projection_is_idempotent_after_container_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -196,6 +208,34 @@ class RuntimeLauncherTests(unittest.TestCase):
 
             with self.assertRaisesRegex(launcher.LauncherError, "existing ComfyUI path"):
                 launcher.install_comfy_projection(projected, runtime)
+
+    def test_multiple_projections_keep_instance_model_links_out_of_shared_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            (runtime / "models/checkpoints").mkdir(parents=True)
+            (runtime / "main.py").write_text("pass\n", encoding="utf-8")
+            item = {"folder": "checkpoints", "filename": "same.safetensors"}
+
+            resolved_targets = []
+            for instance in ("one", "two"):
+                projected = root / instance / "app/comfyui"
+                launcher.install_comfy_projection(projected, runtime)
+                instance_models = root / instance / "models"
+                target = instance_models / "checkpoints/same.safetensors"
+                target.parent.mkdir(parents=True)
+                target.write_bytes(instance.encode("utf-8"))
+                model_bootstrap.publish_comfy_model_links(
+                    projected / "models",
+                    instance_models,
+                    [item],
+                )
+                resolved_targets.append(
+                    (projected / "models/checkpoints/same.safetensors").resolve(strict=True)
+                )
+
+            self.assertNotEqual(resolved_targets[0], resolved_targets[1])
+            self.assertFalse((runtime / "models/checkpoints/same.safetensors").exists())
 
 
 if __name__ == "__main__":
