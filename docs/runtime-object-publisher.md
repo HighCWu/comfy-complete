@@ -131,9 +131,11 @@ The materialized-runtime smoke runs with the image's normal root identity and
 a root-owned simulated Network Volume, matching the product launcher. The
 container root filesystem remains read-only and capabilities are dropped, but
 the runtime mount is writable. The smoke explicitly creates Python bytecode in
-the projected ComfyUI source tree and checks that it lands in the shared
-runtime generation. `/opt` and `/app` remain writable tmpfs mount points for
-the launcher's compatibility links and the container-local `models/` view.
+the shared ComfyUI runtime tree and checks that it lands in the shared runtime
+generation. `/opt` and `/app` remain writable tmpfs mount points for the
+launcher's direct compatibility links. Pod model bootstrap publishes managed
+default-folder symlinks in the shared runtime; their targets are fixed
+content-addressed objects rather than copied model bytes.
 
 The job pushes the immutable slim launcher image first, then invokes the
 publisher, and only then removes the runner-local archive. This means a

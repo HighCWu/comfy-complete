@@ -126,8 +126,8 @@ if [ "${managed_mode}" -eq 1 ]; then
     python -u /pod-model-bootstrap.py \
         --instance-root "${instance_root}" \
         --config "${model_paths_config}" \
-        --comfy-model-root /app/comfyui/models \
-        --shared-volume-root /runpod-volume
+        --shared-volume-root /runpod-volume \
+        --model-object-root /tmp/comfy-model-objects
     python -u /pod-asset-sync.py restore --instance-root "${instance_root}"
 fi
 comfy_args+=(

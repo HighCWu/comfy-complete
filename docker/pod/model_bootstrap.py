@@ -2,8 +2,9 @@
 
 The control plane authenticates this container with the lease-derived Pod
 token and streams private R2 objects without exposing R2 credentials or keys.
-Downloads are resumable, content-verified, and atomically published into the
-instance's managed model directory before ComfyUI starts.
+Downloads are resumable, content-verified, and atomically published into a
+fixed per-Pod object store before ComfyUI starts. Instance model names are
+aliases to those content-addressed objects.
 """
 
 from __future__ import annotations
@@ -23,8 +24,7 @@ from typing import Any
 
 TOKEN_HEADER = "X-Comfy-Pod-Token"
 SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
-SAFE_FOLDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-SAFE_SHARED_PATH = re.compile(r"^shared/models/objects/[a-f0-9]{2}/[a-f0-9]{64}/[A-Za-z0-9._-]+$")
+MODEL_OBJECT_ROOT = Path("/tmp/comfy-model-objects")
 CHUNK_BYTES = 4 * 1024 * 1024
 MANIFEST_WAIT_SECONDS = 300
 
@@ -50,14 +50,36 @@ def required_env(name: str) -> str:
 
 
 def safe_filename(value: str) -> bool:
-    return (
-        bool(value)
-        and len(value) <= 255
-        and value not in {".", ".."}
-        and "/" not in value
-        and "\\" not in value
-        and "\x00" not in value
+    return safe_relative_path(value)
+
+
+def safe_relative_path(value: str) -> bool:
+    """Validate a POSIX relative path without resolving or cleaning it."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 2048
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+        or "\\" in value
+        or "\x00" in value
+    ):
+        return False
+    parts = value.split("/")
+    return all(
+        part and len(part) <= 255 and part not in {".", ".."}
+        for part in parts
     )
+
+
+def canonical_model_relative_path(folder: str, filename: str) -> str:
+    if not safe_relative_path(folder) or not safe_relative_path(filename):
+        raise BootstrapError("model path is unsafe")
+    relative = f"{folder}/{filename}"
+    if len(relative) > 2048:
+        raise BootstrapError("model path is too long")
+    return relative
 
 
 def request(
@@ -119,6 +141,45 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def model_object_path(
+    item: dict[str, object],
+    object_root: Path = MODEL_OBJECT_ROOT,
+) -> Path:
+    """Return the stable per-Pod path for a verified R2 object."""
+    sha256 = str(item["sha256"])
+    return object_root / sha256[:2] / sha256 / "artifact"
+
+
+def link_model_alias(
+    model_root: Path,
+    item: dict[str, object],
+    source: Path,
+) -> None:
+    """Expose one verified object under the instance's ComfyUI model name."""
+    folder = str(item["folder"])
+    filename = str(item["filename"])
+    target_dir = model_root / folder
+    target = target_dir / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    expected = source.absolute()
+    if target.is_symlink():
+        try:
+            if target.resolve(strict=False) == expected.resolve(strict=False):
+                return
+        except OSError:
+            pass
+        raise BootstrapError(f"model alias collision for {folder}/{filename}")
+    if target.exists():
+        raise BootstrapError(f"model alias collision for {folder}/{filename}")
+    temporary = target.with_name(f".{target.name}.model-alias")
+    temporary.unlink(missing_ok=True)
+    try:
+        temporary.symlink_to(expected)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def validate_item(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
         raise BootstrapError("model manifest item is not an object")
@@ -132,7 +193,7 @@ def validate_item(value: object) -> dict[str, object]:
     shared_marker_path = value.get("shared_marker_path")
     if (
         not isinstance(folder, str)
-        or not SAFE_FOLDER.fullmatch(folder)
+        or not safe_relative_path(folder)
         or not isinstance(filename, str)
         or not safe_filename(filename)
         or not isinstance(size_bytes, int)
@@ -143,6 +204,7 @@ def validate_item(value: object) -> dict[str, object]:
         or source not in {"r2", "shared_volume"}
     ):
         raise BootstrapError("model manifest item contains unsafe metadata")
+    expected_shared_path = "models/" + canonical_model_relative_path(folder, filename)
     if source == "r2" and (
         not isinstance(download_path, str)
         or not download_path.startswith("/api/internal/pod-models/artifacts/")
@@ -153,9 +215,8 @@ def validate_item(value: object) -> dict[str, object]:
     if source == "shared_volume" and (
         download_path is not None
         or not isinstance(shared_volume_path, str)
-        or not SAFE_SHARED_PATH.fullmatch(shared_volume_path)
+        or shared_volume_path != expected_shared_path
         or not isinstance(shared_marker_path, str)
-        or not SAFE_SHARED_PATH.fullmatch(shared_marker_path)
         or shared_marker_path != shared_volume_path + ".manifest.json"
     ):
         raise BootstrapError("shared model manifest item contains unsafe metadata")
@@ -176,19 +237,20 @@ def download_model(
     token: str,
     model_root: Path,
     item: dict[str, object],
+    object_root: Path = MODEL_OBJECT_ROOT,
 ) -> None:
     folder = str(item["folder"])
     filename = str(item["filename"])
     expected_size = int(item["size_bytes"])
     expected_sha256 = str(item["sha256"])
-    target_dir = model_root / folder
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / filename
+    target = model_object_path(item, object_root)
+    target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(target.name + ".partial")
 
     if target.exists():
         if target.stat().st_size == expected_size and file_sha256(target) == expected_sha256:
             print(f"comfy-pod: model ready from cache — {folder}/{filename}", flush=True)
+            link_model_alias(model_root, item, target)
             return
         target.unlink()
 
@@ -228,6 +290,7 @@ def download_model(
                 f"({expected_size} bytes)",
                 flush=True,
             )
+            link_model_alias(model_root, item, target)
             return
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as error:
             if attempt == 3:
@@ -254,6 +317,9 @@ def link_shared_model(
     expected_sha256 = str(item["sha256"])
     relative_path = str(item["shared_volume_path"])
     relative_marker = str(item["shared_marker_path"])
+    expected_relative_path = "models/" + canonical_model_relative_path(folder, filename)
+    if relative_path != expected_relative_path:
+        raise BootstrapError(f"shared model path does not match {folder}/{filename}")
     source = (shared_volume_root / relative_path).resolve(strict=True)
     marker = (shared_volume_root / relative_marker).resolve(strict=True)
     shared_root = shared_volume_root.resolve(strict=True)
@@ -274,20 +340,7 @@ def link_shared_model(
     ):
         raise BootstrapError(f"shared model marker does not match {folder}/{filename}")
 
-    target_dir = model_root / folder
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / filename
-    if target.is_symlink() and target.resolve(strict=True) == source:
-        return
-    if target.exists() or target.is_symlink():
-        raise BootstrapError(f"shared model target collision for {folder}/{filename}")
-    temporary = target.with_name(f".{target.name}.shared-model-link")
-    temporary.unlink(missing_ok=True)
-    try:
-        temporary.symlink_to(source)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
+    link_model_alias(model_root, item, source)
     print(f"comfy-pod: shared model ready — {folder}/{filename}", flush=True)
 
 
@@ -307,52 +360,11 @@ def write_extra_model_paths(
     os.replace(temporary, config_path)
 
 
-def publish_comfy_model_links(
-    comfy_model_root: Path,
-    instance_model_root: Path,
-    items: list[dict[str, object]],
-) -> None:
-    """Expose verified instance models through ComfyUI's default folders.
-
-    The instance directory remains the authoritative disposable cache.  These
-    links are container-local compatibility entries: some ComfyUI loaders take
-    their initial filename list from the default model directory even when an
-    equivalent extra search path is configured.
-    """
-    for item in items:
-        folder = str(item["folder"])
-        filename = str(item["filename"])
-        target = (instance_model_root / folder / filename).resolve(strict=True)
-        link_dir = comfy_model_root / folder
-        link_dir.mkdir(parents=True, exist_ok=True)
-        link = link_dir / filename
-        if link.is_symlink():
-            try:
-                if link.resolve(strict=True) == target:
-                    continue
-            except FileNotFoundError:
-                pass
-            raise BootstrapError(
-                f"ComfyUI model link collision for {folder}/{filename}"
-            )
-        if link.exists():
-            raise BootstrapError(
-                f"ComfyUI model path collision for {folder}/{filename}"
-            )
-        temporary = link.with_name(f".{link.name}.model-link")
-        temporary.unlink(missing_ok=True)
-        try:
-            temporary.symlink_to(target)
-            os.replace(temporary, link)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-
 def bootstrap(
     instance_root: Path,
     config_path: Path,
-    comfy_model_root: Path,
     shared_volume_root: Path,
+    model_object_root: Path = MODEL_OBJECT_ROOT,
 ) -> dict[str, int | str]:
     token = required_env("COMFY_POD_TOKEN")
     instance_id = required_env("COMFY_INSTANCE_ID")
@@ -380,13 +392,18 @@ def bootstrap(
         if item["source"] == "shared_volume":
             link_shared_model(shared_volume_root, model_root, item)
         else:
-            download_model(control_plane, token, model_root, item)
+            download_model(
+                control_plane,
+                token,
+                model_root,
+                item,
+                model_object_root,
+            )
     write_extra_model_paths(
         config_path,
         instance_root,
         {str(item["folder"]) for item in items},
     )
-    publish_comfy_model_links(comfy_model_root, model_root, items)
     return {
         "status": str(manifest.get("status", "ready")),
         "item_count": len(items),
@@ -398,8 +415,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--instance-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--comfy-model-root", type=Path, required=True)
     parser.add_argument("--shared-volume-root", type=Path, required=True)
+    parser.add_argument(
+        "--model-object-root",
+        type=Path,
+        default=MODEL_OBJECT_ROOT,
+    )
     args = parser.parse_args()
     if not integration_configured():
         print(
@@ -411,8 +432,8 @@ def main() -> None:
     result = bootstrap(
         args.instance_root,
         args.config,
-        args.comfy_model_root,
         args.shared_volume_root,
+        args.model_object_root,
     )
     print("comfy-pod: model bootstrap complete — " + json.dumps(result), flush=True)
 

@@ -147,62 +147,6 @@ def install_compatibility_link(link: Path, target: Path) -> None:
     os.replace(temporary, link)
 
 
-def install_comfy_projection(link: Path, runtime_comfy: Path) -> None:
-    """Keep instance model links local while source writes reach shared runtime."""
-
-    try:
-        runtime_target = runtime_comfy.resolve(strict=True)
-    except OSError as error:
-        raise LauncherError(f"runtime ComfyUI directory is missing: {runtime_comfy}") from error
-    if not runtime_target.is_dir():
-        raise LauncherError(f"runtime ComfyUI directory is missing: {runtime_comfy}")
-    link.parent.mkdir(parents=True, exist_ok=True)
-    marker = link.parent / f".{link.name}.runtime-projection"
-    if link.is_dir() and not link.is_symlink() and marker.is_file():
-        try:
-            if marker.read_text(encoding="utf-8").strip() == str(runtime_target):
-                return
-        except OSError:
-            pass
-    if link.exists() or link.is_symlink():
-        raise LauncherError(f"refusing to replace an existing ComfyUI path: {link}")
-    temporary = link.with_name(f".{link.name}.runtime-{os.getpid()}")
-    if temporary.exists() or temporary.is_symlink():
-        raise LauncherError(f"temporary ComfyUI projection already exists: {temporary}")
-    marker_temporary = marker.with_name(f"{marker.name}.{os.getpid()}.partial")
-    published = False
-    temporary.mkdir()
-    try:
-        for child in runtime_target.iterdir():
-            destination = temporary / child.name
-            if child.name != "models" or not child.is_dir():
-                destination.symlink_to(child)
-                continue
-            destination.mkdir()
-            for model_folder in child.iterdir():
-                projected_folder = destination / model_folder.name
-                if not model_folder.is_dir():
-                    projected_folder.symlink_to(model_folder)
-                    continue
-                projected_folder.mkdir()
-                for packaged_model in model_folder.iterdir():
-                    (projected_folder / packaged_model.name).symlink_to(packaged_model)
-        os.replace(temporary, link)
-        published = True
-        marker_temporary.write_text(str(runtime_target) + "\n", encoding="utf-8")
-        os.replace(marker_temporary, marker)
-    except Exception:
-        marker_temporary.unlink(missing_ok=True)
-        cleanup_root = link if published else temporary
-        for path in sorted(cleanup_root.glob("**/*"), key=lambda item: len(item.parts), reverse=True):
-            if path.is_symlink() or path.is_file():
-                path.unlink(missing_ok=True)
-            elif path.is_dir():
-                path.rmdir()
-        cleanup_root.rmdir()
-        raise
-
-
 def launch() -> NoReturn:
     configured_root = Path(os.environ.get("COMFY_RUNTIME_ROOT", "/runpod-volume/runtimes/current"))
     try:
@@ -229,7 +173,7 @@ def launch() -> NoReturn:
     )
     verify_runtime_tree(runtime_root, manifest)
     install_compatibility_link(Path("/opt/conda"), runtime_root / "opt/conda")
-    install_comfy_projection(Path("/app/comfyui"), runtime_root / "app/comfyui")
+    install_compatibility_link(Path("/app/comfyui"), runtime_root / "app/comfyui")
     install_compatibility_link(Path("/comfyui"), Path("/app/comfyui"))
     os.environ["PATH"] = "/opt/conda/bin:" + os.environ.get("PATH", "")
     os.chdir("/app/comfyui")

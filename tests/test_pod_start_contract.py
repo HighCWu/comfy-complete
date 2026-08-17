@@ -87,3 +87,10 @@ def test_pod_start_has_explicit_gateway_and_standalone_serving_modes() -> None:
     assert "requires COMFY_POD_TOKEN" in script
     assert "COMFY_CONTROL_PLANE_URL and COMFY_INSTANCE_ID must be configured together" in script
     assert "no control-plane lease fields; running gateway-only" in script
+
+
+def test_pod_model_objects_use_a_fixed_container_local_root() -> None:
+    script = START.read_text(encoding="utf-8")
+
+    assert "--model-object-root /tmp/comfy-model-objects" in script
+    assert "instance_root=\"/tmp/comfy-runtime/${instance_id}\"" in script

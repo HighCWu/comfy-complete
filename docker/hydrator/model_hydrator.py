@@ -22,9 +22,6 @@ from typing import Any
 
 TOKEN_HEADER = "X-Comfy-Hydration-Token"
 SHA256_HEX = re.compile(r"^[a-f0-9]{64}$")
-SAFE_ARTIFACT_PATH = re.compile(
-    r"^shared/models/objects/[a-f0-9]{2}/[a-f0-9]{64}/artifact$"
-)
 CHUNK_BYTES = 8 * 1024 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_ERROR_BYTES = 2 * 1024
@@ -69,6 +66,33 @@ class HydrationError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def safe_relative_path(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 2048
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+        or "\\" in value
+        or "\x00" in value
+    ):
+        return False
+    return all(
+        part and len(part) <= 255 and part not in {".", ".."}
+        for part in value.split("/")
+    )
+
+
+def canonical_model_relative_path(folder: object, filename: object) -> str:
+    if not safe_relative_path(folder) or not safe_relative_path(filename):
+        raise HydrationError("manifest_invalid", "model path is invalid")
+    relative = f"{folder}/{filename}"
+    if len(relative) > 2048:
+        raise HydrationError("manifest_invalid", "model path is too long")
+    return relative
 
 
 def required_env(name: str) -> str:
@@ -148,6 +172,8 @@ def load_manifest(control_plane: str, hydration_id: str, token: str) -> dict[str
 def validate_manifest(value: dict[str, Any]) -> dict[str, object]:
     sha256 = value.get("sha256")
     size_bytes = value.get("size_bytes")
+    folder = value.get("folder")
+    filename = value.get("filename")
     artifact_path = value.get("artifact_path")
     marker_path = value.get("marker_path")
     reserve_bytes = value.get("reserve_bytes")
@@ -160,9 +186,8 @@ def validate_manifest(value: dict[str, Any]) -> dict[str, object]:
         or isinstance(size_bytes, bool)
         or size_bytes <= 0
         or not isinstance(artifact_path, str)
-        or not SAFE_ARTIFACT_PATH.fullmatch(artifact_path)
-        or artifact_path.split("/")[3] != sha256[:2]
-        or artifact_path.split("/")[4] != sha256
+        or not isinstance(folder, str)
+        or not isinstance(filename, str)
         or marker_path != artifact_path + ".manifest.json"
         or not isinstance(reserve_bytes, int)
         or isinstance(reserve_bytes, bool)
@@ -173,6 +198,9 @@ def validate_manifest(value: dict[str, Any]) -> dict[str, object]:
         or not isinstance(source, dict)
     ):
         raise HydrationError("manifest_invalid", "hydration manifest metadata is invalid")
+    expected_artifact_path = "models/" + canonical_model_relative_path(folder, filename)
+    if artifact_path != expected_artifact_path:
+        raise HydrationError("manifest_invalid", "hydration artifact path is not canonical")
     kind = source.get("kind")
     download_url = source.get("download_url")
     if kind not in {"huggingface", "r2"} or not isinstance(download_url, str):
@@ -188,6 +216,8 @@ def validate_manifest(value: dict[str, Any]) -> dict[str, object]:
     return {
         "sha256": sha256,
         "size_bytes": size_bytes,
+        "folder": folder,
+        "filename": filename,
         "artifact_path": artifact_path,
         "marker_path": marker_path,
         "reserve_bytes": reserve_bytes,
@@ -321,8 +351,8 @@ def hydrate(
             f"volume has {before['free_bytes']} free bytes; {required_free} required",
         )
 
-    partial = artifact.with_name("artifact.partial")
-    marker_temporary = marker.with_name("artifact.manifest.json.tmp")
+    partial = artifact.with_name(artifact.name + ".partial")
+    marker_temporary = marker.with_name(marker.name + ".tmp")
     marker.unlink(missing_ok=True)
     marker_temporary.unlink(missing_ok=True)
     started = time.monotonic()

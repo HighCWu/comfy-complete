@@ -1324,12 +1324,12 @@ jobs:
           # performs. Do not call launch(): it would enter the GPU supervisor.
           module.verify_runtime_tree(runtime_root, manifest)
           module.install_compatibility_link(Path("/opt/conda"), runtime_root / "opt/conda")
-          module.install_comfy_projection(Path("/app/comfyui"), runtime_root / "app/comfyui")
+          module.install_compatibility_link(Path("/app/comfyui"), runtime_root / "app/comfyui")
           if not Path("/opt/conda").is_symlink():
               raise SystemExit("/opt/conda compatibility link was not installed")
-          projected = Path("/app/comfyui")
-          if not projected.is_dir() or projected.is_symlink():
-              raise SystemExit("ComfyUI runtime projection was not installed")
+          comfyui = Path("/app/comfyui")
+          if not comfyui.is_symlink() or comfyui.resolve(strict=True) != (runtime_root / "app/comfyui").resolve(strict=True):
+              raise SystemExit("/app/comfyui compatibility link was not installed")
           PY
 
           /opt/conda/bin/python - <<'PY'
@@ -1346,7 +1346,7 @@ jobs:
           try:
               aiohttp_file.relative_to(conda_root)
           except ValueError as error:
-              raise SystemExit(f"aiohttp was not imported from projected /opt/conda: {aiohttp_file}") from error
+              raise SystemExit(f"aiohttp was not imported from runtime /opt/conda: {aiohttp_file}") from error
           spec = importlib.util.spec_from_file_location("pod_gateway", "/pod-gateway.py")
           if spec is None or spec.loader is None:
               raise SystemExit("gateway import spec is missing")
@@ -1354,12 +1354,11 @@ jobs:
           sys.modules[spec.name] = gateway
           spec.loader.exec_module(gateway)
           if gateway.ClientSession is not aiohttp.ClientSession:
-              raise SystemExit("gateway did not bind the projected aiohttp ClientSession")
+              raise SystemExit("gateway did not bind the runtime aiohttp ClientSession")
 
           # Product Pods permit the curated Python runtime to create bytecode
-          # in the shared generation. Compile a source below a projected
-          # directory and prove the cache resolves through that directory link
-          # into the simulated Network Volume, not into instance-local state.
+          # in the shared generation. Compile a source in the runtime tree and
+          # prove the cache resolves into the simulated Network Volume.
           source = Path("/app/comfyui/comfy/__init__.py")
           if not source.is_file():
               raise SystemExit(f"runtime bytecode smoke source is missing: {source}")
@@ -1385,10 +1384,10 @@ jobs:
 
           report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           if report.get("probe_profile") != "cpu" or report.get("status") == "blocker":
-              raise SystemExit(f"projected runtime CPU critical probe failed: {report.get('status')}")
+              raise SystemExit(f"runtime CPU critical probe failed: {report.get('status')}")
           aiohttp_results = [item for item in report.get("imports", []) if item.get("module") == "aiohttp"]
           if len(aiohttp_results) != 1 or aiohttp_results[0].get("status") != "pass":
-              raise SystemExit("projected runtime CPU probe did not pass aiohttp")
+              raise SystemExit("runtime CPU probe did not pass aiohttp")
           PY
           SH
           test -s "$SMOKE_AUDIT/critical-probe.json"

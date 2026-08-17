@@ -413,7 +413,7 @@ def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
     slim_metadata_copy = block.index('cp "$RUNNER_TEMP/slim-image.json" "$RUNTIME_DIR/slim-image.json"')
     release = block.index("Release base and exporter images before local volume materialization")
     materialize = block.index("Materialize runtime into a local simulated Network Volume")
-    projected_smoke = block.index("Smoke-test materialized runtime through slim launcher contracts")
+    materialized_smoke = block.index("Smoke-test materialized runtime through slim launcher contracts")
     remove_volume = block.index("Remove local simulated runtime volume after smoke")
     push = block.index("Push the immutable slim launcher image")
     publish = block.index("Publish verified runtime archive to object store")
@@ -431,7 +431,7 @@ def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
         < slim_metadata_copy
         < release
         < materialize
-        < projected_smoke
+        < materialized_smoke
         < remove_volume
         < push
         < publish
@@ -527,7 +527,7 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
         "load_verified_manifest",
         "verify_runtime_tree",
         "install_compatibility_link",
-        "install_comfy_projection",
+        'module.install_compatibility_link(Path("/app/comfyui"), runtime_root / "app/comfyui")',
         "runtime_critical_probe.py",
         "--profile cpu",
         "aiohttp",
