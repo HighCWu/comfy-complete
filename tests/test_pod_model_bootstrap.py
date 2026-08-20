@@ -245,5 +245,25 @@ class PodModelBootstrapTests(unittest.TestCase):
         self.assertEqual(result["total_bytes"], len(payload))
         self.assertEqual(download.call_count, 2)
 
+    def test_rejects_conflicting_sizes_for_one_sha_across_sources(self) -> None:
+        sha256 = "f" * 64
+        with self.assertRaisesRegex(module.BootstrapError, "conflicting sizes"):
+            module.physical_byte_totals([
+                {
+                    "folder": "checkpoints",
+                    "filename": "r2.safetensors",
+                    "size_bytes": 10,
+                    "sha256": sha256,
+                    "source": "r2",
+                },
+                {
+                    "folder": "vae",
+                    "filename": "shared.safetensors",
+                    "size_bytes": 11,
+                    "sha256": sha256,
+                    "source": "shared_volume",
+                },
+            ])
+
 if __name__ == "__main__":
     unittest.main()

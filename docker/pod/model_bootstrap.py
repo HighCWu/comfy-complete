@@ -370,16 +370,18 @@ def physical_byte_totals(items: list[dict[str, object]]) -> tuple[int, int, int]
     """
 
     r2_objects: dict[str, int] = {}
+    all_objects: dict[str, int] = {}
     shared_volume_bytes = 0
     for item in items:
         size_bytes = int(item["size_bytes"])
+        sha256 = str(item["sha256"])
+        known_size = all_objects.get(sha256)
+        if known_size is not None and known_size != size_bytes:
+            raise BootstrapError("model manifest reuses a SHA-256 with conflicting sizes")
+        all_objects[sha256] = size_bytes
         if item["source"] == "shared_volume":
             shared_volume_bytes += size_bytes
             continue
-        sha256 = str(item["sha256"])
-        existing_size = r2_objects.get(sha256)
-        if existing_size is not None and existing_size != size_bytes:
-            raise BootstrapError("model manifest reuses a SHA-256 with conflicting sizes")
         r2_objects[sha256] = size_bytes
     r2_bytes = sum(r2_objects.values())
     return r2_bytes, shared_volume_bytes, r2_bytes + shared_volume_bytes
