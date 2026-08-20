@@ -232,6 +232,10 @@ class RuntimePublisherTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
 
+    def test_manifest_name_rejects_invalid_digest(self) -> None:
+        with self.assertRaisesRegex(publisher.RuntimePublisherError, "invalid digest"):
+            publisher._manifest_name("not-a-sha256")
+
     def test_multipart_success_and_channel_is_last_mutation(self) -> None:
         result = publisher.RuntimePublisher(self.store, self.config, part_size_bytes=5 * MIB).publish(self.item)
         self.assertEqual(result.status, "published")

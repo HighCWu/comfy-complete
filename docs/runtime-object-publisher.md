@@ -8,9 +8,11 @@ The publisher has three object classes:
 
 1. `runtimes/archives/sha256-<archive-sha256>.tar.zst` is the immutable,
    content-addressed archive.
-2. `runtimes/manifests/sha256-<runtime-sha256>-<archive-sha256>.json` is the
-   immutable manifest, preserving the exact local manifest bytes so the
-   `READY.json` manifest hash remains meaningful.
+2. `runtimes/manifests/sha256-<manifest-sha256>.json` is the immutable
+   manifest, addressed by its complete bytes so launcher compatibility and
+   source metadata changes cannot collide even when the runtime tree and
+   archive remain identical. Preserving the exact local bytes also keeps the
+   `READY.json` manifest hash meaningful.
 3. `runtimes/channels/<channel>.json` is the small mutable pointer. It is
    written only after the archive and manifest have passed post-upload HEAD
    checks. A single object PUT is the atomic pointer replacement; old objects
