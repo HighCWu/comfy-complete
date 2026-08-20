@@ -256,14 +256,19 @@ def _read_manifest(path: Path) -> tuple[bytes, RuntimeManifest]:
     return payload, manifest
 
 
-def _manifest_name(manifest: RuntimeManifest) -> str:
-    runtime_digest = manifest["runtime_digest"]
-    archive = manifest["archive"]
-    runtime_hex = runtime_digest.removeprefix("sha256:")
-    archive_sha256 = archive["sha256"]
-    if not SHA256_RE.fullmatch(runtime_hex) or not SHA256_RE.fullmatch(archive_sha256):
+def _manifest_name(manifest_sha256: str) -> str:
+    """Return a key component addressed by the complete manifest bytes.
+
+    Runtime and archive digests intentionally exclude launcher compatibility
+    metadata.  Addressing a manifest by only those two digests would therefore
+    collide when the same runtime archive is published for a new immutable
+    launcher.  The manifest's own digest covers that compatibility contract as
+    well as its source metadata and file tree.
+    """
+
+    if not SHA256_RE.fullmatch(manifest_sha256):
         raise RuntimePublisherError("runtime manifest contains an invalid digest")
-    return f"sha256-{runtime_hex}-{archive_sha256}.json"
+    return f"sha256-{manifest_sha256}.json"
 
 
 def prepare_publish(
@@ -292,8 +297,9 @@ def prepare_publish(
 
     safe_channel = _validate_channel(channel)
     safe_prefix = _validate_prefix(prefix)
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     archive_key = _join_key(safe_prefix, "runtimes", "archives", expected_name)
-    manifest_key = _join_key(safe_prefix, "runtimes", "manifests", _manifest_name(manifest))
+    manifest_key = _join_key(safe_prefix, "runtimes", "manifests", _manifest_name(manifest_sha256))
     channel_key = _join_key(safe_prefix, "runtimes", "channels", f"{safe_channel}.json")
     return PublishInput(
         archive_path=archive_path,
@@ -306,7 +312,7 @@ def prepare_publish(
         manifest_key=manifest_key,
         channel_key=channel_key,
         channel=safe_channel,
-        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        manifest_sha256=manifest_sha256,
     )
 
 
