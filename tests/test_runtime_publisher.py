@@ -267,6 +267,35 @@ class RuntimePublisherTests(unittest.TestCase):
         self.assertFalse(result.channel_updated)
         self.assertFalse(any(call.startswith(("create:", "part:", "complete:", "put:")) for call in self.store.calls))
 
+    def test_launcher_change_reuses_archive_but_publishes_distinct_manifest(self) -> None:
+        self.store.objects[self.item.archive_key] = (
+            self.archive_body,
+            {"sha256": self.item.archive_sha256},
+        )
+        changed_manifest = json.loads(self.manifest_bytes)
+        changed_manifest["compatibility"]["launcher_digest"] = "sha256:" + "f" * 64
+        changed_bytes = json.dumps(changed_manifest, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        changed_path = self.root / "changed-manifest.json"
+        changed_path.write_bytes(changed_bytes)
+        changed_item = publisher.prepare_publish(
+            self.archive,
+            changed_path,
+            prefix="runtime-test",
+            channel="staging",
+        )
+
+        self.assertEqual(changed_item.archive_key, self.item.archive_key)
+        self.assertNotEqual(changed_item.manifest_key, self.item.manifest_key)
+        self.assertTrue(changed_item.manifest_key.endswith(f"sha256-{changed_item.manifest_sha256}.json"))
+
+        result = publisher.RuntimePublisher(self.store, self.config, part_size_bytes=5 * MIB).publish(changed_item)
+
+        self.assertFalse(result.archive_uploaded)
+        self.assertTrue(result.manifest_uploaded)
+        self.assertTrue(result.channel_updated)
+        self.assertFalse(any(call.startswith("create:") for call in self.store.calls))
+        self.assertIn(changed_item.manifest_key, self.store.objects)
+
     def test_existing_archive_with_wrong_metadata_is_rejected(self) -> None:
         self.store.objects[self.item.archive_key] = (self.archive_body, {"sha256": "0" * 64})
         with self.assertRaisesRegex(publisher.RuntimePublisherError, "content-addressed"):
