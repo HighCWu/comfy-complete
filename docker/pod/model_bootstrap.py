@@ -360,6 +360,31 @@ def write_extra_model_paths(
     os.replace(temporary, config_path)
 
 
+def physical_byte_totals(items: list[dict[str, object]]) -> tuple[int, int, int]:
+    """Return Container Disk, shared-volume, and combined physical bytes.
+
+    R2-backed aliases with the same SHA-256 share one verified object under
+    ``MODEL_OBJECT_ROOT``. Shared-volume items are addressed by canonical
+    catalogue path and therefore remain distinct physical files even when
+    their bytes happen to have the same digest.
+    """
+
+    r2_objects: dict[str, int] = {}
+    shared_volume_bytes = 0
+    for item in items:
+        size_bytes = int(item["size_bytes"])
+        if item["source"] == "shared_volume":
+            shared_volume_bytes += size_bytes
+            continue
+        sha256 = str(item["sha256"])
+        existing_size = r2_objects.get(sha256)
+        if existing_size is not None and existing_size != size_bytes:
+            raise BootstrapError("model manifest reuses a SHA-256 with conflicting sizes")
+        r2_objects[sha256] = size_bytes
+    r2_bytes = sum(r2_objects.values())
+    return r2_bytes, shared_volume_bytes, r2_bytes + shared_volume_bytes
+
+
 def bootstrap(
     instance_root: Path,
     config_path: Path,
@@ -381,9 +406,15 @@ def bootstrap(
         raise BootstrapError("model manifest items are missing")
     items = [validate_item(value) for value in raw_items]
     expected_count = manifest.get("item_count")
+    expected_r2 = manifest.get("r2_bytes")
+    expected_shared = manifest.get("shared_volume_bytes")
     expected_total = manifest.get("total_bytes")
-    if expected_count != len(items) or expected_total != sum(
-        int(item["size_bytes"]) for item in items
+    r2_bytes, shared_volume_bytes, total_bytes = physical_byte_totals(items)
+    if (
+        expected_count != len(items)
+        or expected_r2 != r2_bytes
+        or expected_shared != shared_volume_bytes
+        or expected_total != total_bytes
     ):
         raise BootstrapError("model manifest totals do not match its items")
     model_root = instance_root / "models"
@@ -407,7 +438,7 @@ def bootstrap(
     return {
         "status": str(manifest.get("status", "ready")),
         "item_count": len(items),
-        "total_bytes": sum(int(item["size_bytes"]) for item in items),
+        "total_bytes": total_bytes,
     }
 
 

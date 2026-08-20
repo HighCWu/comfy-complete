@@ -105,6 +105,8 @@ class PodModelBootstrapTests(unittest.TestCase):
             "instance_id": "inst_test",
             "status": "ready",
             "item_count": 1,
+            "r2_bytes": 4,
+            "shared_volume_bytes": 0,
             "total_bytes": 4,
             "items": [
                 {
@@ -155,6 +157,8 @@ class PodModelBootstrapTests(unittest.TestCase):
             "instance_id": "inst_test",
             "status": "ready",
             "item_count": 1,
+            "r2_bytes": 0,
+            "shared_volume_bytes": len(payload),
             "total_bytes": len(payload),
             "items": [{
                 "folder": "checkpoints",
@@ -194,6 +198,52 @@ class PodModelBootstrapTests(unittest.TestCase):
             link = root / "models" / "checkpoints" / "shared.safetensors"
             self.assertTrue(link.is_symlink())
             self.assertEqual(link.resolve(strict=True), artifact.resolve(strict=True))
+
+    def test_repeated_r2_sha_aliases_count_one_physical_object(self) -> None:
+        payload = b"shared-r2-object"
+        sha256 = module.hashlib.sha256(payload).hexdigest()
+        manifest = {
+            "version": 1,
+            "instance_id": "inst_test",
+            "status": "ready",
+            "item_count": 2,
+            "r2_bytes": len(payload),
+            "shared_volume_bytes": 0,
+            "total_bytes": len(payload),
+            "items": [
+                {
+                    "folder": "checkpoints",
+                    "filename": "primary.safetensors",
+                    "size_bytes": len(payload),
+                    "sha256": sha256,
+                    "source": "r2",
+                    "download_path": f"/api/internal/pod-models/artifacts/{sha256}",
+                },
+                {
+                    "folder": "diffusion_models",
+                    "filename": "alias.safetensors",
+                    "size_bytes": len(payload),
+                    "sha256": sha256,
+                    "source": "r2",
+                    "download_path": f"/api/internal/pod-models/artifacts/{sha256}",
+                },
+            ],
+        }
+        env = {
+            "COMFY_POD_TOKEN": "token",
+            "COMFY_INSTANCE_ID": "inst_test",
+            "COMFY_CONTROL_PLANE_URL": "https://example.invalid",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "instance"
+            config = Path(directory) / "extra-model-paths.json"
+            with patch.dict(os.environ, env, clear=False), patch.object(
+                module, "load_manifest", return_value=manifest
+            ), patch.object(module, "download_model") as download:
+                result = module.bootstrap(root, config, Path(directory) / "shared-volume")
+
+        self.assertEqual(result["total_bytes"], len(payload))
+        self.assertEqual(download.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()
