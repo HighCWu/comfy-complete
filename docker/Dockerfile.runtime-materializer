@@ -1,0 +1,30 @@
+# One-shot CPU runtime materializer.
+#
+# The container receives only short-lived HTTPS URLs plus public integrity
+# metadata through environment variables.  It downloads one manifest and one
+# archive to its disposable container disk, then calls the provider-neutral
+# local materializer to publish /runpod-volume/runtimes/current atomically.
+# No object-store SDK, provider API client, or credential is part of this
+# image.
+FROM ubuntu:24.04@sha256:019e8eb29a85e74d64925745884f2ec79aa27e3feab36353d24656f4d6b89467
+
+ARG MATERIALIZER_DIGEST
+
+RUN test -n "${MATERIALIZER_DIGEST}" && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates python3 zstd && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /runtime-tools
+
+COPY --chmod=755 scripts/download_materialize_runtime.py /runtime-tools/download_materialize_runtime.py
+COPY --chmod=755 scripts/materialize_runtime.py /runtime-tools/materialize_runtime.py
+COPY --chmod=644 scripts/runtime_manifest.py /runtime-tools/runtime_manifest.py
+COPY --chmod=644 scripts/runtime_ready.py /runtime-tools/runtime_ready.py
+
+ENV RUNTIME_MATERIALIZER_DIGEST=${MATERIALIZER_DIGEST} \
+    RUNTIME_VOLUME_ROOT=/runpod-volume \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+ENTRYPOINT ["/usr/bin/python3", "/runtime-tools/download_materialize_runtime.py"]
