@@ -105,6 +105,84 @@ jobs:
           docker push ${{ steps.img.outputs.name }}:${{ env.SAGEATTN_VERSION }}
           docker push ${{ steps.img.outputs.name }}:latest
 
+  # The materializer is an independent, one-shot CPU image.  It does not
+  # depend on the heavyweight ComfyUI base build and receives no publication
+  # or provider credentials; runtime object URLs and integrity metadata are
+  # supplied only when a control-plane CPU Pod is launched.
+  build-runtime-materializer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set image base (lowercase)
+        id: img
+        run: echo "base=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/comfy-complete-runtime-materializer" >> $GITHUB_OUTPUT
+
+      - name: Calculate materializer content hash
+        id: materializer
+        run: |
+          set -euo pipefail
+          HASH=$({
+            sha256sum \
+              docker/Dockerfile.runtime-materializer \
+              scripts/download_materialize_runtime.py \
+              scripts/materialize_runtime.py \
+              scripts/runtime_manifest.py \
+              scripts/runtime_ready.py | LC_ALL=C sort
+          } | sha256sum | cut -d' ' -f1)
+          echo "tag=runtime-materializer-${HASH:0:16}" >> "$GITHUB_OUTPUT"
+          echo "digest=sha256:${HASH}" >> "$GITHUB_OUTPUT"
+          echo "Materializer content tag: runtime-materializer-${HASH:0:16}"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for reusable runtime-materializer image
+        id: existing
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.base }}:${{ steps.materializer.outputs.tag }}"
+          if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing ${IMAGE}"
+          else
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+            echo "Building ${IMAGE}"
+          fi
+
+      - name: Build and push runtime-materializer image
+        if: steps.existing.outputs.reuse != 'true'
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.img.outputs.base }}"
+          CONTENT_TAG="${{ steps.materializer.outputs.tag }}"
+          DOCKER_BUILDKIT=1 docker build \
+            -f docker/Dockerfile.runtime-materializer \
+            --build-arg MATERIALIZER_DIGEST="${{ steps.materializer.outputs.digest }}" \
+            -t "$IMAGE:$CONTENT_TAG" \
+            -t "$IMAGE:${{ github.sha }}" \
+            .
+          docker push "$IMAGE:$CONTENT_TAG"
+          docker push "$IMAGE:${{ github.sha }}"
+
+      - name: Install crane for reusable runtime-materializer tags
+        if: steps.existing.outputs.reuse == 'true'
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Publish commit tag for reusable runtime-materializer image
+        if: steps.existing.outputs.reuse == 'true'
+        run: |
+          set -euo pipefail
+          SOURCE="${{ steps.img.outputs.base }}:${{ steps.materializer.outputs.tag }}"
+          crane tag "$SOURCE" "${{ github.sha }}"
+
   build-base:
     needs: build-sageattn
     runs-on: ubuntu-latest

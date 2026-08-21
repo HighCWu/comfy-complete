@@ -116,6 +116,36 @@ def test_wrapper_manifest_checks_precede_expensive_setup_and_hits_retag_immutabl
         assert "if: steps.existing.outputs.reuse == 'true'" in block
 
 
+def test_runtime_materializer_image_is_small_secretless_and_content_tagged():
+    workflow = DOCKER_BUILD.read_text()
+    dockerfile = (REPO_ROOT / "docker" / "Dockerfile.runtime-materializer").read_text()
+    parsed = yaml.safe_load(workflow)
+    job = parsed["jobs"]["build-runtime-materializer"]
+    assert job["permissions"] == {"contents": "read", "packages": "write"}
+    block = workflow.split("  build-runtime-materializer:\n", 1)[1].split("\n  build-base:", 1)[0]
+
+    for path in (
+        "docker/Dockerfile.runtime-materializer",
+        "scripts/download_materialize_runtime.py",
+        "scripts/materialize_runtime.py",
+        "scripts/runtime_manifest.py",
+        "scripts/runtime_ready.py",
+    ):
+        assert path in block
+    assert "comfy-complete-runtime-materializer" in block
+    assert "runtime-materializer-${HASH:0:16}" in block
+    assert "--build-arg MATERIALIZER_DIGEST" in block
+    assert 'docker push "$IMAGE:$CONTENT_TAG"' in block
+    assert 'docker push "$IMAGE:${{ github.sha }}"' in block
+    assert '-t "$IMAGE:latest"' not in block
+    assert "OBJECT_STORE_" not in block
+    assert "RUNPOD_" not in block
+
+    for package in ("ca-certificates", "python3", "zstd"):
+        assert package in dockerfile
+    assert 'ENTRYPOINT ["/usr/bin/python3", "/runtime-tools/download_materialize_runtime.py"]' in dockerfile
+
+
 def test_docker_workflow_yaml_is_valid():
     parsed = yaml.safe_load(DOCKER_BUILD.read_text())
     assert isinstance(parsed, dict)
