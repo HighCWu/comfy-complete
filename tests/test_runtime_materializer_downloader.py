@@ -50,9 +50,11 @@ class _Response:
 class _Opener:
     def __init__(self, response: _Response) -> None:
         self.response = response
+        self.request: urlrequest.Request | None = None
 
-    def open(self, _request: urlrequest.Request, *, timeout: float) -> _Response:
+    def open(self, request: urlrequest.Request, *, timeout: float) -> _Response:
         del timeout
+        self.request = request
         return self.response
 
 
@@ -104,6 +106,25 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
                     expected_size_bytes=len(payload),
                     timeout_seconds=5,
                 )
+
+    def test_result_post_is_https_json_without_authorization_header(self) -> None:
+        payload = {"ok": True, "status": "materialized", "entry_count": 3}
+        result_url = "https://temporary.example/result?signature=short-lived"
+        opener = _Opener(_Response(b"", result_url, content_length="0"))
+        with patch.object(downloader, "_opener", return_value=opener):
+            downloader._post_result(result_url, payload, timeout_seconds=5)
+        assert opener.request is not None
+        self.assertEqual(opener.request.get_method(), "POST")
+        self.assertEqual(json.loads(opener.request.data.decode("utf-8")), payload)
+        self.assertNotIn("authorization", {key.lower() for key in opener.request.headers})
+
+    def test_result_url_rejects_non_https(self) -> None:
+        with self.assertRaisesRegex(downloader.RuntimeDownloadError, "https_required"):
+            downloader._post_result(
+                "http://temporary.example/result",
+                {"ok": False, "error_code": "download_failed"},
+                timeout_seconds=5,
+            )
 
     def _manifest(self, archive_sha256: str, archive_size_bytes: int) -> dict[str, object]:
         one_byte_sha256 = hashlib.sha256(b"x").hexdigest()
@@ -223,6 +244,66 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(stdout.getvalue(), '{"error":"https_required","status":"error"}\n')
         self.assertNotIn(url, stdout.getvalue())
+
+    def _config_with_result_url(self) -> downloader.RuntimeDownloadConfig:
+        return downloader.RuntimeDownloadConfig(
+            archive_url="https://temporary.example/archive?signature=short-lived",
+            manifest_url="https://temporary.example/manifest?signature=short-lived",
+            archive_sha256="a" * 64,
+            archive_size_bytes=1,
+            manifest_sha256="b" * 64,
+            manifest_size_bytes=1,
+            volume_root=Path("/runpod-volume"),
+            timeout_seconds=5,
+            result_url="https://temporary.example/result?signature=short-lived",
+        )
+
+    def test_failed_materialization_posts_failure_and_stays_failed(self) -> None:
+        config = self._config_with_result_url()
+        with patch.object(
+            downloader.RuntimeDownloadConfig, "from_environment", return_value=config
+        ), patch.object(
+            downloader, "run", side_effect=downloader.RuntimeDownloadError("download_failed")
+        ), patch.object(downloader, "_post_result") as report, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as stdout:
+            result = downloader.main([])
+        self.assertEqual(result, 2)
+        report.assert_called_once_with(
+            config.result_url,
+            {"ok": False, "error_code": "download_failed"},
+            timeout_seconds=config.timeout_seconds,
+        )
+        self.assertEqual(stdout.getvalue(), '{"error":"download_failed","status":"error"}\n')
+
+    def test_success_result_report_failure_is_fail_closed(self) -> None:
+        config = self._config_with_result_url()
+        materialized = {
+            "status": "materialized",
+            "runtime_digest": "sha256:" + "c" * 64,
+            "archive_sha256": config.archive_sha256,
+            "archive_size_bytes": config.archive_size_bytes,
+            "manifest_sha256": config.manifest_sha256,
+            "manifest_size_bytes": config.manifest_size_bytes,
+            "entry_count": 3,
+            "current_updated": True,
+        }
+        with patch.object(
+            downloader.RuntimeDownloadConfig, "from_environment", return_value=config
+        ), patch.object(downloader, "run", return_value=materialized), patch.object(
+            downloader,
+            "_post_result",
+            side_effect=downloader.RuntimeDownloadError("result_report_failed"),
+        ) as report, patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            result = downloader.main([])
+        self.assertEqual(result, 2)
+        report.assert_called_once_with(
+            config.result_url,
+            {"ok": True, **materialized},
+            timeout_seconds=config.timeout_seconds,
+        )
+        self.assertEqual(stdout.getvalue(), '{"error":"result_report_failed","status":"error"}\n')
+        self.assertNotIn("materialized", stdout.getvalue())
 
 
 if __name__ == "__main__":

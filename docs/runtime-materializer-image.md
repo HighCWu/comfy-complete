@@ -16,6 +16,7 @@ RUNTIME_ARCHIVE_SHA256
 RUNTIME_ARCHIVE_SIZE_BYTES
 RUNTIME_MANIFEST_SHA256
 RUNTIME_MANIFEST_SIZE_BYTES
+RUNTIME_RESULT_URL                 # optional HTTPS capability callback
 ```
 
 URLs must use HTTPS, have no user-info or fragment, and every redirect must
@@ -23,6 +24,16 @@ also use HTTPS.  The downloader sends only a fixed `GET` request with an
 identity content-encoding and a non-secret user agent.  It never adds an
 authorization header or reads a provider credential.  The expected archive
 digest and size must agree with the validated manifest's archive contract.
+
+When `RUNTIME_RESULT_URL` is present, the entrypoint POSTs one bounded JSON
+record after the materialization attempt.  Success contains `ok: true` plus
+all scalar fields returned by `run()` (`status`, `runtime_digest`, archive and
+manifest digests/sizes, entry count, and `current_updated`).  Failure contains
+the bounded shape `{"ok":false,"error_code":"..."}`.  A successful
+materialization whose result POST fails exits `2` and does not print a success
+record, so a callback failure cannot be treated as successful preparation.  A
+materialization failure always exits `2`, regardless of whether its failure
+callback succeeds.
 
 The archive is streamed once to the CPU container's disposable `/tmp` disk,
 then passed to `scripts/materialize_runtime.py`.  The existing materializer
@@ -59,8 +70,10 @@ docker run --rm \
   -e RUNTIME_ARCHIVE_SIZE_BYTES=... \
   -e RUNTIME_MANIFEST_SHA256=... \
   -e RUNTIME_MANIFEST_SIZE_BYTES=... \
+  -e RUNTIME_RESULT_URL=https://temporary.example/result?signature=short-lived \
   ghcr.io/highcwu/comfy-complete-runtime-materializer:<immutable-tag>
 ```
 
 The example URLs are placeholders; no URL, token, or provider secret belongs
-in the image, repository, or logs.
+in the image, repository, or logs.  The result callback receives only the
+bounded JSON record and no authorization header is sent.
