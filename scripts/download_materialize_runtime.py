@@ -49,6 +49,7 @@ MAX_MANIFEST_BYTES = 128 * 1024 * 1024
 # still rejecting an accidentally unbounded value before creating a file.
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024 * 1024
 READ_CHUNK_BYTES = 8 * 1024 * 1024
+MAX_RESULT_BYTES = 16 * 1024
 
 
 class RuntimeDownloadError(RuntimeError):
@@ -133,6 +134,7 @@ class RuntimeDownloadConfig:
     manifest_size_bytes: int
     volume_root: Path
     timeout_seconds: float
+    result_url: str | None = None
 
     @classmethod
     def from_environment(cls, *, volume_root_override: str | None = None) -> "RuntimeDownloadConfig":
@@ -174,6 +176,11 @@ class RuntimeDownloadConfig:
             manifest_size_bytes=manifest_size_bytes,
             volume_root=root_path,
             timeout_seconds=_parse_timeout(os.environ.get("RUNTIME_DOWNLOAD_TIMEOUT_SECONDS")),
+            result_url=(
+                _validate_url(os.environ["RUNTIME_RESULT_URL"])
+                if os.environ.get("RUNTIME_RESULT_URL")
+                else None
+            ),
         )
 
 
@@ -280,6 +287,37 @@ def _download_file(
     except (OSError, TimeoutError, ValueError, urlerror.URLError, urlerror.HTTPError) as error:
         del error
         raise _error("download_failed") from None
+
+
+def _post_result(url: str, payload: Mapping[str, object], *, timeout_seconds: float) -> None:
+    """POST one bounded result to an optional HTTPS capability URL."""
+
+    body = json.dumps(
+        dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if len(body) > MAX_RESULT_BYTES:
+        raise _error("result_too_large")
+    try:
+        request = urlrequest.Request(
+            _validate_url(url),
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "comfy-runtime-materializer/1",
+            },
+            method="POST",
+        )
+        with _opener().open(request, timeout=timeout_seconds) as response:
+            _response_status(response)
+            # Read at most a bounded response body to release the connection;
+            # the response is never parsed or copied into the result record.
+            response.read(MAX_RESULT_BYTES)
+    except RuntimeDownloadError:
+        raise
+    except (OSError, TimeoutError, ValueError, urlerror.URLError, urlerror.HTTPError) as error:
+        del error
+        raise _error("result_report_failed") from None
 
 
 def _read_manifest(
@@ -400,16 +438,55 @@ def _json_result(value: Mapping[str, object]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    config: RuntimeDownloadConfig | None = None
     try:
         config = RuntimeDownloadConfig.from_environment(volume_root_override=args.volume_root)
-        print(_json_result(run(config)), flush=True)
-        return 0
+        result = run(config)
     except RuntimeDownloadError as error:
+        if config is not None and config.result_url is not None:
+            try:
+                _post_result(
+                    config.result_url,
+                    {"ok": False, "error_code": error.code},
+                    timeout_seconds=config.timeout_seconds,
+                )
+            except RuntimeDownloadError:
+                # The original materialization error remains authoritative.
+                # In particular, a failed result report can never turn a
+                # failed materialization into a success.
+                pass
         print(_json_result({"status": "error", "error": error.code}), flush=True)
         return 2
     except (OSError, ValueError):
+        if config is not None and config.result_url is not None:
+            try:
+                _post_result(
+                    config.result_url,
+                    {"ok": False, "error_code": "materializer_failed"},
+                    timeout_seconds=config.timeout_seconds,
+                )
+            except RuntimeDownloadError:
+                pass
         print(_json_result({"status": "error", "error": "materializer_failed"}), flush=True)
         return 2
+
+    success_payload = {"ok": True, **result}
+    if config.result_url is not None:
+        try:
+            _post_result(
+                config.result_url,
+                success_payload,
+                timeout_seconds=config.timeout_seconds,
+            )
+        except RuntimeDownloadError:
+            # The volume may already contain the newly published generation,
+            # but the caller must not observe a successful run without the
+            # capability callback.  Exit fail-closed and do not print the
+            # success payload.
+            print(_json_result({"status": "error", "error": "result_report_failed"}), flush=True)
+            return 2
+    print(_json_result(success_payload), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
