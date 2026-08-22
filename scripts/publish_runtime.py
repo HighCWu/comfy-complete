@@ -333,6 +333,13 @@ def build_channel_manifest(item: PublishInput) -> bytes:
         "archive_size_bytes": item.archive_size_bytes,
         "manifest_key": item.manifest_key,
         "manifest_sha256": item.manifest_sha256,
+        # Keep the channel bounded even when the complete manifest is large
+        # (the production file tree is tens of MiB). Edge control-plane
+        # readers use these publisher-verified scalar facts for admission;
+        # the CPU materializer still downloads and verifies the complete
+        # manifest before it ever publishes READY.json on a Network Volume.
+        "manifest_size_bytes": len(item.manifest_bytes),
+        "expanded_bytes": item.manifest["file_tree"]["total_bytes"],
     }
     payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
     if len(payload) > MAX_CHANNEL_MANIFEST_BYTES:
