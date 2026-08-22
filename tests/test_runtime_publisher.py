@@ -250,6 +250,8 @@ class RuntimePublisherTests(unittest.TestCase):
         channel = json.loads(channel_body)
         self.assertEqual(channel["archive_key"], self.item.archive_key)
         self.assertEqual(channel["manifest_sha256"], self.item.manifest_sha256)
+        self.assertEqual(channel["manifest_size_bytes"], len(self.manifest_bytes))
+        self.assertEqual(channel["expanded_bytes"], 0)
 
     def test_existing_content_addressed_objects_are_reused(self) -> None:
         self.store.objects[self.item.archive_key] = (
