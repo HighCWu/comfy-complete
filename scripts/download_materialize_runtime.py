@@ -5,9 +5,9 @@ This is the entrypoint for the small CPU runtime-materializer image.  The
 caller supplies two short-lived HTTPS URLs and the expected byte counts and
 SHA-256 digests through environment variables.  The downloader never sends
 credentials or provider-specific headers.  It verifies the manifest before
-downloading the archive, then delegates the final archive -> volume operation
-to :mod:`materialize_runtime`, which owns the lock and atomic ``current``
-publication contract.
+downloading the archive in bounded, contiguous HTTP Range requests, then
+delegates the final archive -> volume operation to :mod:`materialize_runtime`,
+which owns the lock and atomic ``current`` publication contract.
 
 The command deliberately emits only bounded JSON status records.  URLs,
 filesystem paths, response bodies, and exception details are not written to
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -49,7 +50,17 @@ MAX_MANIFEST_BYTES = 128 * 1024 * 1024
 # still rejecting an accidentally unbounded value before creating a file.
 MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024 * 1024
 READ_CHUNK_BYTES = 8 * 1024 * 1024
+# Keep each request bounded while avoiding hundreds of requests for the current
+# ~16 GB runtime archive.  The file is written sequentially, so this does not
+# require a second archive-sized staging buffer.
+ARCHIVE_RANGE_BYTES = 256 * 1024 * 1024
 MAX_RESULT_BYTES = 16 * 1024
+CONTENT_RANGE_RE = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
+TEMP_STORAGE_EXHAUSTION_ERRNOS = frozenset(
+    value
+    for value in (errno.ENOSPC, getattr(errno, "EDQUOT", None), getattr(errno, "EFBIG", None))
+    if value is not None
+)
 
 
 class RuntimeDownloadError(RuntimeError):
@@ -62,6 +73,10 @@ class RuntimeDownloadError(RuntimeError):
 
 def _error(code: str) -> RuntimeDownloadError:
     return RuntimeDownloadError(code)
+
+
+def _is_storage_exhaustion(error: OSError) -> bool:
+    return error.errno in TEMP_STORAGE_EXHAUSTION_ERRNOS
 
 
 def _validate_url(value: object) -> str:
@@ -239,6 +254,23 @@ def _content_length(response: Any) -> int | None:
     return value
 
 
+def _content_range(response: Any) -> tuple[int, int, int]:
+    raw = response.headers.get("Content-Range")
+    if not isinstance(raw, str):
+        raise _error("download_headers_invalid")
+    match = CONTENT_RANGE_RE.fullmatch(raw)
+    if match is None:
+        raise _error("download_headers_invalid")
+    try:
+        start, end, total = (int(value, 10) for value in match.groups())
+    except ValueError as error:
+        del error
+        raise _error("download_headers_invalid") from None
+    if start < 0 or end < start or total <= 0 or end >= total:
+        raise _error("download_headers_invalid")
+    return start, end, total
+
+
 def _download_file(
     url: str,
     destination: Path,
@@ -284,9 +316,98 @@ def _download_file(
                 raise _error("download_digest_mismatch")
     except RuntimeDownloadError:
         raise
-    except (OSError, TimeoutError, ValueError, urlerror.URLError, urlerror.HTTPError) as error:
+    except OSError as error:
+        if _is_storage_exhaustion(error):
+            raise _error("archive_temporary_disk_exhausted") from error
+        raise _error("download_failed") from None
+    except (TimeoutError, ValueError, urlerror.URLError, urlerror.HTTPError) as error:
         del error
         raise _error("download_failed") from None
+
+
+def _download_range_chunks(
+    url: str,
+    destination: Path,
+    *,
+    expected_sha256: str,
+    expected_size_bytes: int,
+    timeout_seconds: float,
+) -> None:
+    """Stream one exact object through contiguous, verified Range requests.
+
+    A server that ignores Range and returns ``200`` is rejected.  Every
+    accepted response must identify exactly the requested interval and total
+    object size; the body is checked for both short and overlong responses
+    before the next interval is requested.
+    """
+
+    if expected_size_bytes <= 0:
+        raise _error("configuration_invalid")
+    validated_url = _validate_url(url)
+    opener = _opener()
+    digest = hashlib.sha256()
+    downloaded = 0
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            while downloaded < expected_size_bytes:
+                start = downloaded
+                end = min(start + ARCHIVE_RANGE_BYTES - 1, expected_size_bytes - 1)
+                chunk_size = end - start + 1
+                request = urlrequest.Request(
+                    validated_url,
+                    headers={
+                        "Accept-Encoding": "identity",
+                        "Range": f"bytes={start}-{end}",
+                        "User-Agent": "comfy-runtime-materializer/1",
+                    },
+                    method="GET",
+                )
+                with opener.open(request, timeout=timeout_seconds) as response:
+                    status = _response_status(response)
+                    if status != 206:
+                        raise _error("download_range_required")
+                    _validate_url(response.geturl())
+                    response_start, response_end, response_total = _content_range(response)
+                    if (
+                        response_start != start
+                        or response_end != end
+                        or response_total != expected_size_bytes
+                    ):
+                        raise _error("download_range_mismatch")
+                    advertised_size = _content_length(response)
+                    if advertised_size != chunk_size:
+                        raise _error("download_size_mismatch")
+
+                    remaining = chunk_size
+                    while remaining > 0:
+                        chunk = response.read(min(READ_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise _error("download_size_mismatch")
+                        if len(chunk) > remaining:
+                            raise _error("download_size_mismatch")
+                        handle.write(chunk)
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    # A compliant response must not contain bytes beyond the
+                    # advertised interval.  Reading one extra byte catches a
+                    # body whose Content-Length was understated.
+                    if response.read(1):
+                        raise _error("download_size_mismatch")
+                downloaded = end + 1
+            handle.flush()
+            os.fsync(handle.fileno())
+    except RuntimeDownloadError:
+        raise
+    except OSError as error:
+        if _is_storage_exhaustion(error):
+            raise _error("archive_temporary_disk_exhausted") from error
+        raise _error("download_failed") from None
+    except (TimeoutError, ValueError, urlerror.URLError, urlerror.HTTPError) as error:
+        del error
+        raise _error("download_failed") from None
+    if downloaded != expected_size_bytes or digest.hexdigest() != expected_sha256:
+        raise _error("download_digest_mismatch")
 
 
 def _post_result(url: str, payload: Mapping[str, object], *, timeout_seconds: float) -> None:
@@ -392,7 +513,7 @@ def run(config: RuntimeDownloadConfig) -> Mapping[str, object]:
         del manifest_bytes
         archive_name = manifest["archive"]["object_name"]
         archive_path = temporary_root / archive_name
-        _download_file(
+        _download_range_chunks(
             config.archive_url,
             archive_path,
             expected_sha256=config.archive_sha256,
@@ -410,16 +531,26 @@ def run(config: RuntimeDownloadConfig) -> Mapping[str, object]:
     # Copy only scalar fields from the provider-neutral materializer.  In
     # particular, do not pass through paths, manifest source metadata, or URL
     # values supplied by the caller.
-    return {
+    output: dict[str, object] = {
         "status": result["status"],
         "runtime_digest": result["runtime_digest"],
         "archive_sha256": config.archive_sha256,
         "archive_size_bytes": config.archive_size_bytes,
+        "downloaded_bytes": config.archive_size_bytes,
         "manifest_sha256": config.manifest_sha256,
         "manifest_size_bytes": config.manifest_size_bytes,
         "entry_count": result["entry_count"],
         "current_updated": result["current_updated"],
     }
+    materialized_bytes = result.get("materialized_bytes")
+    if (
+        not isinstance(materialized_bytes, int)
+        or isinstance(materialized_bytes, bool)
+        or materialized_bytes < 0
+    ):
+        raise _error("materialization_result_invalid")
+    output["materialized_bytes"] = materialized_bytes
+    return output
 
 
 def _parser() -> argparse.ArgumentParser:

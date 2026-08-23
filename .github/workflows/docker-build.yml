@@ -112,6 +112,9 @@ jobs:
   build-runtime-materializer:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      image: ${{ steps.img.outputs.base }}
+      tag: ${{ steps.materializer.outputs.tag }}
     permissions:
       contents: read
       packages: write
@@ -962,7 +965,7 @@ jobs:
   # Artifacts receives metadata only, avoiding multi-gigabyte artifact storage
   # and transfer charges.
   publish-runtime-slim:
-    needs: [build-base, audit-base-runtime]
+    needs: [build-base, audit-base-runtime, build-runtime-materializer]
     runs-on: ubuntu-latest
     # The environment permits deployments from main only. This prevents a
     # workflow_dispatch on an unreviewed branch from receiving publication
@@ -1275,6 +1278,174 @@ jobs:
           cat "$RUNTIME_DIR/runtime-summary.json"
           cp "$RUNNER_TEMP/slim-image.json" "$RUNTIME_DIR/slim-image.json"
           df -h "$RUNNER_TEMP"
+
+      # Exercise the exact published CPU image against the real archive just
+      # produced above.  The temporary HTTPS server is local-only and uses a
+      # runner-generated CA mounted into the image; no object-store URL or
+      # credential enters the step.  This catches image-entrypoint, TLS,
+      # streaming download, zstd, and Network Volume publication regressions
+      # before the host-side materializer smoke and image publication.
+      - name: Smoke-test runtime-materializer image against exported archive
+        run: |
+          set -euo pipefail
+          RUNTIME_DIR="${{ steps.identity.outputs.runtime_dir }}"
+          MATERIALIZER_IMAGE="${{ needs.build-runtime-materializer.outputs.image }}:${{ needs.build-runtime-materializer.outputs.tag }}"
+          ARCHIVE="$(find "$RUNTIME_DIR" -maxdepth 1 -type f -name 'sha256-*.tar.zst' -print -quit)"
+          MANIFEST="$RUNTIME_DIR/manifest.json"
+          test -n "$ARCHIVE" -a -f "$MANIFEST"
+          ARCHIVE_NAME="$(basename "$ARCHIVE")"
+          ARCHIVE_SHA256="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
+          ARCHIVE_SIZE_BYTES="$(stat -c '%s' "$ARCHIVE")"
+          MANIFEST_SHA256="$(sha256sum "$MANIFEST" | cut -d' ' -f1)"
+          MANIFEST_SIZE_BYTES="$(stat -c '%s' "$MANIFEST")"
+          ACCEPTANCE_VOLUME="$RUNTIME_DIR/.runtime-materializer-entrypoint-volume"
+          MATERIALIZER_TMP="$RUNNER_TEMP/runtime-materializer-tmp-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          TLS_DIR="$RUNNER_TEMP/runtime-materializer-tls-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          SERVER_PID=""
+          cleanup() {
+            if [ -n "$SERVER_PID" ]; then
+              kill "$SERVER_PID" >/dev/null 2>&1 || true
+              wait "$SERVER_PID" >/dev/null 2>&1 || true
+            fi
+            sudo rm -rf "$ACCEPTANCE_VOLUME" "$MATERIALIZER_TMP" "$TLS_DIR"
+          }
+          trap cleanup EXIT
+          sudo rm -rf "$ACCEPTANCE_VOLUME" "$MATERIALIZER_TMP" "$TLS_DIR"
+          mkdir -p "$ACCEPTANCE_VOLUME" "$MATERIALIZER_TMP" "$TLS_DIR"
+          sudo chown 0:0 "$ACCEPTANCE_VOLUME"
+          sudo chown 0:0 "$MATERIALIZER_TMP"
+          AVAILABLE_BYTES="$(df --output=avail -B1 "$RUNNER_TEMP" | tail -n 1 | tr -d '[:space:]')"
+          REQUIRED_BYTES=$((ARCHIVE_SIZE_BYTES + 2 * 1024 * 1024 * 1024))
+          test "$AVAILABLE_BYTES" -ge "$REQUIRED_BYTES"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$TLS_DIR/server.key" \
+            -out "$TLS_DIR/ca.pem" \
+            -subj '/CN=runtime-materializer-local-test' \
+            -addext 'subjectAltName=IP:127.0.0.1' \
+            -addext 'basicConstraints=critical,CA:TRUE' \
+            >/dev/null 2>&1
+          cat > "$TLS_DIR/server.py" <<'PY'
+          from __future__ import annotations
+
+          import functools
+          from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+          from pathlib import Path
+          import re
+          import ssl
+          import sys
+
+          root, certificate, key, port_file = map(Path, sys.argv[1:])
+
+          class QuietHandler(SimpleHTTPRequestHandler):
+              def log_message(self, _format: str, *_args: object) -> None:
+                  pass
+
+              def do_GET(self) -> None:
+                  range_header = self.headers.get('Range')
+                  if range_header is None:
+                      super().do_GET()
+                      return
+
+                  path = Path(self.translate_path(self.path))
+                  try:
+                      metadata = path.stat()
+                      if not path.is_file():
+                          raise OSError
+                      total = metadata.st_size
+                      match = re.fullmatch(r'bytes=(\d+)-(\d+)', range_header)
+                      if match is None:
+                          raise ValueError
+                      start, end = (int(value, 10) for value in match.groups())
+                      if start < 0 or end < start or end >= total:
+                          raise ValueError
+                      length = end - start + 1
+                      with path.open('rb') as handle:
+                          handle.seek(start)
+                          self.send_response(206)
+                          self.send_header('Content-type', self.guess_type(str(path)))
+                          self.send_header('Content-Length', str(length))
+                          self.send_header('Content-Range', f'bytes {start}-{end}/{total}')
+                          self.send_header('Accept-Ranges', 'bytes')
+                          self.end_headers()
+                          remaining = length
+                          while remaining:
+                              chunk = handle.read(min(1024 * 1024, remaining))
+                              if not chunk:
+                                  break
+                              self.wfile.write(chunk)
+                              remaining -= len(chunk)
+                  except (OSError, ValueError):
+                      self.send_response(416)
+                      self.send_header('Content-Range', 'bytes */0')
+                      self.send_header('Content-Length', '0')
+                      self.end_headers()
+
+          handler = functools.partial(QuietHandler, directory=str(root))
+          server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+          context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          context.load_cert_chain(certificate, key)
+          server.socket = context.wrap_socket(server.socket, server_side=True)
+          port_file.write_text(str(server.server_address[1]), encoding='ascii')
+          server.serve_forever()
+          PY
+          python3 "$TLS_DIR/server.py" "$RUNTIME_DIR" "$TLS_DIR/ca.pem" "$TLS_DIR/server.key" "$TLS_DIR/port" \
+            > "$TLS_DIR/server.log" 2>&1 &
+          SERVER_PID=$!
+          for _ in $(seq 1 100); do
+            if [ -s "$TLS_DIR/port" ]; then break; fi
+            sleep 0.1
+          done
+          test -s "$TLS_DIR/port"
+          PORT="$(cat "$TLS_DIR/port")"
+          ARCHIVE_URL="https://127.0.0.1:${PORT}/${ARCHIVE_NAME}"
+          MANIFEST_URL="https://127.0.0.1:${PORT}/manifest.json"
+          .github/scripts/docker-pull-with-retry.sh "$MATERIALIZER_IMAGE"
+          docker run --rm \
+            --network host \
+            --read-only \
+            --pids-limit 128 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --mount type=bind,source="$MATERIALIZER_TMP",destination=/tmp \
+            --mount type=bind,source="$ACCEPTANCE_VOLUME",destination=/runpod-volume \
+            --mount type=bind,source="$TLS_DIR/ca.pem",destination=/tmp/runtime-materializer-ca.pem,readonly \
+            -e SSL_CERT_FILE=/tmp/runtime-materializer-ca.pem \
+            -e RUNTIME_ARCHIVE_URL="$ARCHIVE_URL" \
+            -e RUNTIME_MANIFEST_URL="$MANIFEST_URL" \
+            -e RUNTIME_ARCHIVE_SHA256="$ARCHIVE_SHA256" \
+            -e RUNTIME_ARCHIVE_SIZE_BYTES="$ARCHIVE_SIZE_BYTES" \
+            -e RUNTIME_MANIFEST_SHA256="$MANIFEST_SHA256" \
+            -e RUNTIME_MANIFEST_SIZE_BYTES="$MANIFEST_SIZE_BYTES" \
+            "$MATERIALIZER_IMAGE" \
+            > "$TLS_DIR/result.json"
+          python3 - "$TLS_DIR/result.json" "$ACCEPTANCE_VOLUME" "$ARCHIVE_SIZE_BYTES" "$MANIFEST_SIZE_BYTES" "$RUNTIME_DIR/manifest.json" <<'PY'
+          from __future__ import annotations
+
+          import json
+          from pathlib import Path
+          import sys
+
+          result_path, volume_root, archive_size, manifest_size, manifest_path = sys.argv[1:]
+          result = json.loads(Path(result_path).read_text(encoding='utf-8'))
+          manifest = json.loads(Path(manifest_path).read_text(encoding='utf-8'))
+          if result.get('ok') is not True:
+              raise SystemExit(f'runtime-materializer image did not report success: {result!r}')
+          if result.get('downloaded_bytes') != int(archive_size):
+              raise SystemExit(f'downloaded byte count mismatch: {result!r}')
+          if result.get('archive_size_bytes') != int(archive_size):
+              raise SystemExit(f'archive byte count mismatch: {result!r}')
+          if result.get('manifest_size_bytes') != int(manifest_size):
+              raise SystemExit(f'manifest byte count mismatch: {result!r}')
+          expected_materialized = manifest['file_tree']['total_bytes']
+          if result.get('materialized_bytes') != expected_materialized:
+              raise SystemExit(f'materialized byte count mismatch: {result!r}')
+          if result.get('current_updated') is not True:
+              raise SystemExit(f'runtime-materializer image did not publish current: {result!r}')
+          current = Path(volume_root) / 'runtimes' / 'current'
+          if not current.is_symlink() or not current.resolve(strict=True).is_dir():
+              raise SystemExit('runtime-materializer image published an invalid current symlink')
+          PY
+          cp "$TLS_DIR/result.json" "$RUNTIME_DIR/runtime-materializer-entrypoint.json"
 
       # The base and exporter images have already done their work by this
       # point. Release their local layers before creating the second copy of
@@ -1610,6 +1781,7 @@ jobs:
             ${{ steps.identity.outputs.runtime_dir }}/runtime-summary.json
             ${{ steps.identity.outputs.runtime_dir }}/slim-image.json
             ${{ steps.identity.outputs.runtime_dir }}/runtime-materializer.json
+            ${{ steps.identity.outputs.runtime_dir }}/runtime-materializer-entrypoint.json
             ${{ steps.identity.outputs.runtime_dir }}/runtime-launcher-smoke.json
             ${{ steps.identity.outputs.runtime_dir }}/runtime-critical-probe.json
             ${{ steps.identity.outputs.runtime_dir }}/runtime-publisher.json

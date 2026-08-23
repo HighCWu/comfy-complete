@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -66,6 +68,11 @@ PRIVATE_DIRECTORY_MODE = 0o700
 RUNTIME_ROOT_MODE = 0o755
 PUBLISHED_DIRECTORY_MODE = 0o755
 PUBLISHED_METADATA_MODE = 0o644
+STORAGE_EXHAUSTION_ERRNOS = frozenset(
+    value
+    for value in (errno.ENOSPC, getattr(errno, "EDQUOT", None), getattr(errno, "EFBIG", None))
+    if value is not None
+)
 
 
 class RuntimeMaterializerError(RuntimeError):
@@ -85,6 +92,12 @@ class RuntimeMaterializerError(RuntimeError):
 
 def _error(code: str, detail: str | None = None) -> RuntimeMaterializerError:
     return RuntimeMaterializerError(code, detail)
+
+
+def _is_storage_exhaustion(error: OSError) -> bool:
+    """Return whether an OS error means the destination has no capacity."""
+
+    return error.errno in STORAGE_EXHAUSTION_ERRNOS
 
 
 def _lexists(path: Path) -> bool:
@@ -111,7 +124,7 @@ def _ensure_real_directory(path: Path, *, create: bool = False) -> None:
     try:
         path.mkdir(parents=True, exist_ok=True, mode=0o755)
     except OSError as error:
-        raise _error("volume_io") from error
+        raise _error("volume_write_failed") from error
     if not _is_real_directory(path):
         raise _error("unsafe_volume_root")
 
@@ -245,11 +258,11 @@ def _fsync_directory(path: Path) -> None:
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except OSError as error:
-        raise _error("volume_io") from error
+        raise _error("volume_write_failed") from error
     try:
         os.fsync(descriptor)
     except OSError as error:
-        raise _error("volume_io") from error
+        raise _error("volume_write_failed") from error
     finally:
         os.close(descriptor)
 
@@ -266,16 +279,60 @@ def _fsync_tree_directories(root: Path) -> None:
             with os.scandir(directory) as iterator:
                 children = list(iterator)
         except OSError as error:
-            raise _error("staging_io") from error
+            raise _error("volume_write_failed") from error
         for child in children:
             try:
                 metadata = child.stat(follow_symlinks=False)
             except OSError as error:
-                raise _error("staging_io") from error
+                raise _error("volume_write_failed") from error
             if stat.S_ISDIR(metadata.st_mode):
                 stack.append(directory / child.name)
     for directory in reversed(directories):
         _fsync_directory(directory)
+
+
+def _sync_volume_filesystem(path: Path) -> None:
+    """Flush file data for the filesystem containing *path* in one call.
+
+    The runtime archive can contain hundreds of thousands of regular files.
+    Calling ``fsync`` once per file makes materialization dominated by syscall
+    latency on a Network Volume.  Linux ``syncfs`` provides the same durability
+    boundary scoped to the mounted filesystem, so the complete staged tree is
+    flushed once after it has passed content verification and before the
+    generation is renamed into the published namespace.  A non-Linux test
+    environment falls back to Python's process-wide ``sync`` because the
+    materializer already requires a POSIX directory filesystem.
+    """
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as error:
+        raise _error("volume_write_failed") from error
+    try:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            syncfs = libc.syncfs
+        except (AttributeError, OSError):
+            sync = getattr(os, "sync", None)
+            if sync is None:
+                raise _error("volume_write_failed")
+            try:
+                sync()
+            except OSError as error:
+                raise _error("volume_write_failed") from error
+            return
+
+        syncfs.argtypes = [ctypes.c_int]
+        syncfs.restype = ctypes.c_int
+        if syncfs(descriptor) != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+    except RuntimeMaterializerError:
+        raise
+    except OSError as error:
+        raise _error("volume_write_failed") from error
+    finally:
+        os.close(descriptor)
 
 
 def _atomic_write(path: Path, payload: bytes, *, mode: int) -> None:
@@ -299,7 +356,7 @@ def _atomic_write(path: Path, payload: bytes, *, mode: int) -> None:
     except RuntimeMaterializerError:
         raise
     except OSError as error:
-        raise _error("publication_io") from error
+        raise _error("volume_write_failed") from error
     finally:
         if temporary is not None:
             try:
@@ -391,10 +448,10 @@ def _ensure_parents(root: Path, relative: str, expected: Mapping[str, Mapping[st
             try:
                 current.mkdir(mode=0o700)
             except OSError as error:
-                raise _error("staging_io") from error
+                raise _error("volume_write_failed") from error
             continue
         except OSError as error:
-            raise _error("staging_io") from error
+            raise _error("volume_write_failed") from error
         if not stat.S_ISDIR(metadata.st_mode):
             raise _error("tree_conflict", "a runtime path parent is not a directory")
 
@@ -428,7 +485,7 @@ def _open_new_file(path: Path, mode: int) -> int:
         os.fchmod(descriptor, mode)
         return descriptor
     except OSError as error:
-        raise _error("staging_io") from error
+        raise _error("volume_write_failed") from error
 
 
 def _extract_file(fileobj: Any, path: Path, expected: Mapping[str, Any]) -> None:
@@ -437,7 +494,13 @@ def _extract_file(fileobj: Any, path: Path, expected: Mapping[str, Any]) -> None
     size = 0
     try:
         while True:
-            chunk = fileobj.read(CHUNK_BYTES)
+            try:
+                chunk = fileobj.read(CHUNK_BYTES)
+            except OSError as error:
+                # This read is from the decompressor pipe, not the Network
+                # Volume.  Keep source-stream failures distinct from the
+                # destination write failures below.
+                raise _error("archive_stream_invalid") from error
             if not chunk:
                 break
             size += len(chunk)
@@ -450,13 +513,9 @@ def _extract_file(fileobj: Any, path: Path, expected: Mapping[str, Any]) -> None
                         raise OSError("short file write")
                     view = view[written:]
             except OSError as error:
-                raise _error("staging_io") from error
+                raise _error("volume_write_failed") from error
         if size != expected["size_bytes"] or digest.hexdigest() != expected["sha256"]:
             raise _error("member_digest_mismatch", "archive file content differs from manifest")
-        try:
-            os.fsync(descriptor)
-        except OSError as error:
-            raise _error("staging_io") from error
     finally:
         os.close(descriptor)
 
@@ -509,16 +568,16 @@ def _extract_member(
                 destination.mkdir(mode=declared["mode"])
                 os.chmod(destination, declared["mode"], follow_symlinks=False)
             except OSError as error:
-                raise _error("staging_io") from error
+                raise _error("volume_write_failed") from error
         except OSError as error:
-            raise _error("staging_io") from error
+            raise _error("volume_write_failed") from error
         else:
             if not stat.S_ISDIR(metadata.st_mode):
                 raise _error("tree_conflict", "directory member collides with another type")
             try:
                 os.chmod(destination, declared["mode"], follow_symlinks=False)
             except OSError as error:
-                raise _error("staging_io") from error
+                raise _error("volume_write_failed") from error
         return
 
     if kind == "symlink":
@@ -534,7 +593,7 @@ def _extract_member(
         try:
             os.symlink(target, destination)
         except OSError as error:
-            raise _error("staging_io") from error
+            raise _error("volume_write_failed") from error
         return
 
     raise _error("manifest_invalid", "unsupported runtime entry type")
@@ -546,7 +605,12 @@ def _stream_extract(
     expected: Mapping[str, Mapping[str, Any]],
 ) -> None:
     zstd = _require_zstd()
-    stderr_file = tempfile.TemporaryFile(mode="w+b")
+    try:
+        stderr_file = tempfile.TemporaryFile(mode="w+b")
+    except OSError as error:
+        if _is_storage_exhaustion(error):
+            raise _error("archive_temporary_disk_exhausted") from error
+        raise _error("archive_temporary_io") from error
     try:
         process = subprocess.Popen(
             [zstd, "-q", "-d", "-c", "--", str(archive_path)],
@@ -597,7 +661,15 @@ def _stream_extract(
     except RuntimeMaterializerError:
         stop_process()
         raise
-    except (OSError, EOFError, tarfile.TarError, ValueError) as error:
+    except OSError as error:
+        stop_process()
+        if _is_storage_exhaustion(error):
+            # A full destination can surface through the pipe after the
+            # writer has failed.  Do not misreport that as corrupt archive
+            # bytes; the bounded public code identifies volume capacity.
+            raise _error("volume_write_failed") from error
+        raise _error("archive_stream_invalid") from error
+    except (EOFError, tarfile.TarError, ValueError) as error:
         stop_process()
         raise _error("archive_stream_invalid") from error
     finally:
@@ -655,7 +727,6 @@ def _verify_tree(
         raise _error("verification_root")
     expected = _expected_entries(manifest)
     implicit = _implicit_directories(expected)
-    allowed = set(expected) | implicit
     actual: set[str] = set()
     for relative, path, metadata in _walk_tree(root):
         if relative in (MANIFEST_NAME, READY_NAME):
@@ -856,17 +927,18 @@ def _materialize_locked(
             "archive_size_bytes": archive_size,
             "archive_sha256": archive_sha256,
             "entry_count": len(expected),
+            "materialized_bytes": manifest["file_tree"]["total_bytes"],
             "current_updated": current_updated,
         }
 
     staging_root = runtime_root / STAGING_DIRECTORY
     _ensure_real_directory(staging_root, create=True)
-    _chmod_directory(staging_root, PRIVATE_DIRECTORY_MODE, error_code="staging_io")
+    _chmod_directory(staging_root, PRIVATE_DIRECTORY_MODE, error_code="volume_write_failed")
     staging = staging_root / f"{runtime_hex}.{uuid.uuid4().hex}"
     try:
         staging.mkdir(mode=PRIVATE_DIRECTORY_MODE)
     except OSError as error:
-        raise _error("staging_io") from error
+        raise _error("volume_write_failed") from error
     published = False
     try:
         _stream_extract(archive_path, staging, expected)
@@ -883,7 +955,10 @@ def _materialize_locked(
             mode=PUBLISHED_METADATA_MODE,
         )
         _verify_generation(staging, manifest_bytes, manifest)
-        _fsync_tree_directories(staging)
+        # Every regular file has already passed a complete size and digest
+        # verification. Flush the staged generation once at filesystem scope
+        # instead of issuing one fsync syscall per archive member.
+        _sync_volume_filesystem(runtime_root)
 
         _publish_generation(runtime_root, staging, generation)
         published = True
@@ -898,6 +973,7 @@ def _materialize_locked(
             "archive_size_bytes": archive_size,
             "archive_sha256": archive_sha256,
             "entry_count": len(expected),
+            "materialized_bytes": manifest["file_tree"]["total_bytes"],
             "current_updated": current_updated,
         }
     finally:
@@ -927,7 +1003,7 @@ class RuntimeMaterializer:
         _ensure_real_directory(self.volume_root, create=True)
         _require_volume_root_traversable(self.volume_root)
         _ensure_real_directory(self.runtime_root, create=True)
-        _chmod_directory(self.runtime_root, RUNTIME_ROOT_MODE, error_code="volume_io")
+        _chmod_directory(self.runtime_root, RUNTIME_ROOT_MODE, error_code="volume_write_failed")
         lock_path = self.runtime_root / LOCK_NAME
         with _writer_lock(lock_path):
             return _materialize_locked(

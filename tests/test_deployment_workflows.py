@@ -301,7 +301,7 @@ def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifac
     parsed = yaml.safe_load(workflow)
     job = parsed["jobs"]["publish-runtime-slim"]
 
-    assert job["needs"] == ["build-base", "audit-base-runtime"]
+    assert job["needs"] == ["build-base", "audit-base-runtime", "build-runtime-materializer"]
     assert job["permissions"] == {"contents": "read", "packages": "write"}
     assert job["timeout-minutes"] == 360
     block = workflow.split("  publish-runtime-slim:\n", 1)[1]
@@ -511,13 +511,46 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
     block = workflow.split("  publish-runtime-slim:\n", 1)[1]
 
     release = block.index("Release base and exporter images before local volume materialization")
+    entrypoint_smoke = block.index("Smoke-test runtime-materializer image against exported archive")
     materialize = block.index("Materialize runtime into a local simulated Network Volume")
     smoke = block.index("Smoke-test materialized runtime through slim launcher contracts")
     remove_volume = block.index("Remove local simulated runtime volume after smoke")
     push = block.index("Push the immutable slim launcher image")
     publisher = block.index("Publish verified runtime archive to object store")
     cleanup = block.index("Delete the runner-local runtime archive")
-    assert release < materialize < smoke < remove_volume < push < publisher < cleanup
+    assert entrypoint_smoke < release < materialize < smoke < remove_volume < push < publisher < cleanup
+
+    entrypoint_block = block.split(
+        "      - name: Smoke-test runtime-materializer image against exported archive\n", 1
+    )[1].split(
+        "      # The base and exporter images have already done their work", 1
+    )[0]
+    for option in (
+        "RUNTIME_ARCHIVE_URL",
+        "RUNTIME_MANIFEST_URL",
+        "RUNTIME_ARCHIVE_SHA256",
+        "RUNTIME_ARCHIVE_SIZE_BYTES",
+        "RUNTIME_MANIFEST_SHA256",
+        "RUNTIME_MANIFEST_SIZE_BYTES",
+        "MATERIALIZER_TMP",
+        "REQUIRED_BYTES",
+        "df --output=avail",
+        "--network host",
+        "--read-only",
+        "--cap-drop ALL",
+        '--mount type=bind,source="$MATERIALIZER_TMP",destination=/tmp',
+        "SSL_CERT_FILE",
+        "openssl req -x509",
+        "runtime-materializer-entrypoint.json",
+        "downloaded_bytes",
+        "materialized_bytes",
+        "current_updated",
+    ):
+        assert option in entrypoint_block
+    assert "OBJECT_STORE_" not in entrypoint_block
+    assert "RUNPOD_" not in entrypoint_block
+    assert "secrets." not in entrypoint_block
+    assert "--tmpfs /tmp" not in entrypoint_block
 
     materializer_block = block.split(
         "      - name: Materialize runtime into a local simulated Network Volume\n", 1
@@ -587,6 +620,7 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
     )[0]
     for metadata in (
         "runtime-materializer.json",
+        "runtime-materializer-entrypoint.json",
         "runtime-launcher-smoke.json",
         "runtime-critical-probe.json",
     ):
