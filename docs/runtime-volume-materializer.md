@@ -64,6 +64,14 @@ metadata mismatches. Regular-file bytes are streamed into staging while their
 size and SHA-256 are recomputed. After extraction, the entire staged tree is
 walked again to detect corruption or unmanifested files.
 
+Regular-file contents are flushed with one filesystem-scoped `syncfs` barrier
+after that verification, rather than one `fsync` syscall per archive member.
+This keeps the durability boundary before publication while avoiding
+per-file syscall latency for the runtime's very large file count. The staged
+tree and its entries are still flushed before publication, while the
+generation root, metadata directories, and `current` replacement are covered
+by the publication-directory fsyncs.
+
 Only then are the exact manifest bytes and a separately fsynced `READY.json`
 written atomically. The completed staging directory is atomically renamed to
 the immutable generation. The materializer then seals only its own generation
@@ -87,7 +95,16 @@ rejects every unmanifested archive or staging entry.
 ## Output contract
 
 Successful invocations print one compact JSON object containing the status,
-runtime/archive digests, archive byte count, entry count, and whether
-`current` changed. Errors print one compact JSON object with a bounded error
-code and exit with status 2. Input filesystem paths, credentials, URLs, and
-member payloads are never included in command output.
+runtime/archive digests, archive byte count, verified materialized file-byte
+count, entry count, and whether `current` changed. Errors print one compact
+JSON object with a bounded error code and exit with status 2. Input filesystem
+paths, credentials, URLs, and member payloads are never included in command
+output.
+
+Storage failures use distinct bounded codes. A temporary file needed by the
+archive decompressor failing because the local scratch filesystem is full is
+reported as `archive_temporary_disk_exhausted`; writes, fsyncs, or directory
+publication operations on the mounted volume use `volume_write_failed`.
+Malformed or truncated decompressor output remains `archive_stream_invalid`.
+These codes carry no path or operating-system error text and are safe to pass
+through the materializer result callback.

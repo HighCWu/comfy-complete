@@ -20,15 +20,19 @@ RUNTIME_RESULT_URL                 # optional HTTPS capability callback
 ```
 
 URLs must use HTTPS, have no user-info or fragment, and every redirect must
-also use HTTPS.  The downloader sends only a fixed `GET` request with an
-identity content-encoding and a non-secret user agent.  It never adds an
+also use HTTPS.  The manifest uses one fixed `GET`; the large archive uses
+contiguous `Range: bytes=start-end` requests with identity content-encoding
+and a non-secret user agent.  A response that ignores Range is rejected, and
+each chunk must match its requested `Content-Range`, `Content-Length`, and
+body size before the next chunk is requested.  The downloader never adds an
 authorization header or reads a provider credential.  The expected archive
 digest and size must agree with the validated manifest's archive contract.
 
 When `RUNTIME_RESULT_URL` is present, the entrypoint POSTs one bounded JSON
 record after the materialization attempt.  Success contains `ok: true` plus
 all scalar fields returned by `run()` (`status`, `runtime_digest`, archive and
-manifest digests/sizes, entry count, and `current_updated`).  Failure contains
+manifest digests/sizes, `downloaded_bytes`, `materialized_bytes`, entry count,
+and `current_updated`).  Failure contains
 the bounded shape `{"ok":false,"error_code":"..."}`.  A successful
 materialization whose result POST fails exits `2` and does not print a success
 record, so a callback failure cannot be treated as successful preparation.  A

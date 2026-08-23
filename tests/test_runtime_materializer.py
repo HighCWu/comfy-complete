@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import importlib.util
 import io
 import json
-import os
 from pathlib import Path
 import shutil
 import stat
@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,6 +200,7 @@ class RuntimeMaterializerTests(unittest.TestCase):
         ready = json.loads((generation / "READY.json").read_text(encoding="utf-8"))
         self.assertEqual(ready["runtime_digest"], result["runtime_digest"])
         self.assertEqual(len(entries), result["entry_count"])
+        self.assertEqual(result["materialized_bytes"], len(b"runtime"))
         self.assertEqual((generation / "app/comfyui/main.py").read_bytes(), b"runtime")
 
     def test_published_control_paths_are_uid_neutral_but_staging_stays_private(self) -> None:
@@ -241,6 +243,7 @@ class RuntimeMaterializerTests(unittest.TestCase):
         second = materializer.materialize_runtime(archive, manifest, self.volume)
 
         self.assertEqual(second["status"], "reused")
+        self.assertEqual(second["materialized_bytes"], len(b"runtime"))
         self.assertTrue((self.volume / "runtimes" / "current").is_symlink())
         self.assertEqual(stat.S_IMODE(generation.stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE((generation / "app").stat().st_mode), 0o755)
@@ -321,6 +324,31 @@ class RuntimeMaterializerTests(unittest.TestCase):
         manifest = self._manifest(entries, archive, runtime_version="missing")
         with self.assertRaisesRegex(materializer.RuntimeMaterializerError, "archive_entries_missing"):
             materializer.materialize_runtime(archive, manifest, self.volume)
+
+    def test_archive_temporary_disk_exhaustion_has_a_bounded_code(self) -> None:
+        archive, manifest, _ = self._valid_inputs()
+        with patch.object(
+            materializer.tempfile,
+            "TemporaryFile",
+            side_effect=OSError(errno.ENOSPC, "temporary space exhausted"),
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError, "archive_temporary_disk_exhausted"
+        ):
+            materializer.materialize_runtime(archive, manifest, self.volume)
+
+    def test_network_volume_write_exhaustion_is_not_archive_stream_invalid(self) -> None:
+        archive, manifest, _ = self._valid_inputs()
+
+        with patch.object(
+            materializer.os,
+            "write",
+            side_effect=OSError(errno.ENOSPC, "volume is full"),
+        ), self.assertRaisesRegex(materializer.RuntimeMaterializerError, "volume_write_failed") as context:
+            materializer.materialize_runtime(archive, manifest, self.volume)
+
+        self.assertNotEqual(context.exception.code, "archive_stream_invalid")
+        self.assertNotIn(str(self.volume), context.exception.detail)
+        self.assertFalse((self.volume / "runtimes" / "current").exists())
 
     def test_symlink_is_preserved_but_broken_target_fails_closed(self) -> None:
         payload = b"runtime"
