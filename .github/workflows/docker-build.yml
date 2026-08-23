@@ -1279,6 +1279,21 @@ jobs:
           cp "$RUNNER_TEMP/slim-image.json" "$RUNTIME_DIR/slim-image.json"
           df -h "$RUNNER_TEMP"
 
+      # The base and exporter images have completed their work.  Drop their
+      # layers and BuildKit cache before either materializer acceptance expands
+      # the archive: the real runtime tree is about 38 GB, while a hosted
+      # runner's remaining root filesystem can otherwise fall below that.
+      # Keep the slim and materializer images—the following two smoke tests
+      # exercise those exact immutable images.
+      - name: Release build layers before runtime materialization acceptance
+        run: |
+          set -euo pipefail
+          docker image rm "comfy-runtime-exporter:${{ github.sha }}" >/dev/null 2>&1 || true
+          docker image rm "${{ steps.identity.outputs.base_image }}" >/dev/null 2>&1 || true
+          docker builder prune -af >/dev/null 2>&1 || true
+          docker image prune -f >/dev/null 2>&1 || true
+          df -h / /mnt "${{ steps.identity.outputs.runtime_dir }}"
+
       # Exercise the exact published CPU image against the real archive just
       # produced above.  The temporary HTTPS server is local-only and uses a
       # runner-generated CA mounted into the image; no object-store URL or
@@ -1446,17 +1461,6 @@ jobs:
               raise SystemExit('runtime-materializer image published an invalid current symlink')
           PY
           cp "$TLS_DIR/result.json" "$RUNTIME_DIR/runtime-materializer-entrypoint.json"
-
-      # The base and exporter images have already done their work by this
-      # point. Release their local layers before creating the second copy of
-      # the runtime on the runner. The archive and its manifest remain in
-      # RUNTIME_DIR until the publisher and final cleanup have completed.
-      - name: Release base and exporter images before local volume materialization
-        run: |
-          set -euo pipefail
-          docker image rm "comfy-runtime-exporter:${{ github.sha }}" >/dev/null 2>&1 || true
-          docker image rm "${{ steps.identity.outputs.base_image }}" >/dev/null 2>&1 || true
-          df -h / /mnt "${{ steps.identity.outputs.runtime_dir }}"
 
       - name: Materialize runtime into a local simulated Network Volume
         id: runtime-materializer
