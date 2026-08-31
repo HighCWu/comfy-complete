@@ -441,7 +441,7 @@ def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
     slim_metadata = block.index('python3 - "$SIZE" "$RUNNER_TEMP/slim-image.json"')
     export_cleanup = block.index('rm -rf "$RUNTIME_DIR"/*')
     slim_metadata_copy = block.index('cp "$RUNNER_TEMP/slim-image.json" "$RUNTIME_DIR/slim-image.json"')
-    release = block.index("Release base and exporter images before local volume materialization")
+    release = block.index("Release build layers before runtime materialization acceptance")
     materialize = block.index("Materialize runtime into a local simulated Network Volume")
     materialized_smoke = block.index("Smoke-test materialized runtime through slim launcher contracts")
     remove_volume = block.index("Remove local simulated runtime volume after smoke")
@@ -510,7 +510,7 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
     workflow = DOCKER_BUILD.read_text()
     block = workflow.split("  publish-runtime-slim:\n", 1)[1]
 
-    release = block.index("Release base and exporter images before local volume materialization")
+    release = block.index("Release build layers before runtime materialization acceptance")
     entrypoint_smoke = block.index("Smoke-test runtime-materializer image against exported archive")
     materialize = block.index("Materialize runtime into a local simulated Network Volume")
     smoke = block.index("Smoke-test materialized runtime through slim launcher contracts")
@@ -518,12 +518,12 @@ def test_runtime_materializer_smoke_precedes_publisher_and_keeps_archive_local()
     push = block.index("Push the immutable slim launcher image")
     publisher = block.index("Publish verified runtime archive to object store")
     cleanup = block.index("Delete the runner-local runtime archive")
-    assert entrypoint_smoke < release < materialize < smoke < remove_volume < push < publisher < cleanup
+    assert release < entrypoint_smoke < materialize < smoke < remove_volume < push < publisher < cleanup
 
     entrypoint_block = block.split(
         "      - name: Smoke-test runtime-materializer image against exported archive\n", 1
     )[1].split(
-        "      # The base and exporter images have already done their work", 1
+        "      - name: Materialize runtime into a local simulated Network Volume\n", 1
     )[0]
     for option in (
         "RUNTIME_ARCHIVE_URL",
