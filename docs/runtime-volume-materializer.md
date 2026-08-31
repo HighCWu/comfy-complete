@@ -70,7 +70,14 @@ This keeps the durability boundary before publication while avoiding
 per-file syscall latency for the runtime's very large file count. The staged
 tree and its entries are still flushed before publication, while the
 generation root, metadata directories, and `current` replacement are covered
-by the publication-directory fsyncs.
+by the publication-directory fsyncs, a filesystem barrier after the
+generation rename and seal but before `current` becomes visible, and a final
+filesystem barrier after the `current` replacement.
+Network filesystems that explicitly reject directory `fsync` with
+`EINVAL`/`ENOTSUP`/`EOPNOTSUPP` use those filesystem barriers instead; all
+other directory-sync errors remain terminal. If `syncfs` itself reports one
+of those unsupported-operation errors, Linux's system-wide `sync` is the
+bounded compatibility fallback.
 
 Only then are the exact manifest bytes and a separately fsynced `READY.json`
 written atomically. The completed staging directory is atomically renamed to
@@ -103,8 +110,11 @@ output.
 
 Storage failures use distinct bounded codes. A temporary file needed by the
 archive decompressor failing because the local scratch filesystem is full is
-reported as `archive_temporary_disk_exhausted`; writes, fsyncs, or directory
-publication operations on the mounted volume use `volume_write_failed`.
-Malformed or truncated decompressor output remains `archive_stream_invalid`.
-These codes carry no path or operating-system error text and are safe to pass
-through the materializer result callback.
+reported as `archive_temporary_disk_exhausted`; mounted-volume quota or space
+exhaustion uses `volume_capacity_exhausted`, filesystem-wide synchronization
+uses `volume_sync_failed`, unsupported non-capacity directory synchronization
+uses `volume_directory_sync_failed`, and other writes or publication
+operations use `volume_write_failed`. Malformed or truncated decompressor
+output remains `archive_stream_invalid`. These codes carry no path or
+operating-system error text and are safe to pass through the materializer
+result callback.
