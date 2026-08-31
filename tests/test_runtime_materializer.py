@@ -16,7 +16,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -343,12 +343,139 @@ class RuntimeMaterializerTests(unittest.TestCase):
             materializer.os,
             "write",
             side_effect=OSError(errno.ENOSPC, "volume is full"),
-        ), self.assertRaisesRegex(materializer.RuntimeMaterializerError, "volume_write_failed") as context:
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "volume_capacity_exhausted",
+        ) as context:
             materializer.materialize_runtime(archive, manifest, self.volume)
 
+        self.assertEqual(context.exception.code, "volume_capacity_exhausted")
         self.assertNotEqual(context.exception.code, "archive_stream_invalid")
         self.assertNotIn(str(self.volume), context.exception.detail)
         self.assertFalse((self.volume / "runtimes" / "current").exists())
+
+    def test_unsupported_directory_fsync_uses_filesystem_barriers(self) -> None:
+        archive, manifest, _ = self._valid_inputs()
+        original_fsync = materializer.os.fsync
+        original_sync_volume = materializer._sync_volume_filesystem
+        original_update_current = materializer._atomic_update_current
+        events: list[str] = []
+
+        def fsync(descriptor: int) -> None:
+            if stat.S_ISDIR(materializer.os.fstat(descriptor).st_mode):
+                raise OSError(errno.EINVAL, "directory fsync unsupported")
+            original_fsync(descriptor)
+
+        def sync_volume(path: Path) -> None:
+            events.append("sync")
+            original_sync_volume(path)
+
+        def update_current(runtime_root: Path, generation_name: str) -> bool:
+            events.append("current")
+            return original_update_current(runtime_root, generation_name)
+
+        with patch.object(materializer.os, "fsync", side_effect=fsync), patch.object(
+            materializer,
+            "_sync_volume_filesystem",
+            side_effect=sync_volume,
+        ), patch.object(
+            materializer,
+            "_atomic_update_current",
+            side_effect=update_current,
+        ):
+            result = materializer.materialize_runtime(archive, manifest, self.volume)
+
+        self.assertEqual(result["status"], "materialized")
+        self.assertEqual(events, ["sync", "sync", "current", "sync"])
+
+    def test_directory_fsync_io_error_stays_fail_closed(self) -> None:
+        self.volume.mkdir()
+        with patch.object(
+            materializer.os,
+            "fsync",
+            side_effect=OSError(errno.EIO, "directory I/O failure"),
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "volume_directory_sync_failed",
+        ):
+            materializer._fsync_directory(self.volume)
+
+    def test_syncfs_unsupported_falls_back_to_process_sync(self) -> None:
+        self.volume.mkdir()
+        syncfs = Mock(return_value=-1)
+        libc = Mock(syncfs=syncfs)
+        with patch.object(materializer.ctypes, "CDLL", return_value=libc), patch.object(
+            materializer.ctypes,
+            "get_errno",
+            return_value=errno.EINVAL,
+        ), patch.object(materializer.os, "sync") as process_sync:
+            materializer._sync_volume_filesystem(self.volume)
+
+        process_sync.assert_called_once_with()
+
+    def test_syncfs_io_error_stays_fail_closed(self) -> None:
+        self.volume.mkdir()
+        syncfs = Mock(return_value=-1)
+        libc = Mock(syncfs=syncfs)
+        with patch.object(materializer.ctypes, "CDLL", return_value=libc), patch.object(
+            materializer.ctypes,
+            "get_errno",
+            return_value=errno.EIO,
+        ), self.assertRaisesRegex(materializer.RuntimeMaterializerError, "volume_sync_failed"):
+            materializer._sync_volume_filesystem(self.volume)
+
+    def test_atomic_current_preserves_directory_sync_error(self) -> None:
+        runtime_root = self.volume / "runtimes"
+        generation_name = "a" * 64
+        (runtime_root / generation_name).mkdir(parents=True)
+        expected = materializer._error("volume_directory_sync_failed")
+
+        with patch.object(
+            materializer,
+            "_fsync_directory",
+            side_effect=expected,
+        ), self.assertRaises(materializer.RuntimeMaterializerError) as context:
+            materializer._atomic_update_current(runtime_root, generation_name)
+
+        self.assertIs(context.exception, expected)
+
+    def test_capacity_errors_are_classified_before_file_payload_write(self) -> None:
+        self.volume.mkdir()
+        with patch.object(
+            materializer.os,
+            "open",
+            side_effect=OSError(errno.ENOSPC, "volume is full"),
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "volume_capacity_exhausted",
+        ):
+            materializer._open_new_file(self.volume / "model.bin", 0o644)
+
+        with patch.object(
+            materializer.tempfile,
+            "NamedTemporaryFile",
+            side_effect=OSError(errno.EDQUOT, "quota exceeded"),
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "volume_capacity_exhausted",
+        ):
+            materializer._atomic_write(self.volume / "READY.json", b"{}\n", mode=0o644)
+
+    def test_process_sync_capacity_error_is_not_generic_write_failure(self) -> None:
+        self.volume.mkdir()
+        with patch.object(
+            materializer.ctypes,
+            "CDLL",
+            side_effect=AttributeError("syncfs unavailable"),
+        ), patch.object(
+            materializer.os,
+            "sync",
+            side_effect=OSError(errno.ENOSPC, "delayed capacity failure"),
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "volume_capacity_exhausted",
+        ):
+            materializer._sync_volume_filesystem(self.volume)
 
     def test_symlink_is_preserved_but_broken_target_fails_closed(self) -> None:
         payload = b"runtime"

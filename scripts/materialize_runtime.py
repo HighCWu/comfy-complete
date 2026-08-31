@@ -73,6 +73,15 @@ STORAGE_EXHAUSTION_ERRNOS = frozenset(
     for value in (errno.ENOSPC, getattr(errno, "EDQUOT", None), getattr(errno, "EFBIG", None))
     if value is not None
 )
+UNSUPPORTED_SYNC_ERRNOS = frozenset(
+    value
+    for value in (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if value is not None
+)
 
 
 class RuntimeMaterializerError(RuntimeError):
@@ -100,6 +109,12 @@ def _is_storage_exhaustion(error: OSError) -> bool:
     return error.errno in STORAGE_EXHAUSTION_ERRNOS
 
 
+def _volume_error(error: OSError, fallback: str) -> RuntimeMaterializerError:
+    """Map provider-safe storage failures without exposing paths or errno text."""
+
+    return _error("volume_capacity_exhausted" if _is_storage_exhaustion(error) else fallback)
+
+
 def _lexists(path: Path) -> bool:
     """Return whether *path* exists without following a final symlink."""
 
@@ -124,7 +139,7 @@ def _ensure_real_directory(path: Path, *, create: bool = False) -> None:
     try:
         path.mkdir(parents=True, exist_ok=True, mode=0o755)
     except OSError as error:
-        raise _error("volume_write_failed") from error
+        raise _volume_error(error, "volume_write_failed") from error
     if not _is_real_directory(path):
         raise _error("unsafe_volume_root")
 
@@ -135,7 +150,7 @@ def _chmod_directory(path: Path, mode: int, *, error_code: str) -> None:
     try:
         os.chmod(path, mode, follow_symlinks=False)
     except OSError as error:
-        raise _error(error_code) from error
+        raise _volume_error(error, error_code) from error
 
 
 def _require_volume_root_traversable(path: Path) -> None:
@@ -258,11 +273,18 @@ def _fsync_directory(path: Path) -> None:
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except OSError as error:
-        raise _error("volume_write_failed") from error
+        raise _volume_error(error, "volume_directory_sync_failed") from error
     try:
         os.fsync(descriptor)
     except OSError as error:
-        raise _error("volume_write_failed") from error
+        # POSIX permits directory fsync to fail with EINVAL when the mounted
+        # filesystem does not implement it.  RunPod Network Volumes are a
+        # network filesystem, so retain fail-closed handling for real I/O
+        # errors while relying on the filesystem-scoped barriers around
+        # publication when directory fsync is explicitly unsupported.
+        if error.errno in UNSUPPORTED_SYNC_ERRNOS:
+            return
+        raise _volume_error(error, "volume_directory_sync_failed") from error
     finally:
         os.close(descriptor)
 
@@ -284,7 +306,7 @@ def _fsync_tree_directories(root: Path) -> None:
             try:
                 metadata = child.stat(follow_symlinks=False)
             except OSError as error:
-                raise _error("volume_write_failed") from error
+                raise _volume_error(error, "volume_write_failed") from error
             if stat.S_ISDIR(metadata.st_mode):
                 stack.append(directory / child.name)
     for directory in reversed(directories):
@@ -300,14 +322,14 @@ def _sync_volume_filesystem(path: Path) -> None:
     boundary scoped to the mounted filesystem, so the complete staged tree is
     flushed once after it has passed content verification and before the
     generation is renamed into the published namespace.  A non-Linux test
-    environment falls back to Python's process-wide ``sync`` because the
+    environment falls back to Python's system-wide ``sync`` because the
     materializer already requires a POSIX directory filesystem.
     """
 
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except OSError as error:
-        raise _error("volume_write_failed") from error
+        raise _volume_error(error, "volume_sync_failed") from error
     try:
         try:
             libc = ctypes.CDLL(None, use_errno=True)
@@ -315,22 +337,31 @@ def _sync_volume_filesystem(path: Path) -> None:
         except (AttributeError, OSError):
             sync = getattr(os, "sync", None)
             if sync is None:
-                raise _error("volume_write_failed")
+                raise _error("volume_sync_failed")
             try:
                 sync()
             except OSError as error:
-                raise _error("volume_write_failed") from error
+                raise _volume_error(error, "volume_sync_failed") from error
             return
 
         syncfs.argtypes = [ctypes.c_int]
         syncfs.restype = ctypes.c_int
         if syncfs(descriptor) != 0:
             error_number = ctypes.get_errno()
-            raise OSError(error_number, os.strerror(error_number))
+            if error_number not in UNSUPPORTED_SYNC_ERRNOS:
+                raise OSError(error_number, os.strerror(error_number))
+            # Some network filesystems reject syncfs even though Linux still
+            # provides the system-wide sync barrier.  Falling back only for
+            # the documented unsupported-operation errnos preserves genuine
+            # I/O failures as terminal errors.
+            sync = getattr(os, "sync", None)
+            if sync is None:
+                raise OSError(error_number, os.strerror(error_number))
+            sync()
     except RuntimeMaterializerError:
         raise
     except OSError as error:
-        raise _error("volume_write_failed") from error
+        raise _volume_error(error, "volume_sync_failed") from error
     finally:
         os.close(descriptor)
 
@@ -356,7 +387,7 @@ def _atomic_write(path: Path, payload: bytes, *, mode: int) -> None:
     except RuntimeMaterializerError:
         raise
     except OSError as error:
-        raise _error("volume_write_failed") from error
+        raise _volume_error(error, "volume_write_failed") from error
     finally:
         if temporary is not None:
             try:
@@ -448,7 +479,7 @@ def _ensure_parents(root: Path, relative: str, expected: Mapping[str, Mapping[st
             try:
                 current.mkdir(mode=0o700)
             except OSError as error:
-                raise _error("volume_write_failed") from error
+                raise _volume_error(error, "volume_write_failed") from error
             continue
         except OSError as error:
             raise _error("volume_write_failed") from error
@@ -485,7 +516,7 @@ def _open_new_file(path: Path, mode: int) -> int:
         os.fchmod(descriptor, mode)
         return descriptor
     except OSError as error:
-        raise _error("volume_write_failed") from error
+        raise _volume_error(error, "volume_write_failed") from error
 
 
 def _extract_file(fileobj: Any, path: Path, expected: Mapping[str, Any]) -> None:
@@ -513,7 +544,7 @@ def _extract_file(fileobj: Any, path: Path, expected: Mapping[str, Any]) -> None
                         raise OSError("short file write")
                     view = view[written:]
             except OSError as error:
-                raise _error("volume_write_failed") from error
+                raise _volume_error(error, "volume_write_failed") from error
         if size != expected["size_bytes"] or digest.hexdigest() != expected["sha256"]:
             raise _error("member_digest_mismatch", "archive file content differs from manifest")
     finally:
@@ -568,7 +599,7 @@ def _extract_member(
                 destination.mkdir(mode=declared["mode"])
                 os.chmod(destination, declared["mode"], follow_symlinks=False)
             except OSError as error:
-                raise _error("volume_write_failed") from error
+                raise _volume_error(error, "volume_write_failed") from error
         except OSError as error:
             raise _error("volume_write_failed") from error
         else:
@@ -577,7 +608,7 @@ def _extract_member(
             try:
                 os.chmod(destination, declared["mode"], follow_symlinks=False)
             except OSError as error:
-                raise _error("volume_write_failed") from error
+                raise _volume_error(error, "volume_write_failed") from error
         return
 
     if kind == "symlink":
@@ -593,7 +624,7 @@ def _extract_member(
         try:
             os.symlink(target, destination)
         except OSError as error:
-            raise _error("volume_write_failed") from error
+            raise _volume_error(error, "volume_write_failed") from error
         return
 
     raise _error("manifest_invalid", "unsupported runtime entry type")
@@ -667,7 +698,7 @@ def _stream_extract(
             # A full destination can surface through the pipe after the
             # writer has failed.  Do not misreport that as corrupt archive
             # bytes; the bounded public code identifies volume capacity.
-            raise _error("volume_write_failed") from error
+            raise _error("volume_capacity_exhausted") from error
         raise _error("archive_stream_invalid") from error
     except (EOFError, tarfile.TarError, ValueError) as error:
         stop_process()
@@ -870,13 +901,13 @@ def _atomic_update_current(runtime_root: Path, generation_name: str) -> bool:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
-        raise _error("current_update_failed")
+        raise
     except OSError as error:
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
-        raise _error("current_update_failed") from error
+        raise _volume_error(error, "current_update_failed") from error
     return True
 
 
@@ -887,7 +918,7 @@ def _publish_generation(runtime_root: Path, staging: Path, generation: Path) -> 
         os.rename(staging, generation)
         _fsync_directory(runtime_root)
     except OSError as error:
-        raise _error("generation_publish_failed") from error
+        raise _volume_error(error, "generation_publish_failed") from error
 
 
 def _materialize_locked(
@@ -920,7 +951,12 @@ def _materialize_locked(
         # rename but before sealing its materializer-owned parent directories.
         # Repair that state before exposing it through current.
         _seal_published_generation(generation, manifest)
+        _sync_volume_filesystem(runtime_root)
         current_updated = _atomic_update_current(runtime_root, generation_name)
+        # Directory fsync is optional on some network filesystems.  Finish
+        # with a filesystem-scoped barrier after every metadata rename so a
+        # successful result never outruns publication durability.
+        _sync_volume_filesystem(runtime_root)
         return {
             "status": "reused",
             "runtime_digest": manifest["runtime_digest"],
@@ -938,7 +974,7 @@ def _materialize_locked(
     try:
         staging.mkdir(mode=PRIVATE_DIRECTORY_MODE)
     except OSError as error:
-        raise _error("volume_write_failed") from error
+        raise _volume_error(error, "volume_write_failed") from error
     published = False
     try:
         _stream_extract(archive_path, staging, expected)
@@ -966,7 +1002,12 @@ def _materialize_locked(
         # is complete, while an interrupted seal is recoverable by the
         # existing-generation path above and never becomes current.
         _seal_published_generation(generation, manifest)
+        _sync_volume_filesystem(runtime_root)
         current_updated = _atomic_update_current(runtime_root, generation_name)
+        # Directory fsync is optional on some network filesystems.  Finish
+        # with a filesystem-scoped barrier after every metadata rename so a
+        # successful result never outruns publication durability.
+        _sync_volume_filesystem(runtime_root)
         return {
             "status": "materialized",
             "runtime_digest": manifest["runtime_digest"],
