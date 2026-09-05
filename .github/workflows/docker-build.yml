@@ -28,6 +28,14 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   SAGEATTN_VERSION: "2.2.0"
+  # Large GHCR images are pulled serially with bounded outer retries after
+  # Docker's per-layer attempt. Rate-limit retries deliberately wait minutes
+  # so a 429 does not immediately turn into another burst of blob requests.
+  DOCKER_PULL_RETRY_ATTEMPTS: "3"
+  DOCKER_PULL_RETRY_BASE_SECONDS: "15"
+  DOCKER_PULL_RETRY_RATE_LIMIT_SECONDS: "300"
+  DOCKER_PULL_RETRY_MAX_SECONDS: "1200"
+  DOCKER_PULL_RETRY_JITTER_SECONDS: "5"
 
 jobs:
   build-sageattn:

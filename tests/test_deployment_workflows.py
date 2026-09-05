@@ -176,6 +176,10 @@ def test_runtime_audit_job_reuses_published_base_and_is_read_only():
 
 def test_large_base_pulls_limit_request_bursts_and_use_bounded_retry():
     workflow = DOCKER_BUILD.read_text()
+    parsed = yaml.safe_load(workflow)
+    assert parsed["env"]["DOCKER_PULL_RETRY_ATTEMPTS"] == "3"
+    assert parsed["env"]["DOCKER_PULL_RETRY_RATE_LIMIT_SECONDS"] == "300"
+    assert parsed["env"]["DOCKER_PULL_RETRY_MAX_SECONDS"] == "1200"
     blocks = (
         _job_block(workflow, "audit-base-runtime", "publish-runtime-slim"),
         workflow.split("  publish-runtime-slim:\n", 1)[1],
@@ -191,6 +195,9 @@ def test_large_base_pulls_limit_request_bursts_and_use_bounded_retry():
     assert 'DOCKER_PULL_RETRY_ATTEMPTS:-5' in retry_script
     assert "attempt <= max_attempts" in retry_script
     assert "base_delay * (1 << (attempt - 1))" in retry_script
+    assert "rate_limit_base_delay" in retry_script
+    assert "parse_retry_after_seconds" in retry_script
+    assert "max_delay" in retry_script
     assert "toomanyrequests" in retry_script
 
 
@@ -207,7 +214,7 @@ def test_docker_pull_daemon_config_merges_existing_keys(tmp_path: Path):
         "data-root": "/mnt/docker",
         "debug": True,
         "max-concurrent-downloads": 1,
-        "max-download-attempts": 5,
+        "max-download-attempts": 1,
     }
 
 
@@ -223,10 +230,18 @@ if [ "$FAKE_DOCKER_MODE" = transient-then-success ] && [ "$count" -ge 3 ]; then
   echo 'pull complete'
   exit 0
 fi
+if [ "$FAKE_DOCKER_MODE" = rate-limit-then-success ] && [ "$count" -ge 2 ]; then
+  echo 'pull complete'
+  exit 0
+fi
 if [ "$FAKE_DOCKER_MODE" = permanent ]; then
   echo 'unauthorized: authentication required' >&2
+elif [ "$FAKE_DOCKER_MODE" = rate-limit-then-success ] && [ "$count" -lt 2 ]; then
+  echo "toomanyrequests: retry-after: ${FAKE_RETRY_AFTER:-1}" >&2
+elif [ "$FAKE_DOCKER_MODE" = always-rate-limit ]; then
+  echo "toomanyrequests: retry-after: ${FAKE_RETRY_AFTER:-1}" >&2
 else
-  echo 'toomanyrequests: retry-after: 265ms' >&2
+  echo 'temporary failure: connection reset' >&2
 fi
 exit 1
 """
@@ -294,6 +309,79 @@ def test_docker_pull_retry_stops_after_five_transient_failures(tmp_path: Path):
     assert (tmp_path / "count").read_text() == "5"
     assert (tmp_path / "sleeps").read_text().splitlines() == ["0", "0", "0", "0"]
     assert "exhausted 5 attempts" in result.stderr
+
+
+def test_docker_pull_retry_uses_retry_after_for_rate_limits(tmp_path: Path):
+    env = _write_fake_pull_commands(tmp_path)
+    env.update(
+        {
+            "FAKE_DOCKER_MODE": "rate-limit-then-success",
+            "FAKE_RETRY_AFTER": "480.25s",
+            "DOCKER_PULL_RETRY_ATTEMPTS": "2",
+            "DOCKER_PULL_RETRY_RATE_LIMIT_SECONDS": "300",
+            "DOCKER_PULL_RETRY_MAX_SECONDS": "900",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(DOCKER_PULL_RETRY), "ghcr.io/example/image:immutable"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "count").read_text() == "2"
+    assert (tmp_path / "sleeps").read_text().splitlines() == ["481"]
+    assert "rate limit detected" in result.stderr
+
+
+def test_docker_pull_retry_parses_fractional_milliseconds(tmp_path: Path):
+    env = _write_fake_pull_commands(tmp_path)
+    env.update(
+        {
+            "FAKE_DOCKER_MODE": "rate-limit-then-success",
+            "FAKE_RETRY_AFTER": "265.247106ms",
+            "DOCKER_PULL_RETRY_ATTEMPTS": "2",
+            "DOCKER_PULL_RETRY_RATE_LIMIT_SECONDS": "0",
+            "DOCKER_PULL_RETRY_MAX_SECONDS": "900",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(DOCKER_PULL_RETRY), "ghcr.io/example/image:immutable"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "sleeps").read_text().splitlines() == ["1"]
+
+
+def test_docker_pull_retry_backs_off_rate_limits_and_caps_the_delay(tmp_path: Path):
+    env = _write_fake_pull_commands(tmp_path)
+    env.update(
+        {
+            "FAKE_DOCKER_MODE": "always-rate-limit",
+            "FAKE_RETRY_AFTER": "1",
+            "DOCKER_PULL_RETRY_ATTEMPTS": "4",
+            "DOCKER_PULL_RETRY_RATE_LIMIT_SECONDS": "300",
+            "DOCKER_PULL_RETRY_MAX_SECONDS": "600",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(DOCKER_PULL_RETRY), "ghcr.io/example/image:immutable"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert (tmp_path / "count").read_text() == "4"
+    assert (tmp_path / "sleeps").read_text().splitlines() == ["300", "600", "600"]
+    assert "exhausted 4 attempts" in result.stderr
 
 
 def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifacts():
