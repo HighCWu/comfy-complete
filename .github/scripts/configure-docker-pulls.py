@@ -19,8 +19,11 @@ def main() -> None:
     else:
         config = {}
 
+    # GHCR may rate-limit a burst of layer requests.  Serialize downloads and
+    # leave retries to docker-pull-with-retry.sh, which can wait for a 429's
+    # Retry-After window instead of immediately re-requesting every layer.
     config["max-concurrent-downloads"] = 1
-    config["max-download-attempts"] = 5
+    config["max-download-attempts"] = 1
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
     descriptor, temporary_name = tempfile.mkstemp(
