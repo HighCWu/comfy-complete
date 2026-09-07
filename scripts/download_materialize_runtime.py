@@ -66,13 +66,25 @@ TEMP_STORAGE_EXHAUSTION_ERRNOS = frozenset(
 class RuntimeDownloadError(RuntimeError):
     """A bounded, path-free error returned by the image entrypoint."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, diagnostics: Mapping[str, int] | None = None) -> None:
         self.code = code
+        self.diagnostics = {
+            key: value
+            for key, value in (diagnostics or {}).items()
+            if isinstance(key, str)
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
         super().__init__(code)
 
 
-def _error(code: str) -> RuntimeDownloadError:
-    return RuntimeDownloadError(code)
+def _error(
+    code: str,
+    *,
+    diagnostics: Mapping[str, int] | None = None,
+) -> RuntimeDownloadError:
+    return RuntimeDownloadError(code, diagnostics=diagnostics)
 
 
 def _is_storage_exhaustion(error: OSError) -> bool:
@@ -523,7 +535,7 @@ def run(config: RuntimeDownloadConfig) -> Mapping[str, object]:
         try:
             result = materialize_runtime(archive_path, manifest_path, config.volume_root)
         except RuntimeMaterializerError as error:
-            raise _error(error.code) from None
+            raise _error(error.code, diagnostics=error.diagnostics) from None
         except (OSError, ValueError) as error:
             del error
             raise _error("materialization_failed") from None
@@ -550,6 +562,22 @@ def run(config: RuntimeDownloadConfig) -> Mapping[str, object]:
     ):
         raise _error("materialization_result_invalid")
     output["materialized_bytes"] = materialized_bytes
+    # Keep the result contract scalar and bounded while forwarding optional
+    # filesystem snapshots added by the provider-neutral materializer.  Older
+    # materializer images simply omit these fields.
+    for key in (
+        "volume_total_bytes",
+        "volume_free_bytes_before",
+        "volume_free_bytes_after",
+        "volume_total_inodes",
+        "volume_free_inodes_before",
+        "volume_free_inodes_after",
+        "hardlink_count",
+        "hardlink_saved_bytes",
+    ):
+        value = result.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            output[key] = value
     return output
 
 
@@ -574,11 +602,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = RuntimeDownloadConfig.from_environment(volume_root_override=args.volume_root)
         result = run(config)
     except RuntimeDownloadError as error:
+        error_payload: dict[str, object] = {"ok": False, "error_code": error.code}
+        if error.diagnostics:
+            error_payload["diagnostics"] = error.diagnostics
         if config is not None and config.result_url is not None:
             try:
                 _post_result(
                     config.result_url,
-                    {"ok": False, "error_code": error.code},
+                    error_payload,
                     timeout_seconds=config.timeout_seconds,
                 )
             except RuntimeDownloadError:
@@ -586,7 +617,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # In particular, a failed result report can never turn a
                 # failed materialization into a success.
                 pass
-        print(_json_result({"status": "error", "error": error.code}), flush=True)
+        output_payload: dict[str, object] = {"status": "error", "error": error.code}
+        if error.diagnostics:
+            output_payload["diagnostics"] = error.diagnostics
+        print(_json_result(output_payload), flush=True)
         return 2
     except (OSError, ValueError):
         if config is not None and config.result_url is not None:

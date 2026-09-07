@@ -32,8 +32,11 @@ When `RUNTIME_RESULT_URL` is present, the entrypoint POSTs one bounded JSON
 record after the materialization attempt.  Success contains `ok: true` plus
 all scalar fields returned by `run()` (`status`, `runtime_digest`, archive and
 manifest digests/sizes, `downloaded_bytes`, `materialized_bytes`, entry count,
-and `current_updated`).  Failure contains
-the bounded shape `{"ok":false,"error_code":"..."}`.  A successful
+`current_updated`, hardlink count/bytes saved, and best-effort block/inode
+capacity snapshots).  Failure
+contains the bounded shape `{"ok":false,"error_code":"..."}` and may include
+provider-safe `diagnostics` counters for the same block/inode snapshot and
+expected runtime totals.  A successful
 materialization whose result POST fails exits `2` and does not print a success
 record, so a callback failure cannot be treated as successful preparation.  A
 materialization failure always exits `2`, regardless of whether its failure
@@ -42,7 +45,12 @@ callback succeeds.
 The archive is streamed once to the CPU container's disposable `/tmp` disk,
 then passed to `scripts/materialize_runtime.py`.  The existing materializer
 holds its writer lock and verifies the complete tar stream before atomically
-publishing a generation and replacing:
+publishing a generation and replacing. Identical regular files (matching
+SHA-256, byte size, and mode) are still fully consumed and verified from the
+tar stream, then published as hardlink aliases to reduce Network Volume block
+and inode pressure. The curated runtime must treat these source files as
+immutable and use atomic replacement for intentional rewrites. The published
+generation replaces:
 
 ```text
 /runpod-volume/runtimes/current
@@ -52,10 +60,10 @@ publishing a generation and replacing:
 entrypoint refuses to create a missing volume root, so an absent Network
 Volume cannot silently consume container-disk space.  A successful invocation
 prints one compact JSON record containing only digests, byte counts, runtime
-identity, entry count, and publication status.  Failure prints a bounded
-error code and exits `2`; temporary downloads are removed and the previous
-`current` generation remains under the materializer's atomic-failure
-contract.
+identity, entry count, publication status, and provider-safe capacity
+snapshots.  Failure prints a bounded error code and optional capacity
+diagnostics, then exits `2`; temporary downloads are removed and the previous
+`current` generation remains under the materializer's atomic-failure contract.
 
 The current runtime archive is about 15.75GB, so the CPU Pod's container disk
 must leave at least that much free space plus a small safety margin.  The

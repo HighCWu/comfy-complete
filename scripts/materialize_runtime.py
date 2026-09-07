@@ -92,10 +92,27 @@ class RuntimeMaterializerError(RuntimeError):
     filesystem path can never appear in its bounded JSON output.
     """
 
-    def __init__(self, code: str, detail: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        detail: str | None = None,
+        *,
+        diagnostics: Mapping[str, int] | None = None,
+    ) -> None:
         self.code = code
         self.reason = code
         self.detail = detail or code
+        # Diagnostics are deliberately limited to non-negative integer
+        # counters.  They are safe to forward through the short-lived result
+        # callback and cannot contain paths, URLs, or filesystem error text.
+        self.diagnostics = {
+            key: value
+            for key, value in (diagnostics or {}).items()
+            if isinstance(key, str)
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
         super().__init__(f"{code}: {self.detail}")
 
 
@@ -113,6 +130,60 @@ def _volume_error(error: OSError, fallback: str) -> RuntimeMaterializerError:
     """Map provider-safe storage failures without exposing paths or errno text."""
 
     return _error("volume_capacity_exhausted" if _is_storage_exhaustion(error) else fallback)
+
+
+def _volume_capacity_metrics(path: Path) -> dict[str, int]:
+    """Return provider-safe block and inode counters for *path*.
+
+    ``statvfs.f_bavail``/``f_favail`` describe capacity available to the
+    materializer's unprivileged process.  That distinction matters on a
+    mounted volume with reserved blocks: ``f_bfree`` can still be non-zero
+    while a normal container process receives ``ENOSPC``.  The metrics are
+    intentionally snapshots rather than promises; network filesystems can
+    update them asynchronously.
+    """
+
+    stats = os.statvfs(path)
+    fragment = stats.f_frsize or stats.f_bsize
+    if fragment <= 0:
+        raise OSError(errno.EIO, "invalid filesystem block size")
+    free_inodes = getattr(stats, "f_favail", stats.f_ffree)
+    return {
+        "volume_total_bytes": max(0, int(fragment * stats.f_blocks)),
+        "volume_free_bytes": max(0, int(fragment * stats.f_bavail)),
+        "volume_total_inodes": max(0, int(stats.f_files)),
+        "volume_free_inodes": max(0, int(free_inodes)),
+    }
+
+
+def _try_volume_capacity_metrics(path: Path) -> dict[str, int]:
+    """Best-effort metrics for result diagnostics; never mask the real error."""
+
+    try:
+        return _volume_capacity_metrics(path)
+    except (OSError, AttributeError, TypeError, ValueError):
+        return {}
+
+
+def _success_capacity_metrics(
+    before: Mapping[str, int] | None,
+    after: Mapping[str, int] | None,
+) -> dict[str, int]:
+    """Rename snapshot fields into stable success-result names."""
+
+    fields: dict[str, int] = {}
+    for snapshot_name, suffix in ((before, "before"), (after, "after")):
+        if not snapshot_name:
+            continue
+        for key in ("volume_total_bytes", "volume_total_inodes"):
+            value = snapshot_name.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                fields[key] = value
+        for key in ("volume_free_bytes", "volume_free_inodes"):
+            value = snapshot_name.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                fields[f"{key}_{suffix}"] = value
+    return fields
 
 
 def _lexists(path: Path) -> bool:
@@ -551,13 +622,82 @@ def _extract_file(fileobj: Any, path: Path, expected: Mapping[str, Any]) -> None
         os.close(descriptor)
 
 
+def _consume_file(
+    fileobj: Any,
+    expected: Mapping[str, Any],
+) -> tuple[int, str]:
+    """Consume and hash a tar payload without publishing its bytes."""
+
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        try:
+            chunk = fileobj.read(CHUNK_BYTES)
+        except OSError as error:
+            raise _error("archive_stream_invalid") from error
+        if not chunk:
+            break
+        size += len(chunk)
+        digest.update(chunk)
+    actual = digest.hexdigest()
+    if size != expected["size_bytes"] or actual != expected["sha256"]:
+        raise _error("member_digest_mismatch", "archive file content differs from manifest")
+    return size, actual
+
+
+def _extract_or_link_file(
+    fileobj: Any,
+    path: Path,
+    expected: Mapping[str, Any],
+    canonical_path: Path | None,
+) -> bool:
+    """Verify one payload and optionally publish it as a hardlink.
+
+    The manifest is sorted by path, so a dedupe target selected from the
+    first occurrence of each `(sha256, size, mode)` key is encountered before
+    its aliases in archives produced by the exporter.  We still fall back to
+    a normal write if a non-conforming archive presents an alias first; this
+    preserves correctness without trusting archive ordering.
+    """
+
+    if canonical_path is None or not canonical_path.is_file():
+        _extract_file(fileobj, path, expected)
+        return False
+
+    _consume_file(fileobj, expected)
+    try:
+        os.link(canonical_path, path)
+    except OSError as error:
+        # The payload has already been consumed and cannot be replayed from a
+        # streaming tar.  A filesystem that rejects hardlinks is therefore a
+        # terminal publication failure rather than a silent duplicate write.
+        raise _volume_error(error, "volume_write_failed") from error
+    return True
+
+
+def _dedupe_targets(expected: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+    """Map duplicate regular files to the first path with identical metadata."""
+
+    canonical: dict[tuple[str, int, int], str] = {}
+    aliases: dict[str, str] = {}
+    for path, entry in expected.items():
+        if entry["type"] != "file":
+            continue
+        key = (entry["sha256"], entry["size_bytes"], entry["mode"])
+        first = canonical.setdefault(key, path)
+        if first != path:
+            aliases[path] = first
+    return aliases
+
+
 def _extract_member(
     member: tarfile.TarInfo,
     archive: tarfile.TarFile,
     staging: Path,
     expected: Mapping[str, Mapping[str, Any]],
     seen: set[str],
-) -> None:
+    dedupe_targets: Mapping[str, str],
+) -> bool:
     path_name = _safe_member_path(member.name)
     declared = expected.get(path_name)
     if declared is None:
@@ -582,8 +722,12 @@ def _extract_member(
         fileobj = archive.extractfile(member)
         if fileobj is None:
             raise _error("member_payload_missing", "archive file payload is unavailable")
-        _extract_file(fileobj, destination, declared)
-        return
+        return _extract_or_link_file(
+            fileobj,
+            destination,
+            declared,
+            staging / dedupe_targets[path_name] if path_name in dedupe_targets else None,
+        )
 
     if kind == "directory":
         if member.type != tarfile.DIRTYPE or member.size != 0:
@@ -609,7 +753,7 @@ def _extract_member(
                 os.chmod(destination, declared["mode"], follow_symlinks=False)
             except OSError as error:
                 raise _volume_error(error, "volume_write_failed") from error
-        return
+        return False
 
     if kind == "symlink":
         if member.type != tarfile.SYMTYPE or member.size != 0:
@@ -625,7 +769,7 @@ def _extract_member(
             os.symlink(target, destination)
         except OSError as error:
             raise _volume_error(error, "volume_write_failed") from error
-        return
+        return False
 
     raise _error("manifest_invalid", "unsupported runtime entry type")
 
@@ -634,7 +778,7 @@ def _stream_extract(
     archive_path: Path,
     staging: Path,
     expected: Mapping[str, Mapping[str, Any]],
-) -> None:
+) -> dict[str, int]:
     zstd = _require_zstd()
     try:
         stderr_file = tempfile.TemporaryFile(mode="w+b")
@@ -669,10 +813,17 @@ def _stream_extract(
         raise _error("archive_stream_invalid")
     stdout = process.stdout
     seen: set[str] = set()
+    dedupe_targets = _dedupe_targets(expected)
+    hardlink_count = 0
+    hardlink_saved_bytes = 0
     try:
         with tarfile.open(fileobj=stdout, mode="r|") as tar:
             for member in tar:
-                _extract_member(member, tar, staging, expected, seen)
+                path_name = _safe_member_path(member.name)
+                linked = _extract_member(member, tar, staging, expected, seen, dedupe_targets)
+                if linked:
+                    hardlink_count += 1
+                    hardlink_saved_bytes += int(expected[path_name]["size_bytes"])
 
         # tarfile stops at the first end-of-archive block.  Drain the zstd
         # pipe so a concatenated/trailing non-zero tar payload cannot be
@@ -709,6 +860,10 @@ def _stream_extract(
 
     if seen != set(expected):
         raise _error("archive_entries_missing", "archive does not contain exactly the manifest entries")
+    return {
+        "hardlink_count": hardlink_count,
+        "hardlink_saved_bytes": hardlink_saved_bytes,
+    }
 
 
 def _walk_tree(root: Path) -> Iterator[tuple[str, Path, os.stat_result]]:
@@ -928,6 +1083,7 @@ def _materialize_locked(
     archive_size: int,
     archive_sha256: str,
     runtime_root: Path,
+    capacity_before: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
     runtime_hex = manifest["runtime_digest"].removeprefix("sha256:")
     generation_name = runtime_hex
@@ -957,7 +1113,7 @@ def _materialize_locked(
         # with a filesystem-scoped barrier after every metadata rename so a
         # successful result never outruns publication durability.
         _sync_volume_filesystem(runtime_root)
-        return {
+        result: dict[str, object] = {
             "status": "reused",
             "runtime_digest": manifest["runtime_digest"],
             "archive_size_bytes": archive_size,
@@ -965,7 +1121,11 @@ def _materialize_locked(
             "entry_count": len(expected),
             "materialized_bytes": manifest["file_tree"]["total_bytes"],
             "current_updated": current_updated,
+            "hardlink_count": 0,
+            "hardlink_saved_bytes": 0,
         }
+        result.update(_success_capacity_metrics(capacity_before, _try_volume_capacity_metrics(runtime_root)))
+        return result
 
     staging_root = runtime_root / STAGING_DIRECTORY
     _ensure_real_directory(staging_root, create=True)
@@ -977,7 +1137,7 @@ def _materialize_locked(
         raise _volume_error(error, "volume_write_failed") from error
     published = False
     try:
-        _stream_extract(archive_path, staging, expected)
+        extraction_metrics = _stream_extract(archive_path, staging, expected)
         _verify_tree(staging, manifest)
 
         _atomic_write(staging / MANIFEST_NAME, manifest_bytes, mode=PUBLISHED_METADATA_MODE)
@@ -1008,7 +1168,7 @@ def _materialize_locked(
         # with a filesystem-scoped barrier after every metadata rename so a
         # successful result never outruns publication durability.
         _sync_volume_filesystem(runtime_root)
-        return {
+        result = {
             "status": "materialized",
             "runtime_digest": manifest["runtime_digest"],
             "archive_size_bytes": archive_size,
@@ -1016,7 +1176,18 @@ def _materialize_locked(
             "entry_count": len(expected),
             "materialized_bytes": manifest["file_tree"]["total_bytes"],
             "current_updated": current_updated,
+            **extraction_metrics,
         }
+        result.update(_success_capacity_metrics(capacity_before, _try_volume_capacity_metrics(runtime_root)))
+        return result
+    except RuntimeMaterializerError as error:
+        # Capture the mounted filesystem while the failed staging generation
+        # still exists.  The finally block below removes that private tree;
+        # taking this snapshot in the outer caller would otherwise make a
+        # capacity failure look as though it never consumed the blocks/inodes
+        # that triggered it.
+        error.diagnostics.update(_try_volume_capacity_metrics(runtime_root))
+        raise
     finally:
         if not published:
             _remove_tree(staging)
@@ -1047,14 +1218,32 @@ class RuntimeMaterializer:
         _chmod_directory(self.runtime_root, RUNTIME_ROOT_MODE, error_code="volume_write_failed")
         lock_path = self.runtime_root / LOCK_NAME
         with _writer_lock(lock_path):
-            return _materialize_locked(
-                Path(archive_path),
-                manifest_bytes,
-                manifest,
-                archive_size,
-                archive_sha256,
-                self.runtime_root,
-            )
+            capacity_before = _try_volume_capacity_metrics(self.volume_root)
+            try:
+                return _materialize_locked(
+                    Path(archive_path),
+                    manifest_bytes,
+                    manifest,
+                    archive_size,
+                    archive_sha256,
+                    self.runtime_root,
+                    capacity_before,
+                )
+            except RuntimeMaterializerError as error:
+                # Preserve the bounded primary code while attaching the
+                # immutable expected totals. The inner materializer captures
+                # the live capacity snapshot before its staging cleanup; the
+                # caller must not overwrite that failure-time evidence. A
+                # best-effort post-cleanup snapshot is still useful for early
+                # failures that occurred before the inner extraction try.
+                for key, value in _try_volume_capacity_metrics(self.volume_root).items():
+                    error.diagnostics.setdefault(key, value)
+                error.diagnostics.update({
+                    "expected_materialized_bytes": int(manifest["file_tree"]["total_bytes"]),
+                    "expected_entry_count": len(manifest["file_tree"]["entries"]),
+                    "archive_size_bytes": archive_size,
+                })
+                raise
 
 
 def materialize_runtime(

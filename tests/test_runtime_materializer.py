@@ -202,6 +202,15 @@ class RuntimeMaterializerTests(unittest.TestCase):
         self.assertEqual(len(entries), result["entry_count"])
         self.assertEqual(result["materialized_bytes"], len(b"runtime"))
         self.assertEqual((generation / "app/comfyui/main.py").read_bytes(), b"runtime")
+        for key in (
+            "volume_total_bytes",
+            "volume_free_bytes_before",
+            "volume_free_bytes_after",
+            "volume_total_inodes",
+            "volume_free_inodes_before",
+            "volume_free_inodes_after",
+        ):
+            self.assertIsInstance(result[key], int)
 
     def test_published_control_paths_are_uid_neutral_but_staging_stays_private(self) -> None:
         archive, manifest, _ = self._valid_inputs()
@@ -228,6 +237,178 @@ class RuntimeMaterializerTests(unittest.TestCase):
             self.assertEqual(mode & 0o002, 0)
         self.assertEqual(stat.S_IMODE((generation / "app/comfyui").stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE((generation / "app/comfyui/main.py").stat().st_mode), 0o755)
+
+    def test_identical_files_are_verified_then_hardlinked_but_modes_remain_distinct(self) -> None:
+        payload = b"shared-runtime-payload"
+        digest = hashlib.sha256(payload).hexdigest()
+        entries = [
+            {"path": "app/comfyui", "type": "directory", "mode": 0o755, "size_bytes": 0},
+            {
+                "path": "app/comfyui/b.py",
+                "type": "file",
+                "mode": 0o755,
+                "size_bytes": len(payload),
+                "sha256": digest,
+            },
+            {
+                "path": "app/comfyui/c.py",
+                "type": "file",
+                "mode": 0o644,
+                "size_bytes": len(payload),
+                "sha256": digest,
+            },
+            {
+                "path": "app/comfyui/main.py",
+                "type": "file",
+                "mode": 0o755,
+                "size_bytes": len(payload),
+                "sha256": digest,
+            },
+        ]
+        archive = self._archive(
+            [
+                {"path": "app/comfyui", "type": "directory", "mode": 0o755},
+                {"path": "app/comfyui/b.py", "type": "file", "mode": 0o755, "payload": payload},
+                {"path": "app/comfyui/c.py", "type": "file", "mode": 0o644, "payload": payload},
+                {"path": "app/comfyui/main.py", "type": "file", "mode": 0o755, "payload": payload},
+            ],
+            name_prefix="dedupe",
+        )
+        manifest = self._manifest(entries, archive, runtime_version="dedupe")
+
+        result = materializer.materialize_runtime(archive, manifest, self.volume)
+
+        generation = self.volume / "runtimes" / str(result["runtime_digest"])[len("sha256:") :]
+        first = generation / "app/comfyui/b.py"
+        duplicate = generation / "app/comfyui/main.py"
+        distinct_mode = generation / "app/comfyui/c.py"
+        self.assertEqual(first.stat().st_ino, duplicate.stat().st_ino)
+        self.assertNotEqual(first.stat().st_ino, distinct_mode.stat().st_ino)
+        self.assertEqual(result["hardlink_count"], 1)
+        self.assertEqual(result["hardlink_saved_bytes"], len(payload))
+
+    def test_duplicate_payload_is_hashed_before_hardlink_publication(self) -> None:
+        payload = b"shared-runtime-payload"
+        digest = hashlib.sha256(payload).hexdigest()
+        entries = [
+            {"path": "app/comfyui", "type": "directory", "mode": 0o755, "size_bytes": 0},
+            {
+                "path": "app/comfyui/b.py",
+                "type": "file",
+                "mode": 0o755,
+                "size_bytes": len(payload),
+                "sha256": digest,
+            },
+            {
+                "path": "app/comfyui/main.py",
+                "type": "file",
+                "mode": 0o755,
+                "size_bytes": len(payload),
+                "sha256": digest,
+            },
+        ]
+        archive = self._archive(
+            [
+                {"path": "app/comfyui", "type": "directory", "mode": 0o755},
+                {"path": "app/comfyui/b.py", "type": "file", "mode": 0o755, "payload": payload},
+                {"path": "app/comfyui/main.py", "type": "file", "mode": 0o755, "payload": b"tampered-runtime-data!"},
+            ],
+            name_prefix="dedupe-tampered",
+        )
+        manifest = self._manifest(entries, archive, runtime_version="dedupe-tampered")
+
+        with self.assertRaisesRegex(materializer.RuntimeMaterializerError, "member_digest_mismatch"):
+            materializer.materialize_runtime(archive, manifest, self.volume)
+        self.assertFalse((self.volume / "runtimes" / "current").exists())
+
+    def test_alias_before_canonical_falls_back_without_false_hardlink_metric(self) -> None:
+        payload = b"shared-runtime-payload"
+        digest = hashlib.sha256(payload).hexdigest()
+        entries = [
+            {"path": "app/comfyui", "type": "directory", "mode": 0o755, "size_bytes": 0},
+            {
+                "path": "app/comfyui/b.py",
+                "type": "file",
+                "mode": 0o755,
+                "size_bytes": len(payload),
+                "sha256": digest,
+            },
+            {
+                "path": "app/comfyui/main.py",
+                "type": "file",
+                "mode": 0o755,
+                "size_bytes": len(payload),
+                "sha256": digest,
+            },
+        ]
+        # The manifest remains canonical/sorted, but this archive deliberately
+        # presents the alias first. The materializer must preserve both files
+        # and report that no hardlink was actually created.
+        archive = self._archive(
+            [
+                {"path": "app/comfyui", "type": "directory", "mode": 0o755},
+                {"path": "app/comfyui/main.py", "type": "file", "mode": 0o755, "payload": payload},
+                {"path": "app/comfyui/b.py", "type": "file", "mode": 0o755, "payload": payload},
+            ],
+            name_prefix="dedupe-alias-first",
+        )
+        manifest = self._manifest(entries, archive, runtime_version="dedupe-alias-first")
+
+        result = materializer.materialize_runtime(archive, manifest, self.volume)
+
+        generation = self.volume / "runtimes" / str(result["runtime_digest"])[len("sha256:") :]
+        self.assertNotEqual(
+            (generation / "app/comfyui/main.py").stat().st_ino,
+            (generation / "app/comfyui/b.py").stat().st_ino,
+        )
+        self.assertEqual(result["hardlink_count"], 0)
+        self.assertEqual(result["hardlink_saved_bytes"], 0)
+
+    def test_capacity_diagnostics_capture_staging_before_cleanup(self) -> None:
+        archive, manifest, _ = self._valid_inputs()
+        before = {
+            "volume_total_bytes": 1000,
+            "volume_free_bytes": 900,
+            "volume_total_inodes": 100,
+            "volume_free_inodes": 90,
+        }
+        failure = {
+            "volume_total_bytes": 1000,
+            "volume_free_bytes": 20,
+            "volume_total_inodes": 100,
+            "volume_free_inodes": 0,
+        }
+        after = {
+            "volume_total_bytes": 1000,
+            "volume_free_bytes": 900,
+            "volume_total_inodes": 100,
+            "volume_free_inodes": 90,
+        }
+        staging_root = self.volume / "runtimes" / ".staging"
+        observed_staging: list[bool] = []
+
+        def metrics(_path: Path) -> dict[str, int]:
+            observed_staging.append(staging_root.exists() and any(staging_root.iterdir()))
+            return (before, failure, after)[min(len(observed_staging) - 1, 2)]
+
+        def fail_extract(_archive: Path, staging: Path, _expected: object) -> None:
+            (staging / "partial").write_bytes(b"partial")
+            raise materializer._error("volume_capacity_exhausted")
+
+        with patch.object(materializer, "_try_volume_capacity_metrics", side_effect=metrics), patch.object(
+            materializer,
+            "_stream_extract",
+            side_effect=fail_extract,
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "volume_capacity_exhausted",
+        ) as context:
+            materializer.materialize_runtime(archive, manifest, self.volume)
+
+        self.assertEqual(observed_staging, [False, True, False])
+        self.assertEqual(context.exception.diagnostics["volume_free_bytes"], 20)
+        self.assertEqual(context.exception.diagnostics["volume_free_inodes"], 0)
+        self.assertEqual(list(staging_root.iterdir()), [])
 
     def test_interrupted_seal_is_repaired_before_current_is_exposed(self) -> None:
         archive, manifest, _ = self._valid_inputs()
@@ -352,6 +533,15 @@ class RuntimeMaterializerTests(unittest.TestCase):
         self.assertEqual(context.exception.code, "volume_capacity_exhausted")
         self.assertNotEqual(context.exception.code, "archive_stream_invalid")
         self.assertNotIn(str(self.volume), context.exception.detail)
+        self.assertIsInstance(context.exception.diagnostics["volume_total_bytes"], int)
+        self.assertIsInstance(context.exception.diagnostics["volume_free_bytes"], int)
+        self.assertIsInstance(context.exception.diagnostics["volume_total_inodes"], int)
+        self.assertIsInstance(context.exception.diagnostics["volume_free_inodes"], int)
+        self.assertEqual(
+            context.exception.diagnostics["expected_materialized_bytes"],
+            len(b"runtime"),
+        )
+        self.assertEqual(context.exception.diagnostics["expected_entry_count"], 2)
         self.assertFalse((self.volume / "runtimes" / "current").exists())
 
     def test_unsupported_directory_fsync_uses_filesystem_barriers(self) -> None:
