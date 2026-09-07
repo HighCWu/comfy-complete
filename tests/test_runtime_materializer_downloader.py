@@ -421,6 +421,12 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
             "entry_count": 5,
             "current_updated": True,
             "materialized_bytes": 123,
+            "volume_total_bytes": 1000,
+            "volume_free_bytes_before": 900,
+            "volume_free_bytes_after": 700,
+            "volume_total_inodes": 100,
+            "volume_free_inodes_before": 90,
+            "volume_free_inodes_after": 80,
         }
         with tempfile.TemporaryDirectory() as volume:
             config = downloader.RuntimeDownloadConfig(
@@ -434,6 +440,10 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
                 result = downloader.run(config)
         self.assertEqual(result["downloaded_bytes"], len(archive_payload))
         self.assertEqual(result["materialized_bytes"], 123)
+        self.assertEqual(result["volume_free_bytes_before"], 900)
+        self.assertEqual(result["volume_free_bytes_after"], 700)
+        self.assertEqual(result["volume_free_inodes_before"], 90)
+        self.assertEqual(result["volume_free_inodes_after"], 80)
 
     def test_main_error_is_bounded_and_does_not_echo_url(self) -> None:
         url = "https://temporary.example/archive?signature=do-not-print"
@@ -495,6 +505,37 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
             timeout_seconds=config.timeout_seconds,
         )
         self.assertEqual(stdout.getvalue(), '{"error":"volume_write_failed","status":"error"}\n')
+
+    def test_failure_callback_forwards_bounded_capacity_diagnostics(self) -> None:
+        config = self._config_with_result_url()
+        diagnostics = {
+            "volume_total_bytes": 1000,
+            "volume_free_bytes": 20,
+            "volume_total_inodes": 100,
+            "volume_free_inodes": 0,
+        }
+        with patch.object(
+            downloader.RuntimeDownloadConfig, "from_environment", return_value=config
+        ), patch.object(
+            downloader,
+            "run",
+            side_effect=downloader.RuntimeDownloadError(
+                "volume_capacity_exhausted", diagnostics=diagnostics
+            ),
+        ), patch.object(downloader, "_post_result") as report, patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as stdout:
+            result = downloader.main([])
+        self.assertEqual(result, 2)
+        report.assert_called_once_with(
+            config.result_url,
+            {"ok": False, "error_code": "volume_capacity_exhausted", "diagnostics": diagnostics},
+            timeout_seconds=config.timeout_seconds,
+        )
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"status": "error", "error": "volume_capacity_exhausted", "diagnostics": diagnostics},
+        )
 
     def test_success_result_report_failure_is_fail_closed(self) -> None:
         config = self._config_with_result_url()

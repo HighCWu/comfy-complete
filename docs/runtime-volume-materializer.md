@@ -59,9 +59,16 @@ publication sequence, including generation selection and `current` update.
 
 Every tar member must map exactly once to one manifest entry. The materializer
 rejects traversal and unsafe names, duplicate/extra/missing members, hard
-links, special files, unsafe symlinks, and ownership/timestamp/mode/size/link
-metadata mismatches. Regular-file bytes are streamed into staging while their
-size and SHA-256 are recomputed. After extraction, the entire staged tree is
+links in the archive, special files, unsafe symlinks, and ownership/timestamp/
+mode/size/link metadata mismatches. Regular-file bytes are streamed into
+staging while their size and SHA-256 are recomputed. When two manifest files
+have the same SHA-256, size, and mode, the first path is materialized normally;
+later aliases still consume and hash their complete tar payload, then become
+hardlinks to that already-verified file. This lowers block and inode pressure
+without trusting archive payloads or modes. The runtime cache is a curated
+trusted tree: code that intentionally rewrites a runtime file must use atomic
+replacement semantics, because in-place writes to a deduplicated alias also
+affect its identical aliases. After extraction, the entire staged tree is
 walked again to detect corruption or unmanifested files.
 
 Regular-file contents are flushed with one filesystem-scoped `syncfs` barrier
@@ -103,10 +110,16 @@ rejects every unmanifested archive or staging entry.
 
 Successful invocations print one compact JSON object containing the status,
 runtime/archive digests, archive byte count, verified materialized file-byte
-count, entry count, and whether `current` changed. Errors print one compact
-JSON object with a bounded error code and exit with status 2. Input filesystem
-paths, credentials, URLs, and member payloads are never included in command
-output.
+count, entry count, whether `current` changed, and best-effort filesystem
+capacity snapshots (`volume_*_bytes` and `volume_*_inodes`), plus the number
+of verified hardlink aliases and logical bytes saved by links. Errors print one
+compact JSON object with a bounded error code and, when available, the same
+provider-safe capacity counters plus the expected runtime byte/entry totals;
+the command exits with status 2. Input filesystem paths, credentials, URLs,
+and member payloads are never included in command output. The counters are
+diagnostic snapshots, not reservations: a network filesystem may update them
+asynchronously, and `f_bavail`/`f_favail` intentionally report capacity
+available to the unprivileged materializer process.
 
 Storage failures use distinct bounded codes. A temporary file needed by the
 archive decompressor failing because the local scratch filesystem is full is
