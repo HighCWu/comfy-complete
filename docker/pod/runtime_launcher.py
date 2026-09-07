@@ -109,19 +109,44 @@ def verify_runtime_tree(runtime_root: Path, manifest: dict[str, object], *, full
 
         kind = entry["type"]
         mode = stat.S_IMODE(metadata.st_mode)
-        if mode != entry["mode"]:
-            raise LauncherError(f"runtime mode mismatch: {relative}")
         if kind == "directory":
             if not stat.S_ISDIR(metadata.st_mode):
                 raise LauncherError(f"runtime type mismatch: {relative}")
+            expected_mode = entry["mode"]
+            # The materializer's full verification remains byte-for-byte and
+            # mode-for-mode exact before READY is published.  RunPod may add
+            # directory permission bits when the same Network Volume is
+            # mounted into a later Pod, however.  Added directory permissions
+            # do not change runtime bytes or executable identity, while
+            # rejecting them makes an otherwise verified generation restart
+            # forever.  Still fail closed if any manifest-required bit was
+            # removed.  Files and symlinks retain exact mode verification.
+            directory_mode_matches = mode == expected_mode if full else (
+                mode & expected_mode
+            ) == expected_mode
+            if not directory_mode_matches:
+                raise LauncherError(
+                    "runtime mode mismatch: "
+                    f"{relative} (expected {expected_mode:#06o}, actual {mode:#06o})"
+                )
         elif kind == "file":
             if not stat.S_ISREG(metadata.st_mode):
                 raise LauncherError(f"runtime type mismatch: {relative}")
+            if mode != entry["mode"]:
+                raise LauncherError(
+                    "runtime mode mismatch: "
+                    f"{relative} (expected {entry['mode']:#06o}, actual {mode:#06o})"
+                )
             if metadata.st_size != entry["size_bytes"]:
                 raise LauncherError(f"runtime file digest mismatch: {relative}")
             if _sha256(path) != entry["sha256"]:
                 raise LauncherError(f"runtime file digest mismatch: {relative}")
         elif kind == "symlink":
+            if mode != entry["mode"]:
+                raise LauncherError(
+                    "runtime mode mismatch: "
+                    f"{relative} (expected {entry['mode']:#06o}, actual {mode:#06o})"
+                )
             if not stat.S_ISLNK(metadata.st_mode) or os.readlink(path) != entry["link_target"]:
                 raise LauncherError(f"runtime symlink mismatch: {relative}")
             try:

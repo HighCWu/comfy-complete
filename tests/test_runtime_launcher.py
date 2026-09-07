@@ -26,6 +26,12 @@ class RuntimeLauncherTests(unittest.TestCase):
         main = runtime / "app/comfyui/main.py"
         python.parent.mkdir(parents=True)
         main.parent.mkdir(parents=True)
+        for directory in (
+            runtime / "app/comfyui",
+            runtime / "opt/conda",
+            runtime / "opt/conda/bin",
+        ):
+            directory.chmod(0o755)
         python.write_bytes(b"python")
         python.chmod(0o755)
         main.write_bytes(b"main")
@@ -129,6 +135,33 @@ class RuntimeLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(launcher.LauncherError, "missing"):
                 launcher.verify_runtime_tree(manifest_path.parent, manifest, full=True)
             self.assertFalse(missing.exists())
+
+    def test_launch_accepts_provider_added_directory_permission_bits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path, ready_path, _ = self.fixture(Path(temporary))
+            manifest = self.load(manifest_path, ready_path)
+            comfyui = manifest_path.parent / "app/comfyui"
+            comfyui.chmod(0o777)
+
+            launcher.verify_runtime_tree(manifest_path.parent, manifest)
+            with self.assertRaisesRegex(
+                launcher.LauncherError,
+                r"expected 0o0755, actual 0o0777",
+            ):
+                launcher.verify_runtime_tree(manifest_path.parent, manifest, full=True)
+
+    def test_launch_rejects_removed_directory_permission_bits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path, ready_path, _ = self.fixture(Path(temporary))
+            manifest = self.load(manifest_path, ready_path)
+            comfyui = manifest_path.parent / "app/comfyui"
+            comfyui.chmod(0o555)
+
+            with self.assertRaisesRegex(
+                launcher.LauncherError,
+                r"expected 0o0755, actual 0o0555",
+            ):
+                launcher.verify_runtime_tree(manifest_path.parent, manifest)
 
     def test_launch_check_rejects_missing_critical_manifest_entry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
