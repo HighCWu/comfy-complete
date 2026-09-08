@@ -54,6 +54,13 @@ LOCK_NAME = ".materialize.lock"
 CURRENT_NAME = "current"
 MANIFEST_NAME = "manifest.json"
 READY_NAME = "READY.json"
+# The downloader runs this tiny capability probe after fetching the manifest
+# and before fetching the (potentially multi-gigabyte) archive.  Keep the
+# probe's footprint bounded even if a malformed-but-schema-valid manifest
+# contains many distinct mode values.
+MODE_PROBE_PREFIX = ".runtime-materializer-mode-probe-"
+MAX_MODE_PROBE_VARIANTS = 64
+MODE_PROBE_PRIVATE_MODE = 0o700
 # The materializer's control directories are not part of the exported image
 # tree.  They therefore have a small, provider-neutral publication contract:
 #
@@ -498,6 +505,173 @@ def _remove_tree(path: Path) -> None:
         path.rmdir()
     except OSError:
         pass
+
+
+def _mode_probe_error(
+    code: str,
+    *,
+    entry_kind: int | None = None,
+    expected_mode: int | None = None,
+    actual_mode: int | None = None,
+) -> RuntimeMaterializerError:
+    """Build a bounded error for the pre-download filesystem capability probe."""
+
+    diagnostics: dict[str, int] = {}
+    for key, value in (
+        ("entry_kind", entry_kind),
+        ("expected_mode", expected_mode),
+        ("actual_mode", actual_mode),
+    ):
+        if value is not None:
+            diagnostics[key] = value
+    return _error(code, diagnostics=diagnostics)
+
+
+def _mode_probe_variants(manifest: RuntimeManifest) -> tuple[tuple[int, int], ...]:
+    """Return the distinct regular-file and directory modes worth probing.
+
+    The fixed modes map directly to materializer-owned paths: 0600 for locks
+    and temporary files, 0644 for published metadata, 0755 for executable
+    files, and 0700/0755 for private/published directories.  Manifest modes
+    are included by kind so a provider that silently normalizes one mode class
+    is caught before any archive bytes are downloaded.  Symlinks are probed
+    separately because POSIX symlink mode bits are not a chmod round-trip
+    surface.
+    """
+
+    modes: dict[int, set[int]] = {
+        1: {0o700, 0o755},  # private/published directories
+        2: {0o600, 0o644, 0o755},  # lock/metadata/executable files
+    }
+    for entry in manifest["file_tree"]["entries"]:
+        kind = entry["type"]
+        if kind == "directory":
+            modes[1].add(entry["mode"])
+        elif kind == "file":
+            modes[2].add(entry["mode"])
+    variants = tuple(
+        (entry_kind, mode)
+        for entry_kind in (1, 2)
+        for mode in sorted(modes[entry_kind])
+    )
+    if len(variants) > MAX_MODE_PROBE_VARIANTS:
+        raise _mode_probe_error("mode_probe_too_many_variants")
+    return variants
+
+
+def _probe_mode_entry(root: Path, entry_kind: int, expected_mode: int, index: int) -> None:
+    """Round-trip one exact mode on a private regular file or directory."""
+
+    label = "directory" if entry_kind == 1 else "file"
+    path = root / f"{label}-{index}"
+    try:
+        if entry_kind == 2:
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags, MODE_PROBE_PRIVATE_MODE)
+            try:
+                os.fchmod(descriptor, expected_mode)
+            finally:
+                os.close(descriptor)
+        else:
+            path.mkdir(mode=MODE_PROBE_PRIVATE_MODE)
+            os.chmod(path, expected_mode, follow_symlinks=False)
+        metadata = path.lstat()
+    except OSError as error:
+        raise _volume_error(error, "mode_probe_failed") from error
+
+    actual_kind = 1 if stat.S_ISDIR(metadata.st_mode) else 2 if stat.S_ISREG(metadata.st_mode) else 0
+    actual_mode = stat.S_IMODE(metadata.st_mode)
+    if actual_kind != entry_kind:
+        raise _mode_probe_error(
+            "mode_probe_type_mismatch",
+            entry_kind=entry_kind,
+            expected_mode=expected_mode,
+            actual_mode=actual_mode,
+        )
+    if actual_mode != expected_mode:
+        raise _mode_probe_error(
+            "materialized_mode_mismatch",
+            entry_kind=entry_kind,
+            expected_mode=expected_mode,
+            actual_mode=actual_mode,
+        )
+
+
+def _probe_symlink_entry(root: Path, index: int) -> None:
+    """Check that the volume creates symlinks with the POSIX 0777 lstat mode."""
+
+    path = root / f"symlink-{index}"
+    expected_mode = 0o777
+    try:
+        os.symlink("target", path)
+        metadata = path.lstat()
+    except OSError as error:
+        raise _volume_error(error, "mode_probe_failed") from error
+
+    actual_mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISLNK(metadata.st_mode):
+        raise _mode_probe_error(
+            "mode_probe_type_mismatch",
+            entry_kind=3,
+            expected_mode=expected_mode,
+            actual_mode=actual_mode,
+        )
+    if actual_mode != expected_mode:
+        raise _mode_probe_error(
+            "materialized_mode_mismatch",
+            entry_kind=3,
+            expected_mode=expected_mode,
+            actual_mode=actual_mode,
+        )
+
+
+def probe_volume_mode_capability(volume_root: Path, manifest: RuntimeManifest) -> None:
+    """Verify the mounted volume preserves runtime POSIX modes before download.
+
+    The probe is intentionally independent from ``runtimes/current`` and any
+    existing generation.  It creates one private, random directory directly
+    below the caller-supplied mount, performs bounded regular-file/directory
+    chmod round-trips, and removes the directory in all outcomes.  A provider
+    that reports chmod success but stores different mode bits therefore fails
+    closed before the expensive archive transfer and expansion begins.
+    """
+
+    root = Path(volume_root)
+    _require_volume_root_traversable(root)
+    variants = _mode_probe_variants(manifest)
+    probe: Path | None = None
+    primary_error: RuntimeMaterializerError | None = None
+    try:
+        try:
+            probe = Path(tempfile.mkdtemp(prefix=MODE_PROBE_PREFIX, dir=root))
+            os.chmod(probe, MODE_PROBE_PRIVATE_MODE, follow_symlinks=False)
+        except OSError as error:
+            raise _volume_error(error, "mode_probe_failed") from error
+        for index, (entry_kind, expected_mode) in enumerate(variants):
+            _probe_mode_entry(probe, entry_kind, expected_mode, index)
+        _probe_symlink_entry(probe, len(variants))
+    except RuntimeMaterializerError as error:
+        # Cleanup is handled below so a cleanup failure can be reported as a
+        # bounded diagnostic without replacing the primary capability result.
+        primary_error = error
+    finally:
+        cleanup_failed = False
+        if probe is not None:
+            _remove_tree(probe)
+            if _lexists(probe):
+                cleanup_failed = True
+        if cleanup_failed:
+            if primary_error is not None:
+                primary_error.diagnostics["mode_probe_cleanup_failed"] = 1
+            else:
+                primary_error = _error(
+                    "mode_probe_cleanup_failed",
+                    diagnostics={"mode_probe_cleanup_failed": 1},
+                )
+    if primary_error is not None:
+        raise primary_error
 
 
 def _safe_member_path(name: object) -> str:

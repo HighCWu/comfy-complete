@@ -376,6 +376,7 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
             }
 
         with tempfile.TemporaryDirectory() as volume:
+            Path(volume).chmod(0o755)
             config = downloader.RuntimeDownloadConfig(
                 **{**config.__dict__, "volume_root": Path(volume)}
             )
@@ -429,6 +430,7 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
             "volume_free_inodes_after": 80,
         }
         with tempfile.TemporaryDirectory() as volume:
+            Path(volume).chmod(0o755)
             config = downloader.RuntimeDownloadConfig(
                 **{**config.__dict__, "volume_root": Path(volume)}
             )
@@ -444,6 +446,49 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
         self.assertEqual(result["volume_free_bytes_after"], 700)
         self.assertEqual(result["volume_free_inodes_before"], 90)
         self.assertEqual(result["volume_free_inodes_after"], 80)
+
+    def test_run_rejects_mode_capability_before_archive_download(self) -> None:
+        archive_payload = b"archive"
+        archive_sha256 = hashlib.sha256(archive_payload).hexdigest()
+        manifest = self._manifest(archive_sha256, len(archive_payload))
+        manifest_payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        config = downloader.RuntimeDownloadConfig(
+            archive_url="https://temporary.example/archive?signature=short-lived",
+            manifest_url="https://temporary.example/manifest?signature=short-lived",
+            archive_sha256=archive_sha256,
+            archive_size_bytes=len(archive_payload),
+            manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+            manifest_size_bytes=len(manifest_payload),
+            volume_root=Path("/runpod-volume"),
+            timeout_seconds=5,
+        )
+
+        def fake_manifest_download(_url: str, destination: Path, **_kwargs: object) -> None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(manifest_payload)
+
+        with tempfile.TemporaryDirectory() as volume:
+            Path(volume).chmod(0o755)
+            config = downloader.RuntimeDownloadConfig(
+                **{**config.__dict__, "volume_root": Path(volume)}
+            )
+            with patch.object(downloader, "_download_file", side_effect=fake_manifest_download), patch.object(
+                downloader, "_download_range_chunks"
+            ) as archive_download, patch.object(
+                downloader,
+                "probe_volume_mode_capability",
+                side_effect=downloader.RuntimeMaterializerError(
+                    "materialized_mode_mismatch",
+                    diagnostics={"entry_kind": 2, "expected_mode": 0o755, "actual_mode": 0o700},
+                ),
+            ), patch.object(
+                downloader.shutil,
+                "disk_usage",
+                return_value=type("Usage", (), {"free": 1 << 40})(),
+            ), self.assertRaisesRegex(downloader.RuntimeDownloadError, "materialized_mode_mismatch"):
+                downloader.run(config)
+
+        archive_download.assert_not_called()
 
     def test_main_error_is_bounded_and_does_not_echo_url(self) -> None:
         url = "https://temporary.example/archive?signature=do-not-print"

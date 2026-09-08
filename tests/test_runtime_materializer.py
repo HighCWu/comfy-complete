@@ -186,6 +186,113 @@ class RuntimeMaterializerTests(unittest.TestCase):
         )
         return archive, self._manifest(entries, archive), entries
 
+    def test_mode_capability_probe_round_trips_manifest_modes_and_cleans_private_tree(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        del manifest_bytes
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+
+        materializer.probe_volume_mode_capability(self.volume, manifest)
+
+        self.assertEqual(list(self.volume.iterdir()), [])
+
+    def test_mode_capability_probe_includes_fixed_private_metadata_and_published_modes(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+
+        variants = set(materializer._mode_probe_variants(manifest))
+
+        self.assertTrue({(2, 0o600), (2, 0o644), (2, 0o755)} <= variants)
+        self.assertTrue({(1, 0o700), (1, 0o755)} <= variants)
+
+    def test_mode_capability_probe_fails_on_silent_directory_mode_normalization(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+
+        with patch.object(materializer.os, "chmod"), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "materialized_mode_mismatch",
+        ) as context:
+            materializer.probe_volume_mode_capability(self.volume, manifest)
+
+        self.assertEqual(context.exception.diagnostics, {
+            "entry_kind": 1,
+            "expected_mode": 0o755,
+            "actual_mode": 0o700,
+        })
+        self.assertEqual(list(self.volume.iterdir()), [])
+
+    def test_mode_capability_probe_fails_before_archive_on_silent_file_mode_normalization(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+
+        with patch.object(materializer.os, "fchmod"), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "materialized_mode_mismatch",
+        ) as context:
+            materializer.probe_volume_mode_capability(self.volume, manifest)
+
+        self.assertEqual(context.exception.diagnostics, {
+            "entry_kind": 2,
+            "expected_mode": 0o600,
+            "actual_mode": 0o700,
+        })
+        self.assertEqual(list(self.volume.iterdir()), [])
+
+    def test_mode_probe_cleanup_failure_preserves_primary_diagnostics(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+        probe_paths: list[Path] = []
+
+        def leave_probe(path: Path) -> None:
+            probe_paths.append(path)
+
+        with patch.object(materializer.os, "fchmod"), patch.object(
+            materializer, "_remove_tree", side_effect=leave_probe
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "materialized_mode_mismatch",
+        ) as context:
+            materializer.probe_volume_mode_capability(self.volume, manifest)
+
+        self.assertEqual(context.exception.code, "materialized_mode_mismatch")
+        self.assertEqual(context.exception.diagnostics, {
+            "entry_kind": 2,
+            "expected_mode": 0o600,
+            "actual_mode": 0o700,
+            "mode_probe_cleanup_failed": 1,
+        })
+        self.assertEqual(len(probe_paths), 1)
+        shutil.rmtree(probe_paths[0])
+
+    def test_mode_probe_cleanup_failure_without_primary_error_is_bounded(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+        probe_paths: list[Path] = []
+
+        def leave_probe(path: Path) -> None:
+            probe_paths.append(path)
+
+        with patch.object(materializer, "_remove_tree", side_effect=leave_probe), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "mode_probe_cleanup_failed",
+        ) as context:
+            materializer.probe_volume_mode_capability(self.volume, manifest)
+
+        self.assertEqual(context.exception.code, "mode_probe_cleanup_failed")
+        self.assertEqual(context.exception.diagnostics, {"mode_probe_cleanup_failed": 1})
+        self.assertEqual(len(probe_paths), 1)
+        shutil.rmtree(probe_paths[0])
+
     def test_materializes_and_atomically_points_current(self) -> None:
         archive, manifest, entries = self._valid_inputs()
 
