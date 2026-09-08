@@ -35,7 +35,11 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-from materialize_runtime import RuntimeMaterializerError, materialize_runtime
+from materialize_runtime import (
+    RuntimeMaterializerError,
+    materialize_runtime,
+    probe_volume_mode_capability,
+)
 from runtime_manifest import RuntimeManifest, RuntimeManifestError, validate_manifest
 
 
@@ -523,6 +527,14 @@ def run(config: RuntimeDownloadConfig) -> Mapping[str, object]:
             archive_size_bytes=config.archive_size_bytes,
         )
         del manifest_bytes
+        try:
+            # Fail before the expensive archive transfer if the mounted
+            # Network Volume silently normalizes POSIX mode bits.  The probe
+            # is private and independent from any existing runtime/current
+            # generation; it is removed by the helper on every outcome.
+            probe_volume_mode_capability(config.volume_root, manifest)
+        except RuntimeMaterializerError as error:
+            raise _error(error.code, diagnostics=error.diagnostics) from None
         archive_name = manifest["archive"]["object_name"]
         archive_path = temporary_root / archive_name
         _download_range_chunks(
