@@ -116,8 +116,13 @@ class RuntimeMaterializerError(RuntimeError):
         super().__init__(f"{code}: {self.detail}")
 
 
-def _error(code: str, detail: str | None = None) -> RuntimeMaterializerError:
-    return RuntimeMaterializerError(code, detail)
+def _error(
+    code: str,
+    detail: str | None = None,
+    *,
+    diagnostics: Mapping[str, int] | None = None,
+) -> RuntimeMaterializerError:
+    return RuntimeMaterializerError(code, detail, diagnostics=diagnostics)
 
 
 def _is_storage_exhaustion(error: OSError) -> bool:
@@ -936,9 +941,24 @@ def _verify_tree(
             metadata = path.lstat()
         except OSError as error:
             raise _error("missing_materialized_entry") from error
-        if stat.S_IMODE(metadata.st_mode) != entry["mode"]:
-            raise _error("materialized_mode_mismatch", "materialized mode differs from manifest")
         kind = entry["type"]
+        actual_mode = stat.S_IMODE(metadata.st_mode)
+        if actual_mode != entry["mode"]:
+            # Provider filesystems can alter permission bits without making
+            # chmod fail. Keep the public error path-free, but report enough
+            # scalar evidence to distinguish file, directory, and symlink
+            # behavior before deciding whether a narrowly scoped tolerance is
+            # safe. Values are ordinary Unix mode integers, not paths.
+            kind_code = {"directory": 1, "file": 2, "symlink": 3}.get(kind, 0)
+            raise _error(
+                "materialized_mode_mismatch",
+                "materialized mode differs from manifest",
+                diagnostics={
+                    "entry_kind": kind_code,
+                    "expected_mode": entry["mode"],
+                    "actual_mode": actual_mode,
+                },
+            )
         if kind == "directory":
             if not stat.S_ISDIR(metadata.st_mode):
                 raise _error("materialized_type_mismatch", "materialized type differs from manifest")
