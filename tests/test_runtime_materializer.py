@@ -781,6 +781,30 @@ class RuntimeMaterializerTests(unittest.TestCase):
                 with self.assertRaisesRegex(materializer.RuntimeMaterializerError, expected_error):
                     materializer.materialize_runtime(archive, manifest, self.volume)
 
+    def test_materialized_mode_mismatch_reports_path_free_scalar_diagnostics(self) -> None:
+        archive, manifest, _ = self._valid_inputs()
+        original_extract = materializer._stream_extract
+
+        def alter_file_mode(archive_path: Path, staging: Path, expected: object) -> dict[str, int]:
+            result = original_extract(archive_path, staging, expected)
+            (staging / "app/comfyui/main.py").chmod(0o644)
+            return result
+
+        with patch.object(
+            materializer,
+            "_stream_extract",
+            side_effect=alter_file_mode,
+        ), self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "materialized_mode_mismatch",
+        ) as context:
+            materializer.materialize_runtime(archive, manifest, self.volume)
+
+        self.assertEqual(context.exception.diagnostics["entry_kind"], 2)
+        self.assertEqual(context.exception.diagnostics["expected_mode"], 0o755)
+        self.assertEqual(context.exception.diagnostics["actual_mode"], 0o644)
+        self.assertNotIn("main.py", str(context.exception.diagnostics))
+
     def test_failed_current_update_keeps_old_current_and_new_generation_immutable(self) -> None:
         old_archive, old_manifest, _ = self._valid_inputs()
         old_result = materializer.materialize_runtime(old_archive, old_manifest, self.volume)
