@@ -23,14 +23,28 @@ The generation name is the manifest's `runtime_digest` without the
 `current` is a relative symlink and is changed only after a complete staged
 verification succeeds.
 
-The generation root and any parent directories synthesized for manifest paths
-are published with mode `0755`, so a Pod running under an arbitrary UID can
-traverse the verified runtime while group/other users cannot write those
-directories. `manifest.json` and `READY.json` are published with mode `0644`.
-Modes of files, symlinks, and directories present in the runtime manifest are
-never broadened or rewritten. The provider-supplied volume root is not chmod'd;
-it must already grant the runtime UID read and traverse access (a permissive
-`0777` mount is accepted).
+Before the archive is downloaded, the caller runs a bounded capability probe on
+the mounted volume. The probe covers the materializer's control modes and all
+distinct file/directory modes present in the manifest, plus symlink type and
+mode. It returns one immutable `VolumeModePolicy`, which is passed unchanged
+through archive extraction, metadata checks, generation reuse, and publication
+checks. If the probe cannot establish a supported behavior, the archive is not
+downloaded.
+
+Regular-file modes remain exact, and symlinks must remain symlinks with the
+POSIX `0777` `lstat` mode. Directory modes are either exact or, when the
+provider consistently normalizes directory modes, mapped to the observed
+`0777` result. The mapping is accepted only for directory modes without
+special bits; it is not a general permission mismatch bypass. Thus a provider
+that maps `0700`/`0755` directories to `0777` can be used, while files,
+symlinks, types, sizes, bytes, hashes, and archive metadata remain strict.
+
+The generation root, `.staging`, and parent directories synthesized for
+manifest paths use the same policy: they request `0755` or `0700` and verify
+the policy-observed result. `manifest.json` and `READY.json` remain regular
+files with exact `0644` behavior, and the writer lock remains exact `0600`.
+The provider-supplied volume root is not chmod'd; it must already grant the
+runtime UID read and traverse access (a permissive `0777` mount is accepted).
 
 Product Pods mount the trusted runtime cache read-write. The curated ComfyUI
 and custom-node bundle may create ordinary interpreter caches or other benign
