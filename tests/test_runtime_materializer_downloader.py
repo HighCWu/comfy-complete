@@ -357,14 +357,22 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
         )
         downloaded: list[tuple[str, Path]] = []
         materialized: list[tuple[Path, Path, Path]] = []
+        policies: list[object] = []
+        probe_policy = object()
 
         def fake_download(url: str, destination: Path, **_kwargs: object) -> None:
             downloaded.append((url, destination))
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(manifest_payload if "manifest" in url else archive_payload)
 
-        def fake_materialize(archive: Path, manifest_path: Path, volume: Path) -> dict[str, object]:
+        def fake_materialize(
+            archive: Path,
+            manifest_path: Path,
+            volume: Path,
+            **kwargs: object,
+        ) -> dict[str, object]:
             materialized.append((archive, manifest_path, volume))
+            policies.append(kwargs["mode_policy"])
             return {
                 "status": "materialized",
                 "runtime_digest": manifest["runtime_digest"],
@@ -383,6 +391,10 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
             with patch.object(downloader, "_download_file", side_effect=fake_download), patch.object(
                 downloader, "_download_range_chunks", side_effect=fake_download
             ), patch.object(
+                downloader,
+                "probe_volume_mode_capability",
+                return_value=probe_policy,
+            ), patch.object(
                 downloader, "materialize_runtime", side_effect=fake_materialize
             ), patch.object(downloader.shutil, "disk_usage", return_value=type("Usage", (), {"free": 1 << 40})()):
                 result = downloader.run(config)
@@ -392,6 +404,7 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
         self.assertEqual(result["downloaded_bytes"], len(archive_payload))
         self.assertEqual(len(downloaded), 2)
         self.assertEqual(materialized[0][0].name, "sha256-" + archive_sha256 + ".tar.zst")
+        self.assertEqual(policies, [probe_policy])
         self.assertNotIn("signature", json.dumps(result))
 
     def test_run_forwards_verified_materialized_bytes_from_materializer(self) -> None:

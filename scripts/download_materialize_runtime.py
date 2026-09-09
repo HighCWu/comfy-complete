@@ -532,7 +532,7 @@ def run(config: RuntimeDownloadConfig) -> Mapping[str, object]:
             # Network Volume silently normalizes POSIX mode bits.  The probe
             # is private and independent from any existing runtime/current
             # generation; it is removed by the helper on every outcome.
-            probe_volume_mode_capability(config.volume_root, manifest)
+            mode_policy = probe_volume_mode_capability(config.volume_root, manifest)
         except RuntimeMaterializerError as error:
             raise _error(error.code, diagnostics=error.diagnostics) from None
         archive_name = manifest["archive"]["object_name"]
@@ -545,7 +545,12 @@ def run(config: RuntimeDownloadConfig) -> Mapping[str, object]:
             timeout_seconds=config.timeout_seconds,
         )
         try:
-            result = materialize_runtime(archive_path, manifest_path, config.volume_root)
+            result = materialize_runtime(
+                archive_path,
+                manifest_path,
+                config.volume_root,
+                mode_policy=mode_policy,
+            )
         except RuntimeMaterializerError as error:
             raise _error(error.code, diagnostics=error.diagnostics) from None
         except (OSError, ValueError) as error:

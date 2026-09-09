@@ -206,6 +206,152 @@ class RuntimeMaterializerTests(unittest.TestCase):
         self.assertTrue({(2, 0o600), (2, 0o644), (2, 0o755)} <= variants)
         self.assertTrue({(1, 0o700), (1, 0o755)} <= variants)
 
+    def test_mode_capability_probe_returns_exact_policy_on_local_volume(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+
+        policy = materializer.probe_volume_mode_capability(self.volume, manifest)
+
+        self.assertEqual(policy.directory_actual_mode(0o700), 0o700)
+        self.assertEqual(policy.directory_actual_mode(0o755), 0o755)
+        self.assertEqual(policy.file_actual_mode(0o600), 0o600)
+        self.assertEqual(policy.file_actual_mode(0o644), 0o644)
+        self.assertEqual(policy.file_actual_mode(0o755), 0o755)
+        self.assertEqual(policy.symlink_mode, 0o777)
+        self.assertEqual(list(self.volume.iterdir()), [])
+
+    def test_mode_capability_probe_accepts_explicit_directory_0777_mapping(self) -> None:
+        archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+        original_chmod = materializer.os.chmod
+
+        def normalize_directory(
+            path: Path,
+            _mode: int,
+            *,
+            follow_symlinks: bool = True,
+        ) -> None:
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                original_chmod(path, 0o777, follow_symlinks=follow_symlinks)
+            else:
+                original_chmod(path, _mode, follow_symlinks=follow_symlinks)
+
+        with patch.object(materializer.os, "chmod", side_effect=normalize_directory):
+            policy = materializer.probe_volume_mode_capability(self.volume, manifest)
+
+        self.assertEqual(policy.directory_actual_mode(0o700), 0o777)
+        self.assertEqual(policy.directory_actual_mode(0o755), 0o777)
+        self.assertEqual(policy.file_actual_mode(0o600), 0o600)
+        self.assertEqual(policy.file_actual_mode(0o644), 0o644)
+        self.assertEqual(policy.file_actual_mode(0o755), 0o755)
+        self.assertEqual(list(self.volume.iterdir()), [])
+
+        with patch.object(materializer.os, "chmod", side_effect=normalize_directory):
+            result = materializer.materialize_runtime(
+                archive,
+                manifest_path,
+                self.volume,
+                mode_policy=policy,
+            )
+        runtime_hex = str(result["runtime_digest"])[len("sha256:"):]
+        runtime_root = self.volume / "runtimes"
+        generation = runtime_root / runtime_hex
+        self.assertEqual(stat.S_IMODE(runtime_root.stat().st_mode), 0o777)
+        self.assertEqual(stat.S_IMODE((runtime_root / ".staging").stat().st_mode), 0o777)
+        self.assertEqual(stat.S_IMODE(generation.stat().st_mode), 0o777)
+        self.assertEqual(stat.S_IMODE((generation / "app/comfyui").stat().st_mode), 0o777)
+        self.assertEqual(
+            stat.S_IMODE((generation / "app/comfyui/main.py").stat().st_mode),
+            0o755,
+        )
+
+    def test_materialization_rejects_a_policy_that_does_not_match_final_volume(self) -> None:
+        archive, manifest, _entries = self._valid_inputs()
+        policy = materializer.VolumeModePolicy(
+            directory_modes=((0o700, 0o777), (0o755, 0o777)),
+            file_modes=((0o600, 0o600), (0o644, 0o644), (0o755, 0o755)),
+        )
+
+        with self.assertRaisesRegex(
+            materializer.RuntimeMaterializerError,
+            "materialized_mode_mismatch",
+        ) as context:
+            materializer.materialize_runtime(
+                archive,
+                manifest,
+                self.volume,
+                mode_policy=policy,
+            )
+
+        self.assertEqual(context.exception.diagnostics["entry_kind"], 1)
+        self.assertEqual(context.exception.diagnostics["expected_mode"], 0o755)
+        self.assertEqual(context.exception.diagnostics["actual_mode"], 0o755)
+        self.assertFalse((self.volume / "runtimes" / "current").exists())
+
+    def test_staging_mode_mismatch_fails_before_stream_extract(self) -> None:
+        archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+        policy = materializer.probe_volume_mode_capability(self.volume, manifest)
+        original_chmod = materializer.os.chmod
+
+        def normalize_staging_generation(
+            path: Path,
+            _mode: int,
+            *,
+            follow_symlinks: bool = True,
+        ) -> None:
+            if Path(path).parent.name == materializer.STAGING_DIRECTORY:
+                original_chmod(path, 0o777, follow_symlinks=follow_symlinks)
+            else:
+                original_chmod(path, _mode, follow_symlinks=follow_symlinks)
+
+        with patch.object(
+            materializer.os,
+            "chmod",
+            side_effect=normalize_staging_generation,
+        ), patch.object(materializer, "_stream_extract", return_value={}) as stream_extract:
+            with self.assertRaisesRegex(
+                materializer.RuntimeMaterializerError,
+                "materialized_mode_mismatch",
+            ) as context:
+                materializer.materialize_runtime(
+                    archive,
+                    manifest_path,
+                    self.volume,
+                    mode_policy=policy,
+                )
+
+        stream_extract.assert_not_called()
+        self.assertEqual(context.exception.diagnostics["entry_kind"], 1)
+        self.assertEqual(context.exception.diagnostics["expected_mode"], 0o700)
+        self.assertEqual(context.exception.diagnostics["actual_mode"], 0o777)
+        self.assertEqual(list((self.volume / "runtimes" / materializer.STAGING_DIRECTORY).iterdir()), [])
+
+    def test_mode_policy_rejects_duplicate_or_missing_mappings(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+
+        duplicate = materializer.VolumeModePolicy(
+            directory_modes=((0o700, 0o700), (0o700, 0o777), (0o755, 0o755)),
+            file_modes=((0o600, 0o600), (0o644, 0o644), (0o755, 0o755)),
+        )
+        missing = materializer.VolumeModePolicy(
+            directory_modes=((0o700, 0o700),),
+            file_modes=((0o600, 0o600), (0o644, 0o644), (0o755, 0o755)),
+        )
+
+        with self.assertRaisesRegex(materializer.RuntimeMaterializerError, "mode_policy_invalid"):
+            duplicate.validate_manifest(manifest)
+        with self.assertRaisesRegex(materializer.RuntimeMaterializerError, "mode_policy_incomplete"):
+            missing.validate_manifest(manifest)
+
     def test_mode_capability_probe_fails_on_silent_directory_mode_normalization(self) -> None:
         _archive, manifest_path, _entries = self._valid_inputs()
         _manifest_bytes, manifest = materializer._read_manifest(manifest_path)

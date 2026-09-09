@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import ctypes
+from dataclasses import dataclass
 import errno
 import fcntl
 import hashlib
@@ -61,16 +62,19 @@ READY_NAME = "READY.json"
 MODE_PROBE_PREFIX = ".runtime-materializer-mode-probe-"
 MAX_MODE_PROBE_VARIANTS = 64
 MODE_PROBE_PRIVATE_MODE = 0o700
+SYMLINK_MODE = 0o777
 # The materializer's control directories are not part of the exported image
 # tree.  They therefore have a small, provider-neutral publication contract:
 #
 # * ``.staging`` stays private while an archive is being expanded;
 # * a published generation and any implicit parent directories are traversable
-#   by an arbitrary runtime UID, but are not writable by group/other users;
+#   by an arbitrary runtime UID; a provider may normalize these directories to
+#   the policy-observed ``0777`` mode;
 # * generated metadata is readable by arbitrary runtime UIDs, but is not
 #   writable by them.
 #
-# Modes of entries that came from the runtime manifest are never changed here.
+# Regular-file and symlink modes from the runtime manifest remain exact.
+# Directory modes are applied and verified through the capability policy below.
 PRIVATE_DIRECTORY_MODE = 0o700
 RUNTIME_ROOT_MODE = 0o755
 PUBLISHED_DIRECTORY_MODE = 0o755
@@ -121,6 +125,139 @@ class RuntimeMaterializerError(RuntimeError):
             and value >= 0
         }
         super().__init__(f"{code}: {self.detail}")
+
+
+@dataclass(frozen=True)
+class VolumeModePolicy:
+    """Immutable mode behavior observed for one mounted volume.
+
+    Directory modes may be preserved exactly or normalized by the provider to
+    ``0777``. Files and symlinks never use a normalization rule: their
+    observed modes must remain exact. The policy is created by the bounded
+    pre-download probe and passed through the complete materialization call so
+    the final verifier cannot silently choose a different interpretation.
+    """
+
+    directory_modes: tuple[tuple[int, int], ...]
+    file_modes: tuple[tuple[int, int], ...]
+    symlink_mode: int = SYMLINK_MODE
+
+    @staticmethod
+    def _lookup(
+        values: tuple[tuple[int, int], ...],
+        expected_mode: int,
+        *,
+        entry_kind: int,
+    ) -> int:
+        for expected, actual in values:
+            if expected == expected_mode:
+                return actual
+        raise _mode_probe_error(
+            "mode_policy_incomplete",
+            entry_kind=entry_kind,
+            expected_mode=expected_mode,
+        )
+
+    def directory_actual_mode(self, expected_mode: int) -> int:
+        return self._lookup(self.directory_modes, expected_mode, entry_kind=1)
+
+    def file_actual_mode(self, expected_mode: int) -> int:
+        return self._lookup(self.file_modes, expected_mode, entry_kind=2)
+
+    @staticmethod
+    def _validate_mapping(
+        values: object,
+        *,
+        entry_kind: int,
+        allow_directory_normalization: bool,
+    ) -> None:
+        """Reject malformed or ambiguous policy mappings before lookup."""
+
+        if not isinstance(values, tuple):
+            raise _error("mode_policy_invalid")
+        seen: set[int] = set()
+        for pair in values:
+            if (
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or any(not isinstance(value, int) or isinstance(value, bool) for value in pair)
+            ):
+                raise _error("mode_policy_invalid")
+            expected_mode, actual_mode = pair
+            if (
+                expected_mode < 0
+                or expected_mode > 0o7777
+                or actual_mode < 0
+                or actual_mode > 0o7777
+                or expected_mode in seen
+            ):
+                raise _error("mode_policy_invalid")
+            seen.add(expected_mode)
+            if entry_kind == 1:
+                valid = actual_mode == expected_mode or (
+                    allow_directory_normalization
+                    and actual_mode == 0o777
+                    and expected_mode & ~0o777 == 0
+                )
+            else:
+                valid = actual_mode == expected_mode
+            if not valid:
+                raise _mode_probe_error(
+                    "mode_policy_invalid",
+                    entry_kind=entry_kind,
+                    expected_mode=expected_mode,
+                    actual_mode=actual_mode,
+                )
+
+    def validate_manifest(self, manifest: RuntimeManifest) -> None:
+        """Ensure this policy covers all manifest and materializer modes."""
+
+        self._validate_mapping(
+            self.directory_modes,
+            entry_kind=1,
+            allow_directory_normalization=True,
+        )
+        self._validate_mapping(
+            self.file_modes,
+            entry_kind=2,
+            allow_directory_normalization=False,
+        )
+        if (
+            not isinstance(self.symlink_mode, int)
+            or isinstance(self.symlink_mode, bool)
+            or self.symlink_mode != SYMLINK_MODE
+        ):
+            raise _mode_probe_error(
+                "mode_policy_invalid",
+                entry_kind=3,
+                expected_mode=SYMLINK_MODE,
+                actual_mode=self.symlink_mode,
+            )
+        required_directories = {0o700, 0o755}
+        required_files = {0o600, 0o644, 0o755}
+        for entry in manifest["file_tree"]["entries"]:
+            if entry["type"] == "directory":
+                required_directories.add(entry["mode"])
+            elif entry["type"] == "file":
+                required_files.add(entry["mode"])
+            elif entry["type"] == "symlink" and entry["mode"] != self.symlink_mode:
+                raise _mode_probe_error(
+                    "materialized_mode_mismatch",
+                    entry_kind=3,
+                    expected_mode=entry["mode"],
+                    actual_mode=self.symlink_mode,
+                )
+        for mode in required_directories:
+            self.directory_actual_mode(mode)
+        for mode in required_files:
+            actual = self.file_actual_mode(mode)
+            if actual != mode:
+                raise _mode_probe_error(
+                    "materialized_mode_mismatch",
+                    entry_kind=2,
+                    expected_mode=mode,
+                    actual_mode=actual,
+                )
 
 
 def _error(
@@ -228,12 +365,39 @@ def _ensure_real_directory(path: Path, *, create: bool = False) -> None:
 
 
 def _chmod_directory(path: Path, mode: int, *, error_code: str) -> None:
-    """Set an exact mode on a directory without following a symlink."""
+    """Request a mode on a directory without following a symlink."""
 
     try:
         os.chmod(path, mode, follow_symlinks=False)
     except OSError as error:
         raise _volume_error(error, error_code) from error
+
+
+def _apply_directory_mode(
+    path: Path,
+    expected_mode: int,
+    mode_policy: VolumeModePolicy,
+    *,
+    error_code: str,
+) -> None:
+    """Apply one policy-bound directory mode and verify the stored result."""
+
+    _chmod_directory(path, expected_mode, error_code=error_code)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise _error(error_code) from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _error(error_code)
+    actual_mode = stat.S_IMODE(metadata.st_mode)
+    policy_mode = mode_policy.directory_actual_mode(expected_mode)
+    if actual_mode != policy_mode:
+        raise _mode_probe_error(
+            "materialized_mode_mismatch",
+            entry_kind=1,
+            expected_mode=expected_mode,
+            actual_mode=actual_mode,
+        )
 
 
 def _require_volume_root_traversable(path: Path) -> None:
@@ -328,7 +492,10 @@ def _require_zstd() -> str:
 
 
 @contextmanager
-def _writer_lock(path: Path) -> Iterator[None]:
+def _writer_lock(
+    path: Path,
+    mode_policy: VolumeModePolicy | None = None,
+) -> Iterator[None]:
     """Hold one blocking process lock for all publication operations."""
 
     flags = os.O_RDWR | os.O_CREAT
@@ -341,6 +508,19 @@ def _writer_lock(path: Path) -> Iterator[None]:
     try:
         try:
             os.fchmod(descriptor, 0o600)
+            if mode_policy is not None:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise _error("lock_unavailable")
+                actual_mode = stat.S_IMODE(metadata.st_mode)
+                expected_mode = mode_policy.file_actual_mode(0o600)
+                if actual_mode != expected_mode:
+                    raise _mode_probe_error(
+                        "materialized_mode_mismatch",
+                        entry_kind=2,
+                        expected_mode=0o600,
+                        actual_mode=actual_mode,
+                    )
             fcntl.flock(descriptor, fcntl.LOCK_EX)
         except OSError as error:
             raise _error("lock_unavailable") from error
@@ -559,8 +739,13 @@ def _mode_probe_variants(manifest: RuntimeManifest) -> tuple[tuple[int, int], ..
     return variants
 
 
-def _probe_mode_entry(root: Path, entry_kind: int, expected_mode: int, index: int) -> None:
-    """Round-trip one exact mode on a private regular file or directory."""
+def _probe_mode_entry(
+    root: Path,
+    entry_kind: int,
+    expected_mode: int,
+    index: int,
+) -> tuple[int, int]:
+    """Round-trip one mode and return ``(actual_kind, actual_mode)``."""
 
     label = "directory" if entry_kind == 1 else "file"
     path = root / f"{label}-{index}"
@@ -583,24 +768,11 @@ def _probe_mode_entry(root: Path, entry_kind: int, expected_mode: int, index: in
 
     actual_kind = 1 if stat.S_ISDIR(metadata.st_mode) else 2 if stat.S_ISREG(metadata.st_mode) else 0
     actual_mode = stat.S_IMODE(metadata.st_mode)
-    if actual_kind != entry_kind:
-        raise _mode_probe_error(
-            "mode_probe_type_mismatch",
-            entry_kind=entry_kind,
-            expected_mode=expected_mode,
-            actual_mode=actual_mode,
-        )
-    if actual_mode != expected_mode:
-        raise _mode_probe_error(
-            "materialized_mode_mismatch",
-            entry_kind=entry_kind,
-            expected_mode=expected_mode,
-            actual_mode=actual_mode,
-        )
+    return actual_kind, actual_mode
 
 
-def _probe_symlink_entry(root: Path, index: int) -> None:
-    """Check that the volume creates symlinks with the POSIX 0777 lstat mode."""
+def _probe_symlink_entry(root: Path, index: int) -> tuple[int, int]:
+    """Create a symlink and return ``(actual_kind, actual_mode)``."""
 
     path = root / f"symlink-{index}"
     expected_mode = 0o777
@@ -611,31 +783,56 @@ def _probe_symlink_entry(root: Path, index: int) -> None:
         raise _volume_error(error, "mode_probe_failed") from error
 
     actual_mode = stat.S_IMODE(metadata.st_mode)
-    if not stat.S_ISLNK(metadata.st_mode):
-        raise _mode_probe_error(
+    actual_kind = 3 if stat.S_ISLNK(metadata.st_mode) else 0
+    return actual_kind, actual_mode
+
+
+def _probe_observation_error(
+    *,
+    expected_kind: int,
+    expected_mode: int,
+    actual_kind: int,
+    actual_mode: int,
+) -> RuntimeMaterializerError | None:
+    """Return a bounded error for one completed capability observation."""
+
+    if actual_kind != expected_kind:
+        return _mode_probe_error(
             "mode_probe_type_mismatch",
-            entry_kind=3,
+            entry_kind=expected_kind,
             expected_mode=expected_mode,
             actual_mode=actual_mode,
         )
-    if actual_mode != expected_mode:
-        raise _mode_probe_error(
-            "materialized_mode_mismatch",
-            entry_kind=3,
-            expected_mode=expected_mode,
-            actual_mode=actual_mode,
+    if expected_kind == 1:
+        # A provider may add directory permission bits, but only the one
+        # observed normalization accepted by this compatibility layer is
+        # 0777.  Special directory bits are never silently discarded.
+        allowed = actual_mode == expected_mode or (
+            actual_mode == 0o777 and expected_mode & ~0o777 == 0
         )
+    elif expected_kind == 2:
+        allowed = actual_mode == expected_mode
+    else:
+        allowed = actual_mode == SYMLINK_MODE
+    if allowed:
+        return None
+    return _mode_probe_error(
+        "materialized_mode_mismatch",
+        entry_kind=expected_kind,
+        expected_mode=expected_mode,
+        actual_mode=actual_mode,
+    )
 
 
-def probe_volume_mode_capability(volume_root: Path, manifest: RuntimeManifest) -> None:
+def probe_volume_mode_capability(volume_root: Path, manifest: RuntimeManifest) -> VolumeModePolicy:
     """Verify the mounted volume preserves runtime POSIX modes before download.
 
     The probe is intentionally independent from ``runtimes/current`` and any
-    existing generation.  It creates one private, random directory directly
-    below the caller-supplied mount, performs bounded regular-file/directory
-    chmod round-trips, and removes the directory in all outcomes.  A provider
-    that reports chmod success but stores different mode bits therefore fails
-    closed before the expensive archive transfer and expansion begins.
+    existing generation. It creates one private, random directory directly
+    below the caller-supplied mount, completes the entire bounded matrix, and
+    removes the directory in all outcomes. A provider that reports chmod
+    success but stores unsupported mode bits therefore fails closed before the
+    expensive archive transfer and expansion begins.
     """
 
     root = Path(volume_root)
@@ -643,6 +840,8 @@ def probe_volume_mode_capability(volume_root: Path, manifest: RuntimeManifest) -
     variants = _mode_probe_variants(manifest)
     probe: Path | None = None
     primary_error: RuntimeMaterializerError | None = None
+    directory_modes: dict[int, int] = {}
+    file_modes: dict[int, int] = {}
     try:
         try:
             probe = Path(tempfile.mkdtemp(prefix=MODE_PROBE_PREFIX, dir=root))
@@ -650,12 +849,46 @@ def probe_volume_mode_capability(volume_root: Path, manifest: RuntimeManifest) -
         except OSError as error:
             raise _volume_error(error, "mode_probe_failed") from error
         for index, (entry_kind, expected_mode) in enumerate(variants):
-            _probe_mode_entry(probe, entry_kind, expected_mode, index)
-        _probe_symlink_entry(probe, len(variants))
+            try:
+                actual_kind, actual_mode = _probe_mode_entry(
+                    probe,
+                    entry_kind,
+                    expected_mode,
+                    index,
+                )
+                observation_error = _probe_observation_error(
+                    expected_kind=entry_kind,
+                    expected_mode=expected_mode,
+                    actual_kind=actual_kind,
+                    actual_mode=actual_mode,
+                )
+                if observation_error is not None and primary_error is None:
+                    primary_error = observation_error
+                if entry_kind == 1:
+                    directory_modes[expected_mode] = actual_mode
+                else:
+                    file_modes[expected_mode] = actual_mode
+            except RuntimeMaterializerError as error:
+                if primary_error is None:
+                    primary_error = error
+        try:
+            actual_kind, actual_mode = _probe_symlink_entry(probe, len(variants))
+            observation_error = _probe_observation_error(
+                expected_kind=3,
+                expected_mode=SYMLINK_MODE,
+                actual_kind=actual_kind,
+                actual_mode=actual_mode,
+            )
+            if observation_error is not None and primary_error is None:
+                primary_error = observation_error
+        except RuntimeMaterializerError as error:
+            if primary_error is None:
+                primary_error = error
     except RuntimeMaterializerError as error:
         # Cleanup is handled below so a cleanup failure can be reported as a
         # bounded diagnostic without replacing the primary capability result.
-        primary_error = error
+        if primary_error is None:
+            primary_error = error
     finally:
         cleanup_failed = False
         if probe is not None:
@@ -672,6 +905,12 @@ def probe_volume_mode_capability(volume_root: Path, manifest: RuntimeManifest) -
                 )
     if primary_error is not None:
         raise primary_error
+    policy = VolumeModePolicy(
+        directory_modes=tuple(sorted(directory_modes.items())),
+        file_modes=tuple(sorted(file_modes.items())),
+    )
+    policy.validate_manifest(manifest)
+    return policy
 
 
 def _safe_member_path(name: object) -> str:
@@ -1083,6 +1322,7 @@ def _verify_symlink_inside(root: Path, path: Path, allowed: set[str]) -> None:
 def _verify_tree(
     root: Path,
     manifest: RuntimeManifest,
+    mode_policy: VolumeModePolicy,
     *,
     allow_unmanifested: bool = False,
 ) -> None:
@@ -1117,28 +1357,28 @@ def _verify_tree(
             raise _error("missing_materialized_entry") from error
         kind = entry["type"]
         actual_mode = stat.S_IMODE(metadata.st_mode)
-        if actual_mode != entry["mode"]:
-            # Provider filesystems can alter permission bits without making
-            # chmod fail. Keep the public error path-free, but report enough
-            # scalar evidence to distinguish file, directory, and symlink
-            # behavior before deciding whether a narrowly scoped tolerance is
-            # safe. Values are ordinary Unix mode integers, not paths.
-            kind_code = {"directory": 1, "file": 2, "symlink": 3}.get(kind, 0)
-            raise _error(
-                "materialized_mode_mismatch",
-                "materialized mode differs from manifest",
-                diagnostics={
-                    "entry_kind": kind_code,
-                    "expected_mode": entry["mode"],
-                    "actual_mode": actual_mode,
-                },
-            )
         if kind == "directory":
             if not stat.S_ISDIR(metadata.st_mode):
                 raise _error("materialized_type_mismatch", "materialized type differs from manifest")
+            expected_mode = mode_policy.directory_actual_mode(entry["mode"])
+            if actual_mode != expected_mode:
+                raise _mode_probe_error(
+                    "materialized_mode_mismatch",
+                    entry_kind=1,
+                    expected_mode=entry["mode"],
+                    actual_mode=actual_mode,
+                )
         elif kind == "file":
             if not stat.S_ISREG(metadata.st_mode):
                 raise _error("materialized_type_mismatch", "materialized type differs from manifest")
+            expected_mode = mode_policy.file_actual_mode(entry["mode"])
+            if actual_mode != expected_mode:
+                raise _mode_probe_error(
+                    "materialized_mode_mismatch",
+                    entry_kind=2,
+                    expected_mode=entry["mode"],
+                    actual_mode=actual_mode,
+                )
             if metadata.st_size != entry["size_bytes"]:
                 raise _error("materialized_size_mismatch", "materialized size differs from manifest")
             size, digest = _hash_regular_file(path)
@@ -1147,6 +1387,13 @@ def _verify_tree(
         elif kind == "symlink":
             if not stat.S_ISLNK(metadata.st_mode):
                 raise _error("materialized_type_mismatch", "materialized type differs from manifest")
+            if entry["mode"] != mode_policy.symlink_mode or actual_mode != mode_policy.symlink_mode:
+                raise _mode_probe_error(
+                    "materialized_mode_mismatch",
+                    entry_kind=3,
+                    expected_mode=entry["mode"],
+                    actual_mode=actual_mode,
+                )
             try:
                 target = os.readlink(path)
             except OSError as error:
@@ -1159,7 +1406,12 @@ def _verify_tree(
             raise _error("manifest_invalid", "unsupported runtime entry type")
 
 
-def _verify_metadata(root: Path, manifest_bytes: bytes, manifest: RuntimeManifest) -> None:
+def _verify_metadata(
+    root: Path,
+    manifest_bytes: bytes,
+    manifest: RuntimeManifest,
+    mode_policy: VolumeModePolicy,
+) -> None:
     manifest_path = root / MANIFEST_NAME
     ready_path = root / READY_NAME
     try:
@@ -1169,9 +1421,10 @@ def _verify_metadata(root: Path, manifest_bytes: bytes, manifest: RuntimeManifes
         raise _error("metadata_missing") from error
     if not stat.S_ISREG(actual_manifest.st_mode) or not stat.S_ISREG(actual_ready.st_mode):
         raise _error("metadata_invalid")
+    expected_metadata_mode = mode_policy.file_actual_mode(PUBLISHED_METADATA_MODE)
     if (
-        stat.S_IMODE(actual_manifest.st_mode) != PUBLISHED_METADATA_MODE
-        or stat.S_IMODE(actual_ready.st_mode) != PUBLISHED_METADATA_MODE
+        stat.S_IMODE(actual_manifest.st_mode) != expected_metadata_mode
+        or stat.S_IMODE(actual_ready.st_mode) != expected_metadata_mode
     ):
         raise _error("metadata_mode_mismatch")
     try:
@@ -1193,23 +1446,28 @@ def _verify_generation(
     root: Path,
     manifest_bytes: bytes,
     manifest: RuntimeManifest,
+    mode_policy: VolumeModePolicy,
     *,
     allow_unmanifested: bool = False,
 ) -> None:
-    _verify_metadata(root, manifest_bytes, manifest)
-    _verify_tree(root, manifest, allow_unmanifested=allow_unmanifested)
+    _verify_metadata(root, manifest_bytes, manifest, mode_policy)
+    _verify_tree(root, manifest, mode_policy, allow_unmanifested=allow_unmanifested)
 
 
-def _seal_published_generation(root: Path, manifest: RuntimeManifest) -> None:
+def _seal_published_generation(
+    root: Path,
+    manifest: RuntimeManifest,
+    mode_policy: VolumeModePolicy,
+) -> None:
     """Seal only materializer-owned directories after full verification.
 
-    The exported runtime entries retain the exact modes recorded in the
-    manifest.  Only the generation root and parent directories that were
+    The exported runtime files and symlinks retain the exact modes recorded in
+    the manifest. Only the generation root and parent directories that were
     synthesized because they were absent from that manifest are materializer
-    metadata; making those directories ``0755`` lets a Pod running as any UID
-    reach the verified runtime without making the shared volume writable by
-    that UID.  The operation is intentionally idempotent so a crash between
-    generation rename and ``current`` publication can be repaired on retry.
+    metadata; requesting ``0755`` lets a Pod running as any UID reach the
+    verified runtime, subject to the provider's pre-probed directory policy.
+    The operation is intentionally idempotent so a crash between generation
+    rename and ``current`` publication can be repaired on retry.
     """
 
     expected = _expected_entries(manifest)
@@ -1221,7 +1479,12 @@ def _seal_published_generation(root: Path, manifest: RuntimeManifest) -> None:
             raise _error("publication_permissions") from error
         if not stat.S_ISDIR(metadata.st_mode):
             raise _error("publication_permissions")
-        _chmod_directory(directory, PUBLISHED_DIRECTORY_MODE, error_code="publication_permissions")
+        _apply_directory_mode(
+            directory,
+            PUBLISHED_DIRECTORY_MODE,
+            mode_policy,
+            error_code="publication_permissions",
+        )
         _fsync_directory(directory)
 
 
@@ -1277,6 +1540,7 @@ def _materialize_locked(
     archive_size: int,
     archive_sha256: str,
     runtime_root: Path,
+    mode_policy: VolumeModePolicy,
     capacity_before: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
     runtime_hex = manifest["runtime_digest"].removeprefix("sha256:")
@@ -1295,12 +1559,13 @@ def _materialize_locked(
             generation,
             manifest_bytes,
             manifest,
+            mode_policy,
             allow_unmanifested=True,
         )
         # A previous process may have been interrupted after the generation
         # rename but before sealing its materializer-owned parent directories.
         # Repair that state before exposing it through current.
-        _seal_published_generation(generation, manifest)
+        _seal_published_generation(generation, manifest, mode_policy)
         _sync_volume_filesystem(runtime_root)
         current_updated = _atomic_update_current(runtime_root, generation_name)
         # Directory fsync is optional on some network filesystems.  Finish
@@ -1323,16 +1588,27 @@ def _materialize_locked(
 
     staging_root = runtime_root / STAGING_DIRECTORY
     _ensure_real_directory(staging_root, create=True)
-    _chmod_directory(staging_root, PRIVATE_DIRECTORY_MODE, error_code="volume_write_failed")
+    _apply_directory_mode(
+        staging_root,
+        PRIVATE_DIRECTORY_MODE,
+        mode_policy,
+        error_code="volume_write_failed",
+    )
     staging = staging_root / f"{runtime_hex}.{uuid.uuid4().hex}"
-    try:
-        staging.mkdir(mode=PRIVATE_DIRECTORY_MODE)
-    except OSError as error:
-        raise _volume_error(error, "volume_write_failed") from error
     published = False
     try:
+        try:
+            staging.mkdir(mode=PRIVATE_DIRECTORY_MODE)
+        except OSError as error:
+            raise _volume_error(error, "volume_write_failed") from error
+        _apply_directory_mode(
+            staging,
+            PRIVATE_DIRECTORY_MODE,
+            mode_policy,
+            error_code="volume_write_failed",
+        )
         extraction_metrics = _stream_extract(archive_path, staging, expected)
-        _verify_tree(staging, manifest)
+        _verify_tree(staging, manifest, mode_policy)
 
         _atomic_write(staging / MANIFEST_NAME, manifest_bytes, mode=PUBLISHED_METADATA_MODE)
         try:
@@ -1344,7 +1620,7 @@ def _materialize_locked(
             canonical_json(ready) + b"\n",
             mode=PUBLISHED_METADATA_MODE,
         )
-        _verify_generation(staging, manifest_bytes, manifest)
+        _verify_generation(staging, manifest_bytes, manifest, mode_policy)
         # Every regular file has already passed a complete size and digest
         # verification. Flush the staged generation once at filesystem scope
         # instead of issuing one fsync syscall per archive member.
@@ -1355,7 +1631,7 @@ def _materialize_locked(
         # Keep the rename-before-seal order: staging remains private until it
         # is complete, while an interrupted seal is recoverable by the
         # existing-generation path above and never becomes current.
-        _seal_published_generation(generation, manifest)
+        _seal_published_generation(generation, manifest, mode_policy)
         _sync_volume_filesystem(runtime_root)
         current_updated = _atomic_update_current(runtime_root, generation_name)
         # Directory fsync is optional on some network filesystems.  Finish
@@ -1402,16 +1678,30 @@ class RuntimeMaterializer:
         self.volume_root = Path(volume_root)
         self.runtime_root = self.volume_root / runtime_directory
 
-    def materialize(self, archive_path: Path, manifest_path: Path) -> dict[str, object]:
+    def materialize(
+        self,
+        archive_path: Path,
+        manifest_path: Path,
+        *,
+        mode_policy: VolumeModePolicy | None = None,
+    ) -> dict[str, object]:
         manifest_bytes, manifest = _read_manifest(Path(manifest_path))
         archive_size, archive_sha256 = _validate_archive_input(Path(archive_path), manifest)
 
         _ensure_real_directory(self.volume_root, create=True)
         _require_volume_root_traversable(self.volume_root)
+        if mode_policy is None:
+            mode_policy = probe_volume_mode_capability(self.volume_root, manifest)
+        mode_policy.validate_manifest(manifest)
         _ensure_real_directory(self.runtime_root, create=True)
-        _chmod_directory(self.runtime_root, RUNTIME_ROOT_MODE, error_code="volume_write_failed")
+        _apply_directory_mode(
+            self.runtime_root,
+            RUNTIME_ROOT_MODE,
+            mode_policy,
+            error_code="volume_write_failed",
+        )
         lock_path = self.runtime_root / LOCK_NAME
-        with _writer_lock(lock_path):
+        with _writer_lock(lock_path, mode_policy):
             capacity_before = _try_volume_capacity_metrics(self.volume_root)
             try:
                 return _materialize_locked(
@@ -1421,6 +1711,7 @@ class RuntimeMaterializer:
                     archive_size,
                     archive_sha256,
                     self.runtime_root,
+                    mode_policy,
                     capacity_before,
                 )
             except RuntimeMaterializerError as error:
@@ -1446,12 +1737,14 @@ def materialize_runtime(
     volume_root: Path,
     *,
     runtime_directory: str = RUNTIME_DIRECTORY,
+    mode_policy: VolumeModePolicy | None = None,
 ) -> dict[str, object]:
     """Materialize one archive and return bounded, path-free result metadata."""
 
     return RuntimeMaterializer(volume_root, runtime_directory=runtime_directory).materialize(
         archive_path,
         manifest_path,
+        mode_policy=mode_policy,
     )
 
 
@@ -1461,6 +1754,7 @@ def materialize(
     volume_root: Path,
     *,
     runtime_directory: str = RUNTIME_DIRECTORY,
+    mode_policy: VolumeModePolicy | None = None,
 ) -> dict[str, object]:
     """Compatibility alias for callers using the shorter function name."""
 
@@ -1469,6 +1763,7 @@ def materialize(
         manifest_path,
         volume_root,
         runtime_directory=runtime_directory,
+        mode_policy=mode_policy,
     )
 
 
