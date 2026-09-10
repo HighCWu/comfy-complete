@@ -27,6 +27,9 @@ MAX_PATH_LENGTH = 4096
 MAX_DIRECTORY_NAME_LENGTH = 255
 MAX_ENTRYPOINT_ARG_LENGTH = 4096
 MAX_ENTRYPOINT_ARG_COUNT = 128
+VOLUME_DIRECTORY_NORMALIZED_MODE = 0o777
+VOLUME_FILE_NONEXEC_NORMALIZED_MODE = 0o666
+VOLUME_FILE_EXEC_NORMALIZED_MODE = 0o777
 
 
 class RuntimeManifestError(ValueError):
@@ -53,6 +56,49 @@ class RuntimeManifest(TypedDict):
     selection_policy: dict[str, Any]
     file_tree: dict[str, Any]
     archive: dict[str, Any]
+
+
+def volume_mode_matches(entry_type: str, expected_mode: int, actual_mode: int) -> bool:
+    """Return whether a mounted volume's mode is an allowed representation.
+
+    RunPod Network Volumes can normalize ordinary POSIX modes while retaining
+    the entry type.  The only accepted file mappings are the observed
+    execution classes: non-executable files become ``0666`` and files with
+    any execute bit become ``0777``.  Directories may become ``0777``.  An
+    exact mode is always accepted for provider-neutral local filesystems.
+    Special bits are never accepted, and symlinks remain exact ``0777``
+    entries.  This pure function is shared by the materializer and Pod
+    launcher so their verification semantics cannot drift.
+    """
+
+    if (
+        not isinstance(entry_type, str)
+        or not isinstance(expected_mode, int)
+        or isinstance(expected_mode, bool)
+        or not isinstance(actual_mode, int)
+        or isinstance(actual_mode, bool)
+        or expected_mode < 0
+        or expected_mode > 0o7777
+        or actual_mode < 0
+        or actual_mode > 0o7777
+        or expected_mode & ~0o777
+        or actual_mode & ~0o777
+    ):
+        return False
+    if entry_type == "symlink":
+        return expected_mode == 0o777 and actual_mode == 0o777
+    if actual_mode == expected_mode:
+        return entry_type in {"directory", "file"}
+    if entry_type == "directory":
+        return actual_mode == VOLUME_DIRECTORY_NORMALIZED_MODE
+    if entry_type == "file":
+        normalized = (
+            VOLUME_FILE_EXEC_NORMALIZED_MODE
+            if expected_mode & 0o111
+            else VOLUME_FILE_NONEXEC_NORMALIZED_MODE
+        )
+        return actual_mode == normalized
+    return False
 
 
 def canonical_json(value: Any) -> bytes:
