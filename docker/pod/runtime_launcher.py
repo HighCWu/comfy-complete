@@ -13,7 +13,11 @@ from typing import NoReturn
 
 sys.path.insert(0, "/launcher-lib")
 
-from runtime_manifest import RuntimeManifestError, validate_manifest  # noqa: E402
+from runtime_manifest import (  # noqa: E402
+    RuntimeManifestError,
+    validate_manifest,
+    volume_mode_matches,
+)
 
 
 class LauncherError(RuntimeError):
@@ -113,18 +117,7 @@ def verify_runtime_tree(runtime_root: Path, manifest: dict[str, object], *, full
             if not stat.S_ISDIR(metadata.st_mode):
                 raise LauncherError(f"runtime type mismatch: {relative}")
             expected_mode = entry["mode"]
-            # The materializer's full verification remains byte-for-byte and
-            # mode-for-mode exact before READY is published.  RunPod may add
-            # directory permission bits when the same Network Volume is
-            # mounted into a later Pod, however.  Added directory permissions
-            # do not change runtime bytes or executable identity, while
-            # rejecting them makes an otherwise verified generation restart
-            # forever.  Still fail closed if any manifest-required bit was
-            # removed.  Files and symlinks retain exact mode verification.
-            directory_mode_matches = mode == expected_mode if full else (
-                mode & expected_mode
-            ) == expected_mode
-            if not directory_mode_matches:
+            if not volume_mode_matches("directory", expected_mode, mode):
                 raise LauncherError(
                     "runtime mode mismatch: "
                     f"{relative} (expected {expected_mode:#06o}, actual {mode:#06o})"
@@ -132,7 +125,7 @@ def verify_runtime_tree(runtime_root: Path, manifest: dict[str, object], *, full
         elif kind == "file":
             if not stat.S_ISREG(metadata.st_mode):
                 raise LauncherError(f"runtime type mismatch: {relative}")
-            if mode != entry["mode"]:
+            if not volume_mode_matches("file", entry["mode"], mode):
                 raise LauncherError(
                     "runtime mode mismatch: "
                     f"{relative} (expected {entry['mode']:#06o}, actual {mode:#06o})"
@@ -142,7 +135,7 @@ def verify_runtime_tree(runtime_root: Path, manifest: dict[str, object], *, full
             if _sha256(path) != entry["sha256"]:
                 raise LauncherError(f"runtime file digest mismatch: {relative}")
         elif kind == "symlink":
-            if mode != entry["mode"]:
+            if not volume_mode_matches("symlink", entry["mode"], mode):
                 raise LauncherError(
                     "runtime mode mismatch: "
                     f"{relative} (expected {entry['mode']:#06o}, actual {mode:#06o})"

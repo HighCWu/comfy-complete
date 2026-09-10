@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from runtime_manifest import canonical_json  # noqa: E402
+from runtime_manifest import canonical_json, volume_mode_matches  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location("runtime_launcher", ROOT / "docker/pod/runtime_launcher.py")
 assert SPEC and SPEC.loader
@@ -20,6 +20,33 @@ launcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launcher)
 
 class RuntimeLauncherTests(unittest.TestCase):
+    def test_volume_mode_matching_contract_is_narrow(self) -> None:
+        accepted = (
+            ("directory", 0o755, 0o755),
+            ("directory", 0o755, 0o777),
+            ("file", 0o600, 0o600),
+            ("file", 0o600, 0o666),
+            ("file", 0o644, 0o666),
+            ("file", 0o755, 0o755),
+            ("file", 0o755, 0o777),
+            ("symlink", 0o777, 0o777),
+        )
+        rejected = (
+            ("directory", 0o755, 0o555),
+            ("file", 0o644, 0o777),
+            ("file", 0o755, 0o666),
+            ("file", 0o1755, 0o777),
+            ("file", 0o644, 0o1666),
+            ("symlink", 0o755, 0o777),
+            ("unknown", 0o644, 0o644),
+        )
+        for entry_type, expected_mode, actual_mode in accepted:
+            with self.subTest(entry_type=entry_type, expected_mode=expected_mode, actual_mode=actual_mode):
+                self.assertTrue(volume_mode_matches(entry_type, expected_mode, actual_mode))
+        for entry_type, expected_mode, actual_mode in rejected:
+            with self.subTest(entry_type=entry_type, expected_mode=expected_mode, actual_mode=actual_mode):
+                self.assertFalse(volume_mode_matches(entry_type, expected_mode, actual_mode))
+
     def fixture(self, root: Path) -> tuple[Path, Path, dict[str, object]]:
         runtime = root / "generation"
         python = runtime / "opt/conda/bin/python"
@@ -136,17 +163,74 @@ class RuntimeLauncherTests(unittest.TestCase):
                 launcher.verify_runtime_tree(manifest_path.parent, manifest, full=True)
             self.assertFalse(missing.exists())
 
-    def test_launch_accepts_provider_added_directory_permission_bits(self) -> None:
+    def test_launch_accepts_provider_normalized_directory_and_file_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest_path, ready_path, _ = self.fixture(Path(temporary))
             manifest = self.load(manifest_path, ready_path)
             comfyui = manifest_path.parent / "app/comfyui"
             comfyui.chmod(0o777)
+            main = manifest_path.parent / "app/comfyui/main.py"
+            main.chmod(0o666)
+            python = manifest_path.parent / "opt/conda/bin/python"
+            python.chmod(0o777)
+            metadata = manifest_path.parent / "app/comfyui/settings.json"
+            metadata.write_bytes(b"settings")
+            metadata.chmod(0o666)
+            manifest["file_tree"]["entries"].append({
+                "path": "app/comfyui/settings.json",
+                "type": "file",
+                "mode": 0o644,
+                "size_bytes": len(b"settings"),
+                "sha256": hashlib.sha256(b"settings").hexdigest(),
+            })
 
             launcher.verify_runtime_tree(manifest_path.parent, manifest)
+            launcher.verify_runtime_tree(manifest_path.parent, manifest, full=True)
+
+    def test_launch_rejects_wrong_file_execution_class(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path, ready_path, _ = self.fixture(Path(temporary))
+            manifest = self.load(manifest_path, ready_path)
+            python = manifest_path.parent / "opt/conda/bin/python"
+            python.chmod(0o666)
+
             with self.assertRaisesRegex(
                 launcher.LauncherError,
-                r"expected 0o0755, actual 0o0777",
+                r"expected 0o0755, actual 0o0666",
+            ):
+                launcher.verify_runtime_tree(manifest_path.parent, manifest)
+
+    def test_launch_rejects_special_file_mode_bits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path, ready_path, _ = self.fixture(Path(temporary))
+            manifest = self.load(manifest_path, ready_path)
+            python = manifest_path.parent / "opt/conda/bin/python"
+            python.chmod(0o1755)
+
+            with self.assertRaisesRegex(
+                launcher.LauncherError,
+                r"expected 0o0755, actual 0o1755",
+            ):
+                launcher.verify_runtime_tree(manifest_path.parent, manifest)
+
+    def test_launch_rejects_nonexecutable_file_normalized_as_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path, ready_path, _ = self.fixture(Path(temporary))
+            manifest = self.load(manifest_path, ready_path)
+            metadata = manifest_path.parent / "app/comfyui/settings.json"
+            metadata.write_bytes(b"settings")
+            metadata.chmod(0o777)
+            manifest["file_tree"]["entries"].append({
+                "path": "app/comfyui/settings.json",
+                "type": "file",
+                "mode": 0o644,
+                "size_bytes": len(b"settings"),
+                "sha256": hashlib.sha256(b"settings").hexdigest(),
+            })
+
+            with self.assertRaisesRegex(
+                launcher.LauncherError,
+                r"expected 0o0644, actual 0o0777",
             ):
                 launcher.verify_runtime_tree(manifest_path.parent, manifest, full=True)
 

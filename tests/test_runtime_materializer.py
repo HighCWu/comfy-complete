@@ -270,6 +270,47 @@ class RuntimeMaterializerTests(unittest.TestCase):
             0o755,
         )
 
+    def test_mode_capability_probe_accepts_observed_file_execution_class_normalization(self) -> None:
+        archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        self.volume.mkdir(parents=True, exist_ok=True)
+        self.volume.chmod(0o755)
+        original_fchmod = materializer.os.fchmod
+
+        def normalize_file(descriptor: int, requested_mode: int) -> None:
+            normalized_mode = 0o777 if requested_mode & 0o111 else 0o666
+            original_fchmod(descriptor, normalized_mode)
+
+        with patch.object(materializer.os, "fchmod", side_effect=normalize_file):
+            policy = materializer.probe_volume_mode_capability(self.volume, manifest)
+
+        self.assertEqual(policy.file_actual_mode(0o600), 0o666)
+        self.assertEqual(policy.file_actual_mode(0o644), 0o666)
+        self.assertEqual(policy.file_actual_mode(0o755), 0o777)
+        self.assertEqual(list(self.volume.iterdir()), [])
+
+        with patch.object(materializer.os, "fchmod", side_effect=normalize_file):
+            result = materializer.materialize_runtime(
+                archive,
+                manifest_path,
+                self.volume,
+                mode_policy=policy,
+            )
+
+        runtime_hex = str(result["runtime_digest"])[len("sha256:") :]
+        runtime_root = self.volume / "runtimes"
+        generation = runtime_root / runtime_hex
+        self.assertEqual(result["status"], "materialized")
+        self.assertEqual(
+            stat.S_IMODE((runtime_root / ".materialize.lock").stat().st_mode),
+            0o666,
+        )
+        self.assertEqual(stat.S_IMODE((generation / "manifest.json").stat().st_mode), 0o666)
+        self.assertEqual(stat.S_IMODE((generation / "READY.json").stat().st_mode), 0o666)
+        self.assertEqual(stat.S_IMODE((generation / "app/comfyui/main.py").stat().st_mode), 0o777)
+        self.assertEqual((generation / "app/comfyui/main.py").read_bytes(), b"runtime")
+
+
     def test_materialization_rejects_a_policy_that_does_not_match_final_volume(self) -> None:
         archive, manifest, _entries = self._valid_inputs()
         policy = materializer.VolumeModePolicy(
@@ -351,6 +392,65 @@ class RuntimeMaterializerTests(unittest.TestCase):
             duplicate.validate_manifest(manifest)
         with self.assertRaisesRegex(materializer.RuntimeMaterializerError, "mode_policy_incomplete"):
             missing.validate_manifest(manifest)
+
+    def test_mode_policy_rejects_special_bits_and_wrong_file_execution_classes(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        complete_directories = ((0o700, 0o700), (0o755, 0o755))
+        complete_files = ((0o600, 0o600), (0o644, 0o644), (0o755, 0o755))
+
+        invalid_policies = (
+            materializer.VolumeModePolicy(
+                directory_modes=((0o1755, 0o777), *complete_directories),
+                file_modes=complete_files,
+            ),
+            materializer.VolumeModePolicy(
+                directory_modes=complete_directories,
+                file_modes=((0o600, 0o1666), (0o644, 0o644), (0o755, 0o755)),
+            ),
+            materializer.VolumeModePolicy(
+                directory_modes=complete_directories,
+                file_modes=((0o600, 0o777), (0o644, 0o644), (0o755, 0o755)),
+            ),
+            materializer.VolumeModePolicy(
+                directory_modes=complete_directories,
+                file_modes=((0o600, 0o600), (0o644, 0o777), (0o755, 0o755)),
+            ),
+            materializer.VolumeModePolicy(
+                directory_modes=complete_directories,
+                file_modes=((0o600, 0o600), (0o644, 0o644), (0o755, 0o666)),
+            ),
+        )
+
+        for policy in invalid_policies:
+            with self.subTest(policy=policy):
+                with self.assertRaisesRegex(materializer.RuntimeMaterializerError, "mode_policy"):
+                    policy.validate_manifest(manifest)
+
+    def test_mode_policy_rejects_malformed_mappings(self) -> None:
+        _archive, manifest_path, _entries = self._valid_inputs()
+        _manifest_bytes, manifest = materializer._read_manifest(manifest_path)
+        complete_directories = ((0o700, 0o700), (0o755, 0o755))
+        complete_files = ((0o600, 0o600), (0o644, 0o644), (0o755, 0o755))
+        malformed_policies = (
+            materializer.VolumeModePolicy(
+                directory_modes=((0o700,), *complete_directories),  # type: ignore[arg-type]
+                file_modes=complete_files,
+            ),
+            materializer.VolumeModePolicy(
+                directory_modes=[*complete_directories],  # type: ignore[arg-type]
+                file_modes=complete_files,
+            ),
+            materializer.VolumeModePolicy(
+                directory_modes=((0o700, True), *complete_directories),  # type: ignore[arg-type]
+                file_modes=complete_files,
+            ),
+        )
+
+        for policy in malformed_policies:
+            with self.subTest(policy=policy):
+                with self.assertRaisesRegex(materializer.RuntimeMaterializerError, "mode_policy_invalid"):
+                    policy.validate_manifest(manifest)
 
     def test_mode_capability_probe_fails_on_silent_directory_mode_normalization(self) -> None:
         _archive, manifest_path, _entries = self._valid_inputs()

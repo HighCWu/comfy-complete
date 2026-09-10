@@ -31,18 +31,23 @@ through archive extraction, metadata checks, generation reuse, and publication
 checks. If the probe cannot establish a supported behavior, the archive is not
 downloaded.
 
-Regular-file modes remain exact, and symlinks must remain symlinks with the
-POSIX `0777` `lstat` mode. Directory modes are either exact or, when the
-provider consistently normalizes directory modes, mapped to the observed
-`0777` result. The mapping is accepted only for directory modes without
-special bits; it is not a general permission mismatch bypass. Thus a provider
-that maps `0700`/`0755` directories to `0777` can be used, while files,
-symlinks, types, sizes, bytes, hashes, and archive metadata remain strict.
+Regular-file modes are either exact or, when the provider consistently
+normalizes them, mapped by execution class: non-executable files may become
+`0666`, while files with any execute bit may become `0777`. Directory modes
+are either exact or mapped to the observed `0777` result. Special permission
+bits are always rejected; a file cannot cross execution classes (for example,
+`0644` must not become `0777`, and `0755` must not become `0666`). Symlinks
+must remain symlinks with the POSIX `0777` `lstat` mode. These mappings are
+not a general permission mismatch bypass: types, sizes, bytes, hashes, link
+targets, and archive metadata remain strict. The materializer and Pod launcher
+share the same bounded mode-matching function so their acceptance rules cannot
+drift.
 
 The generation root, `.staging`, and parent directories synthesized for
 manifest paths use the same policy: they request `0755` or `0700` and verify
-the policy-observed result. `manifest.json` and `READY.json` remain regular
-files with exact `0644` behavior, and the writer lock remains exact `0600`.
+the policy-observed result. `manifest.json` and `READY.json` request `0644`,
+and the writer lock requests `0600`; on a provider with the observed file
+normalization they are verified as `0666` because they are non-executable.
 The provider-supplied volume root is not chmod'd; it must already grant the
 runtime UID read and traverse access (a permissive `0777` mount is accepted).
 

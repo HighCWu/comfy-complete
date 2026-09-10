@@ -39,6 +39,7 @@ from runtime_manifest import (
     RuntimeManifestError,
     canonical_json,
     is_safe_relative_path,
+    volume_mode_matches,
     validate_manifest,
 )
 from runtime_ready import RuntimeReadyError, build_ready_marker
@@ -73,8 +74,10 @@ SYMLINK_MODE = 0o777
 # * generated metadata is readable by arbitrary runtime UIDs, but is not
 #   writable by them.
 #
-# Regular-file and symlink modes from the runtime manifest remain exact.
-# Directory modes are applied and verified through the capability policy below.
+# Regular-file modes from the runtime manifest are applied and verified through
+# the capability policy below.  A provider may normalize non-executable files
+# to 0666 and executable files to 0777; special bits remain rejected. Symlink
+# modes stay strict at 0777.
 PRIVATE_DIRECTORY_MODE = 0o700
 RUNTIME_ROOT_MODE = 0o755
 PUBLISHED_DIRECTORY_MODE = 0o755
@@ -132,10 +135,12 @@ class VolumeModePolicy:
     """Immutable mode behavior observed for one mounted volume.
 
     Directory modes may be preserved exactly or normalized by the provider to
-    ``0777``. Files and symlinks never use a normalization rule: their
-    observed modes must remain exact. The policy is created by the bounded
-    pre-download probe and passed through the complete materialization call so
-    the final verifier cannot silently choose a different interpretation.
+    ``0777``. Ordinary files may be preserved exactly or normalized by
+    execution class: non-executable files become ``0666`` and files with any
+    execute bit become ``0777``. Files with special bits and symlinks remain
+    strict. The policy is created by the bounded pre-download probe and passed
+    through the complete materialization call so the final verifier cannot
+    silently choose a different interpretation.
     """
 
     directory_modes: tuple[tuple[int, int], ...]
@@ -193,14 +198,13 @@ class VolumeModePolicy:
             ):
                 raise _error("mode_policy_invalid")
             seen.add(expected_mode)
-            if entry_kind == 1:
-                valid = actual_mode == expected_mode or (
-                    allow_directory_normalization
-                    and actual_mode == 0o777
-                    and expected_mode & ~0o777 == 0
-                )
-            else:
-                valid = actual_mode == expected_mode
+            valid = volume_mode_matches(
+                "directory" if entry_kind == 1 else "file",
+                expected_mode,
+                actual_mode,
+            )
+            if entry_kind == 1 and not allow_directory_normalization and actual_mode != expected_mode:
+                valid = False
             if not valid:
                 raise _mode_probe_error(
                     "mode_policy_invalid",
@@ -251,7 +255,7 @@ class VolumeModePolicy:
             self.directory_actual_mode(mode)
         for mode in required_files:
             actual = self.file_actual_mode(mode)
-            if actual != mode:
+            if not volume_mode_matches("file", mode, actual):
                 raise _mode_probe_error(
                     "materialized_mode_mismatch",
                     entry_kind=2,
@@ -803,17 +807,12 @@ def _probe_observation_error(
             expected_mode=expected_mode,
             actual_mode=actual_mode,
         )
-    if expected_kind == 1:
-        # A provider may add directory permission bits, but only the one
-        # observed normalization accepted by this compatibility layer is
-        # 0777.  Special directory bits are never silently discarded.
-        allowed = actual_mode == expected_mode or (
-            actual_mode == 0o777 and expected_mode & ~0o777 == 0
-        )
-    elif expected_kind == 2:
-        allowed = actual_mode == expected_mode
-    else:
-        allowed = actual_mode == SYMLINK_MODE
+    entry_type = {1: "directory", 2: "file", 3: "symlink"}.get(expected_kind)
+    allowed = entry_type is not None and volume_mode_matches(
+        entry_type,
+        expected_mode,
+        actual_mode,
+    )
     if allowed:
         return None
     return _mode_probe_error(
