@@ -416,7 +416,7 @@ def test_runtime_publication_waits_for_audit_and_keeps_large_archive_off_artifac
     assert "-pod-slim:latest" not in block
 
 
-def test_runtime_object_publisher_is_explicit_dispatch_only_and_secret_gated():
+def test_runtime_object_publisher_is_dispatch_only_enabled_by_default_and_secret_gated():
     workflow = DOCKER_BUILD.read_text()
     parsed = yaml.safe_load(workflow)
     trigger = parsed.get("on", parsed.get(True, {}))
@@ -426,7 +426,7 @@ def test_runtime_object_publisher_is_explicit_dispatch_only_and_secret_gated():
         "description": "Publish the verified runtime archive to the configured object store",
         "required": False,
         "type": "boolean",
-        "default": False,
+        "default": True,
     }
     assert inputs["channel"]["type"] == "string"
     assert inputs["channel"]["default"] == "staging"

@@ -14,7 +14,7 @@ on:
         description: "Publish the verified runtime archive to the configured object store"
         required: false
         type: boolean
-        default: false
+        default: true
       channel:
         description: "Mutable runtime channel pointer (for example, staging)"
         required: false
