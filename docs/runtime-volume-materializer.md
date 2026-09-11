@@ -23,8 +23,8 @@ The generation name is the manifest's `runtime_digest` without the
 `current` is a relative symlink and is changed only after a complete staged
 verification succeeds.
 
-Before the archive is downloaded, the caller runs a bounded capability probe on
-the mounted volume. The probe covers the materializer's control modes and all
+Before extraction, the caller runs a bounded capability probe on the mounted
+volume. The probe covers the materializer's control modes and all
 distinct file/directory modes present in the manifest, plus symlink type and
 mode. It returns one immutable `VolumeModePolicy`, which is passed unchanged
 through archive extraction, metadata checks, generation reuse, and publication
@@ -59,8 +59,31 @@ used as user-data storage or as a tenant isolation boundary.
 
 This is only the offline local `archive -> mounted volume` materialization
 step. It is not an R2 downloader, a control-plane worker, or a RunPod
-hydration implementation; a separate caller is responsible for obtaining the
-already-verified local archive and manifest.
+hydration implementation; the control plane stages the archive and manifest
+through the Network Volume S3 interface before starting the utility Pod.
+
+The public `download_materialize_runtime.py` entrypoint consumes that staged
+pair at the fixed content-addressed locations below and performs a second,
+exact size/SHA-256 verification from the mounted files:
+
+```text
+<volume-root>/.runtime-incoming/archives/sha256-<archive-sha256>.tar.zst
+<volume-root>/.runtime-incoming/manifests/sha256-<manifest-sha256>.json
+```
+
+Those input files are caller-owned.  The utility does not remove, rename, or
+copy them into container disk; cleanup belongs to the control plane after the
+Pod is gone.  The entrypoint's pre-staged mode rejects relative paths,
+traversal components, symlinked path components, paths outside the fixed
+layout, missing files, and non-regular files before materialization.
+
+The utility wrapper passes the exact manifest bytes it verified into
+`materialize_runtime(verified_manifest_bytes=...)`.  The materializer does not
+re-read the staged manifest path after that point; those bytes determine the
+runtime identity and are the bytes written to the published generation's
+`manifest.json`.  Archive size/SHA-256 verification is performed once by the
+materializer immediately before extraction, with bounded phase callbacks for
+`archive_verify`, `extraction`, and `tree_verify`.
 
 ## Command
 
@@ -129,8 +152,8 @@ rejects every unmanifested archive or staging entry.
 
 Successful invocations print one compact JSON object containing the status,
 runtime/archive digests, archive byte count, verified materialized file-byte
-count, entry count, whether `current` changed, and best-effort filesystem
-capacity snapshots (`volume_*_bytes` and `volume_*_inodes`), plus the number
+count, `verified_archive_bytes`, entry count, whether `current` changed, and
+best-effort filesystem capacity snapshots (`volume_*_bytes` and `volume_*_inodes`), plus the number
 of verified hardlink aliases and logical bytes saved by links. Errors print one
 compact JSON object with a bounded error code and, when available, the same
 provider-safe capacity counters plus the expected runtime byte/entry totals;

@@ -1,9 +1,11 @@
 # One-shot CPU runtime materializer.
 #
-# The container receives only short-lived HTTPS URLs plus public integrity
-# metadata through environment variables.  It downloads one manifest and one
-# archive to its disposable container disk, then calls the provider-neutral
-# local materializer to publish /runpod-volume/runtimes/current atomically.
+# The product stages one manifest and one archive on the mounted Network
+# Volume before starting this image.  The entrypoint verifies the staged
+# manifest/path contract and passes its exact bytes to the provider-neutral
+# local materializer, which performs the single archive verification and
+# publishes /runpod-volume/runtimes/current atomically.  A
+# legacy HTTPS downloader remains in the script for old images/tests only.
 # No object-store SDK, provider API client, or credential is part of this
 # image.
 FROM ubuntu:24.04@sha256:019e8eb29a85e74d64925745884f2ec79aa27e3feab36353d24656f4d6b89467

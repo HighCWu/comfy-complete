@@ -24,6 +24,7 @@ COPY --chmod=755 docker/pod/runtime_launcher.py /runtime-launcher.py
 COPY --chmod=644 scripts/runtime_manifest.py /launcher-lib/runtime_manifest.py
 COPY --chmod=755 docker/pod/start.sh /start-pod.sh
 COPY --chmod=644 docker/pod/gateway.py /pod-gateway.py
+COPY --chmod=644 docker/pod/worker_lifecycle.py /worker_lifecycle.py
 COPY --chmod=644 docker/pod/model_bootstrap.py /pod-model-bootstrap.py
 COPY --chmod=644 docker/pod/asset_sync.py /pod-asset-sync.py
 COPY --chmod=755 docker/runpod/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode

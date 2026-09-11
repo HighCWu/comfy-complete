@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""Download one immutable runtime bundle and publish it to a mounted volume.
+"""Verify and publish one immutable runtime bundle to a mounted volume.
 
-This is the entrypoint for the small CPU runtime-materializer image.  The
-caller supplies two short-lived HTTPS URLs and the expected byte counts and
-SHA-256 digests through environment variables.  The downloader never sends
-credentials or provider-specific headers.  It verifies the manifest before
-downloading the archive in bounded, contiguous HTTP Range requests, then
-delegates the final archive -> volume operation to :mod:`materialize_runtime`,
-which owns the lock and atomic ``current`` publication contract.
+This is the entrypoint for the small CPU runtime-materializer image.  Product
+hydration stages the archive and manifest on the mounted Network Volume before
+starting this image.  In that mode the caller supplies deterministic absolute
+paths under ``RUNTIME_VOLUME_ROOT`` plus the expected byte counts and SHA-256
+digests through environment variables.  The entrypoint verifies the staged
+manifest and path contract in place, while the provider-neutral materializer
+performs the single authoritative archive verification; neither component
+downloads, copies, or deletes the staged inputs.  A legacy HTTPS
+downloader mode remains for old images and tests, but is not the product
+hydration path.
+
+After verification the entrypoint delegates the final archive -> volume
+operation to :mod:`materialize_runtime`, which owns the lock and atomic
+``current`` publication contract.
 
 The command deliberately emits only bounded JSON status records.  URLs,
 filesystem paths, response bodies, and exception details are not written to
-stdout or stderr.  A failed download or materialization exits with status 2;
-an existing ``current`` generation is left to the provider-neutral
-materializer and is never replaced by a partial download.
+stdout or stderr.  Phase/progress records go to stderr; the final result (or
+bounded failure record) goes to stdout.  A failed verification or
+materialization exits with status 2; an existing ``current`` generation is
+left to the provider-neutral materializer and is never replaced by a partial
+download.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import re
 import shutil
 import ssl
 import stat
+import sys
 import tempfile
 from typing import Any, Mapping, Sequence
 from urllib import error as urlerror
@@ -58,6 +68,7 @@ READ_CHUNK_BYTES = 8 * 1024 * 1024
 # ~16 GB runtime archive.  The file is written sequentially, so this does not
 # require a second archive-sized staging buffer.
 ARCHIVE_RANGE_BYTES = 256 * 1024 * 1024
+ARCHIVE_VERIFY_PROGRESS_BYTES = 256 * 1024 * 1024
 MAX_RESULT_BYTES = 16 * 1024
 CONTENT_RANGE_RE = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
 TEMP_STORAGE_EXHAUSTION_ERRNOS = frozenset(
@@ -155,10 +166,42 @@ def _parse_timeout(value: object) -> float:
     return timeout
 
 
+def _validate_staged_path(value: object, volume_root: Path) -> Path:
+    """Validate one deterministic absolute path inside the mounted volume.
+
+    The lexical checks happen while reading configuration so a malformed path
+    cannot silently select legacy downloader mode.  The filesystem checks are
+    repeated immediately before opening the file because a path component may
+    have been replaced after configuration was parsed.
+    """
+
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise _error("configuration_invalid")
+    if not value.startswith(os.sep):
+        raise _error("configuration_invalid")
+    if "\\" in value:
+        raise _error("configuration_invalid")
+    # Path normalisation hides these components, so inspect the raw POSIX
+    # spelling as well.  The image runs on Linux and the mount contract is
+    # intentionally POSIX-only.
+    if any(component in {".", ".."} for component in value.split(os.sep)):
+        raise _error("configuration_invalid")
+    path = Path(value)
+    if not path.is_absolute() or str(path) != value or path == volume_root:
+        raise _error("configuration_invalid")
+    try:
+        relative = path.relative_to(volume_root)
+    except ValueError:
+        raise _error("configuration_invalid") from None
+    if not relative.parts:
+        raise _error("configuration_invalid")
+    return path
+
+
 @dataclass(frozen=True)
 class RuntimeDownloadConfig:
-    archive_url: str
-    manifest_url: str
+    archive_url: str | None
+    manifest_url: str | None
     archive_sha256: str
     archive_size_bytes: int
     manifest_sha256: str
@@ -166,11 +209,45 @@ class RuntimeDownloadConfig:
     volume_root: Path
     timeout_seconds: float
     result_url: str | None = None
+    archive_path: Path | None = None
+    manifest_path: Path | None = None
+
+    @property
+    def is_pre_staged(self) -> bool:
+        return self.archive_path is not None and self.manifest_path is not None
 
     @classmethod
     def from_environment(cls, *, volume_root_override: str | None = None) -> "RuntimeDownloadConfig":
-        archive_url = _validate_url(os.environ.get("RUNTIME_ARCHIVE_URL"))
-        manifest_url = _validate_url(os.environ.get("RUNTIME_MANIFEST_URL"))
+        configured_root = volume_root_override or os.environ.get(
+            "RUNTIME_VOLUME_ROOT", DEFAULT_VOLUME_ROOT
+        )
+        root_path = Path(configured_root)
+        if (
+            not configured_root
+            or "\x00" in configured_root
+            or not root_path.is_absolute()
+            or ".." in root_path.parts
+        ):
+            raise _error("configuration_invalid")
+
+        archive_path_value = os.environ.get("RUNTIME_ARCHIVE_PATH")
+        manifest_path_value = os.environ.get("RUNTIME_MANIFEST_PATH")
+        if (archive_path_value is None) != (manifest_path_value is None):
+            # Do not fall back to a URL just because one half of a staged
+            # pair is missing.  That would make a partially configured Pod
+            # unexpectedly consume container-disk space and GPU time.
+            raise _error("configuration_invalid")
+        if archive_path_value is not None and manifest_path_value is not None:
+            archive_path = _validate_staged_path(archive_path_value, root_path)
+            manifest_path = _validate_staged_path(manifest_path_value, root_path)
+            archive_url = None
+            manifest_url = None
+        else:
+            archive_path = None
+            manifest_path = None
+            archive_url = _validate_url(os.environ.get("RUNTIME_ARCHIVE_URL"))
+            manifest_url = _validate_url(os.environ.get("RUNTIME_MANIFEST_URL"))
+
         archive_sha256 = _parse_sha256(
             "RUNTIME_ARCHIVE_SHA256", os.environ.get("RUNTIME_ARCHIVE_SHA256")
         )
@@ -187,17 +264,6 @@ class RuntimeDownloadConfig:
             os.environ.get("RUNTIME_MANIFEST_SIZE_BYTES"),
             maximum=MAX_MANIFEST_BYTES,
         )
-        configured_root = volume_root_override or os.environ.get(
-            "RUNTIME_VOLUME_ROOT", DEFAULT_VOLUME_ROOT
-        )
-        root_path = Path(configured_root)
-        if (
-            not configured_root
-            or "\x00" in configured_root
-            or not root_path.is_absolute()
-            or ".." in root_path.parts
-        ):
-            raise _error("configuration_invalid")
         return cls(
             archive_url=archive_url,
             manifest_url=manifest_url,
@@ -212,6 +278,8 @@ class RuntimeDownloadConfig:
                 if os.environ.get("RUNTIME_RESULT_URL")
                 else None
             ),
+            archive_path=archive_path,
+            manifest_path=manifest_path,
         )
 
 
@@ -243,6 +311,109 @@ def _opener() -> urlrequest.OpenerDirector:
         urlrequest.HTTPSHandler(context=context),
         _HttpsRedirectHandler(),
     )
+
+
+def _emit_event(event: str, phase: str, **fields: object) -> None:
+    """Emit one bounded, path-free progress record to stderr."""
+
+    payload: dict[str, object] = {"event": event, "phase": phase}
+    for key, value in fields.items():
+        # Callers only pass fixed phase names and scalar counters.  Keep this
+        # guard here so a future call site cannot accidentally log a URL, path,
+        # exception, or arbitrary response body.
+        if isinstance(value, bool):
+            payload[key] = value
+        elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            payload[key] = value
+        elif isinstance(value, str) and len(value) <= 64 and "\n" not in value:
+            payload[key] = value
+    print(_json_result(payload), file=sys.stderr, flush=True)
+
+
+def _validate_staged_file_path(path: Path, volume_root: Path) -> None:
+    """Require *path* to be a regular, non-symlink file below *volume_root*."""
+
+    try:
+        relative = path.relative_to(volume_root)
+    except ValueError:
+        raise _error("staged_path_invalid") from None
+    if not relative.parts:
+        raise _error("staged_path_invalid")
+
+    current = volume_root
+    try:
+        root_metadata = current.lstat()
+        if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+            raise _error("volume_unavailable")
+        for component in relative.parts:
+            current = current / component
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise _error("staged_path_invalid")
+            if current != path and not stat.S_ISDIR(metadata.st_mode):
+                raise _error("staged_path_invalid")
+        final_metadata = path.lstat()
+        if not stat.S_ISREG(final_metadata.st_mode):
+            raise _error("staged_path_invalid")
+        resolved_root = volume_root.resolve(strict=True)
+        resolved_path = path.resolve(strict=True)
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError:
+            raise _error("staged_path_invalid") from None
+    except RuntimeDownloadError:
+        raise
+    except FileNotFoundError:
+        raise _error("staged_input_unavailable") from None
+    except OSError:
+        raise _error("staged_path_invalid") from None
+
+
+def _validate_staged_layout(config: RuntimeDownloadConfig) -> None:
+    """Require the control-plane's content-addressed staging layout."""
+
+    if config.archive_path is None or config.manifest_path is None:
+        raise _error("configuration_invalid")
+    expected_archive = (
+        config.volume_root
+        / ".runtime-incoming"
+        / "archives"
+        / f"sha256-{config.archive_sha256}.tar.zst"
+    )
+    expected_manifest = (
+        config.volume_root
+        / ".runtime-incoming"
+        / "manifests"
+        / f"sha256-{config.manifest_sha256}.json"
+    )
+    if config.archive_path != expected_archive or config.manifest_path != expected_manifest:
+        raise _error("staged_path_invalid")
+
+
+def _open_staged_file(path: Path, volume_root: Path) -> Any:
+    """Open a pre-staged file after a no-symlink, in-volume validation."""
+
+    _validate_staged_file_path(path, volume_root)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(descriptor)
+            descriptor = -1
+            raise _error("staged_path_invalid")
+        return os.fdopen(descriptor, "rb")
+    except RuntimeDownloadError:
+        raise
+    except FileNotFoundError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise _error("staged_input_unavailable") from None
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise _error("staged_path_invalid") from None
 
 
 def _response_status(response: Any) -> int:
@@ -411,6 +582,17 @@ def _download_range_chunks(
                     if response.read(1):
                         raise _error("download_size_mismatch")
                 downloaded = end + 1
+                if (
+                    downloaded == expected_size_bytes
+                    or downloaded == chunk_size
+                    or downloaded % ARCHIVE_VERIFY_PROGRESS_BYTES < chunk_size
+                ):
+                    _emit_event(
+                        "progress",
+                        "archive_download",
+                        downloaded_bytes=downloaded,
+                        total_bytes=expected_size_bytes,
+                    )
             handle.flush()
             os.fsync(handle.fileno())
     except RuntimeDownloadError:
@@ -457,6 +639,41 @@ def _post_result(url: str, payload: Mapping[str, object], *, timeout_seconds: fl
         raise _error("result_report_failed") from None
 
 
+def _read_verified_file_bytes(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_size_bytes: int,
+    volume_root: Path | None = None,
+) -> bytes:
+    """Read one bounded file and verify its exact size and digest."""
+
+    try:
+        if volume_root is None:
+            handle = path.open("rb")
+        else:
+            handle = _open_staged_file(path, volume_root)
+        with handle:
+            digest = hashlib.sha256()
+            payload = bytearray()
+            while True:
+                chunk = handle.read(READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) > expected_size_bytes:
+                    raise _error("manifest_size_mismatch")
+                digest.update(chunk)
+    except RuntimeDownloadError:
+        raise
+    except OSError as error:
+        del error
+        raise _error("manifest_unavailable") from None
+    if len(payload) != expected_size_bytes or digest.hexdigest() != expected_sha256:
+        raise _error("manifest_digest_mismatch")
+    return bytes(payload)
+
+
 def _read_manifest(
     path: Path,
     *,
@@ -464,14 +681,14 @@ def _read_manifest(
     expected_size_bytes: int,
     archive_sha256: str,
     archive_size_bytes: int,
+    volume_root: Path | None = None,
 ) -> tuple[bytes, RuntimeManifest]:
-    try:
-        payload = path.read_bytes()
-    except OSError as error:
-        del error
-        raise _error("manifest_unavailable") from None
-    if len(payload) != expected_size_bytes or hashlib.sha256(payload).hexdigest() != expected_sha256:
-        raise _error("manifest_digest_mismatch")
+    payload = _read_verified_file_bytes(
+        path,
+        expected_sha256=expected_sha256,
+        expected_size_bytes=expected_size_bytes,
+        volume_root=volume_root,
+    )
     try:
         manifest = validate_manifest(json.loads(payload.decode("utf-8")))
     except (UnicodeDecodeError, json.JSONDecodeError, RuntimeManifestError) as error:
@@ -495,82 +712,209 @@ def _validate_volume_root(path: Path) -> None:
         raise _error("volume_unavailable")
 
 
+def _materializer_progress(
+    phase: str,
+    state: str,
+    current: int | None,
+    total: int | None,
+) -> None:
+    """Translate materializer progress to bounded, path-free JSON logs."""
+
+    if state == "start":
+        _emit_event("phase", f"{phase}_start")
+    elif state == "end":
+        fields: dict[str, object] = {}
+        if current is not None:
+            if phase == "archive_verify":
+                fields["verified_bytes"] = current
+            else:
+                fields["completed"] = current
+        if total is not None:
+            if phase == "archive_verify":
+                fields["total_bytes"] = total
+            else:
+                fields["total"] = total
+        _emit_event("phase", f"{phase}_end", **fields)
+    elif state == "progress" and phase == "archive_verify" and current is not None:
+        _emit_event(
+            "progress",
+            phase,
+            verified_bytes=current,
+            **({"total_bytes": total} if total is not None else {}),
+        )
+
+
+def _materialize_verified(
+    archive_path: Path,
+    manifest_path: Path,
+    volume_root: Path,
+    mode_policy: object,
+    verified_manifest_bytes: bytes,
+) -> Mapping[str, object]:
+    """Run the provider-neutral materializer with bounded phase records."""
+
+    _emit_event("phase", "materialization_start")
+    completed = False
+    try:
+        result = materialize_runtime(
+            archive_path,
+            manifest_path,
+            volume_root,
+            mode_policy=mode_policy,
+            verified_manifest_bytes=verified_manifest_bytes,
+            progress_callback=_materializer_progress,
+        )
+        completed = True
+        return result
+    except RuntimeMaterializerError as error:
+        raise _error(error.code, diagnostics=error.diagnostics) from None
+    except (OSError, ValueError) as error:
+        del error
+        raise _error("materialization_failed") from None
+    finally:
+        _emit_event("phase", "materialization_end", outcome="success" if completed else "error")
+
+
 def run(config: RuntimeDownloadConfig) -> Mapping[str, object]:
-    """Download and materialize one runtime, returning bounded metadata."""
+    """Verify, materialize, and return bounded metadata.
+
+    The pre-staged branch never uses container ``/tmp`` for runtime bytes and
+    never deletes the two caller-owned input files.  The URL branch below is
+    retained only for compatibility with older images and public downloader
+    tests.
+    """
 
     _validate_volume_root(config.volume_root)
-    try:
-        free_bytes = shutil.disk_usage("/tmp").free
-    except OSError as error:
-        del error
-        raise _error("download_disk_space") from None
-    # Leave a modest amount of headroom for Python and the filesystem journal;
-    # the archive itself is never copied a second time by this entrypoint.
-    if free_bytes < config.archive_size_bytes + 64 * 1024 * 1024:
-        raise _error("download_disk_space")
+    _emit_event("phase", "volume_validated")
 
-    with tempfile.TemporaryDirectory(prefix="runtime-materializer-", dir="/tmp") as directory:
-        temporary_root = Path(directory)
-        manifest_path = temporary_root / "manifest.json"
-        _download_file(
-            config.manifest_url,
-            manifest_path,
-            expected_sha256=config.manifest_sha256,
-            expected_size_bytes=config.manifest_size_bytes,
-            timeout_seconds=config.timeout_seconds,
-        )
+    if config.is_pre_staged:
+        # ``is_pre_staged`` is true only when both paths are present.  Keep the
+        # explicit checks so a directly-constructed config cannot accidentally
+        # select a partial or URL-backed branch.
+        if config.archive_path is None or config.manifest_path is None:
+            raise _error("configuration_invalid")
+        _validate_staged_layout(config)
+        archive_path = config.archive_path
+        manifest_path = config.manifest_path
+        _emit_event("phase", "manifest_verify_start")
         manifest_bytes, manifest = _read_manifest(
             manifest_path,
             expected_sha256=config.manifest_sha256,
             expected_size_bytes=config.manifest_size_bytes,
             archive_sha256=config.archive_sha256,
             archive_size_bytes=config.archive_size_bytes,
+            volume_root=config.volume_root,
         )
-        del manifest_bytes
+        if manifest["archive"]["object_name"] != archive_path.name:
+            raise _error("staged_archive_name_mismatch")
+        # Validate both caller-owned inputs before touching materializer-owned
+        # volume state in the mode capability probe.
+        _validate_staged_file_path(archive_path, config.volume_root)
+        _emit_event("phase", "manifest_verify_end")
         try:
-            # Fail before the expensive archive transfer if the mounted
-            # Network Volume silently normalizes POSIX mode bits.  The probe
-            # is private and independent from any existing runtime/current
-            # generation; it is removed by the helper on every outcome.
+            # Fail before extraction if the mounted Network Volume silently
+            # normalizes POSIX mode bits.  The probe is private and
+            # independent from any existing runtime/current generation; it is
+            # removed by the helper on every outcome.
             mode_policy = probe_volume_mode_capability(config.volume_root, manifest)
         except RuntimeMaterializerError as error:
             raise _error(error.code, diagnostics=error.diagnostics) from None
-        archive_name = manifest["archive"]["object_name"]
-        archive_path = temporary_root / archive_name
-        _download_range_chunks(
-            config.archive_url,
+        result = _materialize_verified(
             archive_path,
-            expected_sha256=config.archive_sha256,
-            expected_size_bytes=config.archive_size_bytes,
-            timeout_seconds=config.timeout_seconds,
+            manifest_path,
+            config.volume_root,
+            mode_policy,
+            manifest_bytes,
         )
+    else:
+        if config.archive_url is None or config.manifest_url is None:
+            raise _error("configuration_invalid")
         try:
-            result = materialize_runtime(
+            free_bytes = shutil.disk_usage("/tmp").free
+        except OSError as error:
+            del error
+            raise _error("download_disk_space") from None
+        # Leave a modest amount of headroom for Python and the filesystem
+        # journal; the archive itself is never copied a second time by this
+        # entrypoint.
+        if free_bytes < config.archive_size_bytes + 64 * 1024 * 1024:
+            raise _error("download_disk_space")
+
+        with tempfile.TemporaryDirectory(prefix="runtime-materializer-", dir="/tmp") as directory:
+            temporary_root = Path(directory)
+            manifest_path = temporary_root / "manifest.json"
+            _download_file(
+                config.manifest_url,
+                manifest_path,
+                expected_sha256=config.manifest_sha256,
+                expected_size_bytes=config.manifest_size_bytes,
+                timeout_seconds=config.timeout_seconds,
+            )
+            manifest_bytes, manifest = _read_manifest(
+                manifest_path,
+                expected_sha256=config.manifest_sha256,
+                expected_size_bytes=config.manifest_size_bytes,
+                archive_sha256=config.archive_sha256,
+                archive_size_bytes=config.archive_size_bytes,
+            )
+            try:
+                # Fail before the expensive archive transfer if the mounted
+                # Network Volume silently normalizes POSIX mode bits.  The
+                # probe is private and independent from any existing
+                # runtime/current generation; it is removed by the helper on
+                # every outcome.
+                mode_policy = probe_volume_mode_capability(config.volume_root, manifest)
+            except RuntimeMaterializerError as error:
+                raise _error(error.code, diagnostics=error.diagnostics) from None
+            archive_name = manifest["archive"]["object_name"]
+            archive_path = temporary_root / archive_name
+            _download_range_chunks(
+                config.archive_url,
+                archive_path,
+                expected_sha256=config.archive_sha256,
+                expected_size_bytes=config.archive_size_bytes,
+                timeout_seconds=config.timeout_seconds,
+            )
+            result = _materialize_verified(
                 archive_path,
                 manifest_path,
                 config.volume_root,
-                mode_policy=mode_policy,
+                mode_policy,
+                manifest_bytes,
             )
-        except RuntimeMaterializerError as error:
-            raise _error(error.code, diagnostics=error.diagnostics) from None
-        except (OSError, ValueError) as error:
-            del error
-            raise _error("materialization_failed") from None
 
+    consumed_archive_sha256 = result.get("archive_sha256")
+    consumed_archive_size = result.get("archive_size_bytes")
+    if (
+        not isinstance(consumed_archive_sha256, str)
+        or SHA256_RE.fullmatch(consumed_archive_sha256) is None
+        or not isinstance(consumed_archive_size, int)
+        or isinstance(consumed_archive_size, bool)
+        or consumed_archive_size < 0
+        or consumed_archive_sha256 != config.archive_sha256
+        or consumed_archive_size != config.archive_size_bytes
+    ):
+        raise _error("materialization_result_invalid")
+    consumed_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     # Copy only scalar fields from the provider-neutral materializer.  In
     # particular, do not pass through paths, manifest source metadata, or URL
-    # values supplied by the caller.
+    # values supplied by the caller.  Archive identity comes from the
+    # materializer result, i.e. from the bytes it actually consumed.
     output: dict[str, object] = {
         "status": result["status"],
         "runtime_digest": result["runtime_digest"],
-        "archive_sha256": config.archive_sha256,
-        "archive_size_bytes": config.archive_size_bytes,
-        "downloaded_bytes": config.archive_size_bytes,
-        "manifest_sha256": config.manifest_sha256,
-        "manifest_size_bytes": config.manifest_size_bytes,
+        "archive_sha256": consumed_archive_sha256,
+        "archive_size_bytes": consumed_archive_size,
+        "verified_archive_bytes": consumed_archive_size,
+        "manifest_sha256": consumed_manifest_sha256,
+        "manifest_size_bytes": len(manifest_bytes),
         "entry_count": result["entry_count"],
         "current_updated": result["current_updated"],
     }
+    # Keep the old field only for the legacy URL branch.  The product's
+    # pre-staged branch must not claim that a GPU container downloaded bytes.
+    if not config.is_pre_staged:
+        output["downloaded_bytes"] = config.archive_size_bytes
     materialized_bytes = result.get("materialized_bytes")
     if (
         not isinstance(materialized_bytes, int)

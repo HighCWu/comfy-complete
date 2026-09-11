@@ -94,3 +94,20 @@ def test_pod_model_objects_use_a_fixed_container_local_root() -> None:
 
     assert "--model-object-root /tmp/comfy-model-objects" in script
     assert "instance_root=\"/tmp/comfy-runtime/${instance_id}\"" in script
+
+
+def test_worker_capability_mode_is_opt_in_and_restart_is_signal_only() -> None:
+    script = START.read_text(encoding="utf-8")
+
+    assert 'COMFY_POD_WORKER_CAPABILITY_SECRET' in script
+    assert 'worker_mode=0' in script
+    assert 'export COMFY_POD_INSTANCE_ROOT="${instance_root}"' in script
+    assert 'export COMFY_POD_SUPERVISOR_PID="$$"' in script
+    assert 'COMFY_POD_SUPERVISOR_GENERATION_FILE' in script
+    assert 'trap request_comfy_restart USR1' in script
+    assert 'start_comfy' in script
+    assert 'wait_for_comfy' in script
+    assert 'publish_worker_generation' in script
+    assert 'COMFY_EXTRA_ARGS' in script
+    # The shell supervisor does not expose a user-provided command/PID path.
+    assert 'kill "${comfy_pid}"' in script

@@ -564,6 +564,7 @@ def test_runtime_object_publisher_runs_after_all_verification_and_image_push():
         "/start-pod.sh",
         "/launcher-lib/runtime_manifest.py",
         "/pod-gateway.py",
+        "/worker_lifecycle.py",
         "/pod-model-bootstrap.py",
         "/pod-asset-sync.py",
         "/usr/local/bin/comfy-manager-set-mode",

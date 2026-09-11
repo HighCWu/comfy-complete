@@ -423,6 +423,7 @@ jobs:
               docker/Dockerfile.pod \
               docker/pod/start.sh \
               docker/pod/gateway.py \
+              docker/pod/worker_lifecycle.py \
               docker/pod/model_bootstrap.py \
               docker/pod/asset_sync.py \
               docker/runpod/comfy-manager-set-mode.sh | LC_ALL=C sort
@@ -1183,6 +1184,7 @@ jobs:
             /start-pod.sh \
             /launcher-lib/runtime_manifest.py \
             /pod-gateway.py \
+            /worker_lifecycle.py \
             /pod-model-bootstrap.py \
             /pod-asset-sync.py \
             /usr/local/bin/comfy-manager-set-mode; do
@@ -1216,7 +1218,12 @@ jobs:
           # base-image critical probe separately imports aiohttp and the core
           # runtime dependencies; here the slim system Python validates source
           # syntax without pretending to own those runtime packages.
-          for path in ("/pod-gateway.py", "/pod-model-bootstrap.py", "/pod-asset-sync.py"):
+          for path in (
+              "/pod-gateway.py",
+              "/worker_lifecycle.py",
+              "/pod-model-bootstrap.py",
+              "/pod-asset-sync.py",
+          ):
               with open(path, "rb") as source:
                   compile(source.read(), path, "exec")
           PY

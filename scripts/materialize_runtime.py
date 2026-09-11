@@ -32,7 +32,7 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from runtime_manifest import (
     RuntimeManifest,
@@ -47,6 +47,7 @@ from runtime_ready import RuntimeReadyError, build_ready_marker
 
 MIB = 1024 * 1024
 CHUNK_BYTES = 8 * MIB
+PROGRESS_INTERVAL_BYTES = 256 * MIB
 MAX_MANIFEST_BYTES = 128 * MIB
 MAX_READY_BYTES = 64 * 1024
 MAX_ENTRY_COUNT = 1_000_000
@@ -128,6 +129,14 @@ class RuntimeMaterializerError(RuntimeError):
             and value >= 0
         }
         super().__init__(f"{code}: {self.detail}")
+
+
+# Optional observability hook used by the utility-image wrapper.  ``phase`` is
+# one of ``archive_verify``, ``extraction``, or ``tree_verify``; ``state`` is
+# ``start``, ``progress``, or ``end``.  Byte counters are best-effort and may
+# be ``None`` for phases that do not have a fixed total.  The callback is
+# intentionally out-of-band: it must never be required for correctness.
+ProgressCallback = Callable[[str, str, int | None, int | None], None]
 
 
 @dataclass(frozen=True)
@@ -441,7 +450,32 @@ def _read_regular_file(path: Path, *, max_bytes: int | None = None) -> bytes:
         raise _error("input_unavailable") from error
 
 
-def _hash_regular_file(path: Path) -> tuple[int, str]:
+def _notify_progress(
+    callback: ProgressCallback | None,
+    phase: str,
+    state: str,
+    current: int | None = None,
+    total: int | None = None,
+) -> None:
+    """Deliver best-effort progress without changing materialization semantics."""
+
+    if callback is None:
+        return
+    try:
+        callback(phase, state, current, total)
+    except Exception:
+        # Progress is diagnostic only. A logger/callback failure must not turn
+        # a verified materialization into a false failure.
+        return
+
+
+def _hash_regular_file(
+    path: Path,
+    *,
+    progress_callback: ProgressCallback | None = None,
+    phase: str = "archive_verify",
+    total_bytes: int | None = None,
+) -> tuple[int, str]:
     try:
         metadata = path.lstat()
     except OSError as error:
@@ -450,6 +484,10 @@ def _hash_regular_file(path: Path) -> tuple[int, str]:
         raise _error("archive_not_regular")
     digest = hashlib.sha256()
     size = 0
+    next_progress = PROGRESS_INTERVAL_BYTES
+    report_file_progress = phase != "tree_verify"
+    if report_file_progress:
+        _notify_progress(progress_callback, phase, "start", 0, total_bytes)
     try:
         with path.open("rb") as handle:
             while True:
@@ -458,13 +496,20 @@ def _hash_regular_file(path: Path) -> tuple[int, str]:
                     break
                 size += len(chunk)
                 digest.update(chunk)
+                if report_file_progress and size >= next_progress:
+                    _notify_progress(progress_callback, phase, "progress", size, total_bytes)
+                    next_progress += PROGRESS_INTERVAL_BYTES
     except OSError as error:
         raise _error("archive_unavailable") from error
+    if report_file_progress:
+        _notify_progress(progress_callback, phase, "progress", size, total_bytes)
+        _notify_progress(progress_callback, phase, "end", size, total_bytes)
     return size, digest.hexdigest()
 
 
-def _read_manifest(path: Path) -> tuple[bytes, RuntimeManifest]:
-    payload = _read_regular_file(path, max_bytes=MAX_MANIFEST_BYTES)
+def _parse_manifest_bytes(payload: bytes) -> tuple[bytes, RuntimeManifest]:
+    if not isinstance(payload, bytes) or len(payload) > MAX_MANIFEST_BYTES:
+        raise _error("manifest_too_large")
     if not payload:
         raise _error("manifest_invalid")
     try:
@@ -478,11 +523,25 @@ def _read_manifest(path: Path) -> tuple[bytes, RuntimeManifest]:
     return payload, manifest
 
 
-def _validate_archive_input(archive_path: Path, manifest: RuntimeManifest) -> tuple[int, str]:
+def _read_manifest(path: Path) -> tuple[bytes, RuntimeManifest]:
+    return _parse_manifest_bytes(_read_regular_file(path, max_bytes=MAX_MANIFEST_BYTES))
+
+
+def _validate_archive_input(
+    archive_path: Path,
+    manifest: RuntimeManifest,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[int, str]:
     archive = manifest["archive"]
     if archive_path.name != archive["object_name"]:
         raise _error("archive_name_mismatch")
-    size, digest = _hash_regular_file(archive_path)
+    size, digest = _hash_regular_file(
+        archive_path,
+        progress_callback=progress_callback,
+        phase="archive_verify",
+        total_bytes=archive["size_bytes"],
+    )
     if size != archive["size_bytes"] or digest != archive["sha256"]:
         raise _error("archive_digest_mismatch")
     return size, digest
@@ -779,7 +838,6 @@ def _probe_symlink_entry(root: Path, index: int) -> tuple[int, int]:
     """Create a symlink and return ``(actual_kind, actual_mode)``."""
 
     path = root / f"symlink-{index}"
-    expected_mode = 0o777
     try:
         os.symlink("target", path)
         metadata = path.lstat()
@@ -1195,7 +1253,10 @@ def _stream_extract(
     archive_path: Path,
     staging: Path,
     expected: Mapping[str, Mapping[str, Any]],
+    *,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, int]:
+    _notify_progress(progress_callback, "extraction", "start", 0, None)
     zstd = _require_zstd()
     try:
         stderr_file = tempfile.TemporaryFile(mode="w+b")
@@ -1277,6 +1338,7 @@ def _stream_extract(
 
     if seen != set(expected):
         raise _error("archive_entries_missing", "archive does not contain exactly the manifest entries")
+    _notify_progress(progress_callback, "extraction", "end", 1, 1)
     return {
         "hardlink_count": hardlink_count,
         "hardlink_saved_bytes": hardlink_saved_bytes,
@@ -1324,9 +1386,11 @@ def _verify_tree(
     mode_policy: VolumeModePolicy,
     *,
     allow_unmanifested: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> None:
     """Verify all published entries and optionally tolerate runtime-created files."""
 
+    _notify_progress(progress_callback, "tree_verify", "start", 0, None)
     if not _is_real_directory(root):
         raise _error("verification_root")
     expected = _expected_entries(manifest)
@@ -1380,7 +1444,12 @@ def _verify_tree(
                 )
             if metadata.st_size != entry["size_bytes"]:
                 raise _error("materialized_size_mismatch", "materialized size differs from manifest")
-            size, digest = _hash_regular_file(path)
+            size, digest = _hash_regular_file(
+                path,
+                progress_callback=progress_callback,
+                phase="tree_verify",
+                total_bytes=entry["size_bytes"],
+            )
             if size != entry["size_bytes"] or digest != entry["sha256"]:
                 raise _error("materialized_digest_mismatch", "materialized digest differs from manifest")
         elif kind == "symlink":
@@ -1403,6 +1472,7 @@ def _verify_tree(
             _verify_symlink_inside(root, path, set(expected))
         else:
             raise _error("manifest_invalid", "unsupported runtime entry type")
+    _notify_progress(progress_callback, "tree_verify", "end", 1, 1)
 
 
 def _verify_metadata(
@@ -1448,9 +1518,16 @@ def _verify_generation(
     mode_policy: VolumeModePolicy,
     *,
     allow_unmanifested: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> None:
     _verify_metadata(root, manifest_bytes, manifest, mode_policy)
-    _verify_tree(root, manifest, mode_policy, allow_unmanifested=allow_unmanifested)
+    _verify_tree(
+        root,
+        manifest,
+        mode_policy,
+        allow_unmanifested=allow_unmanifested,
+        progress_callback=progress_callback,
+    )
 
 
 def _seal_published_generation(
@@ -1541,6 +1618,7 @@ def _materialize_locked(
     runtime_root: Path,
     mode_policy: VolumeModePolicy,
     capacity_before: Mapping[str, int] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, object]:
     runtime_hex = manifest["runtime_digest"].removeprefix("sha256:")
     generation_name = runtime_hex
@@ -1560,6 +1638,7 @@ def _materialize_locked(
             manifest,
             mode_policy,
             allow_unmanifested=True,
+            progress_callback=progress_callback,
         )
         # A previous process may have been interrupted after the generation
         # rename but before sealing its materializer-owned parent directories.
@@ -1606,8 +1685,18 @@ def _materialize_locked(
             mode_policy,
             error_code="volume_write_failed",
         )
-        extraction_metrics = _stream_extract(archive_path, staging, expected)
-        _verify_tree(staging, manifest, mode_policy)
+        if progress_callback is None:
+            # Keep the historical private-call shape for tests and older
+            # embedders that replace this helper with a three-argument hook.
+            extraction_metrics = _stream_extract(archive_path, staging, expected)
+        else:
+            extraction_metrics = _stream_extract(
+                archive_path,
+                staging,
+                expected,
+                progress_callback=progress_callback,
+            )
+        _verify_tree(staging, manifest, mode_policy, progress_callback=progress_callback)
 
         _atomic_write(staging / MANIFEST_NAME, manifest_bytes, mode=PUBLISHED_METADATA_MODE)
         try:
@@ -1619,7 +1708,13 @@ def _materialize_locked(
             canonical_json(ready) + b"\n",
             mode=PUBLISHED_METADATA_MODE,
         )
-        _verify_generation(staging, manifest_bytes, manifest, mode_policy)
+        _verify_generation(
+            staging,
+            manifest_bytes,
+            manifest,
+            mode_policy,
+            progress_callback=progress_callback,
+        )
         # Every regular file has already passed a complete size and digest
         # verification. Flush the staged generation once at filesystem scope
         # instead of issuing one fsync syscall per archive member.
@@ -1683,9 +1778,18 @@ class RuntimeMaterializer:
         manifest_path: Path,
         *,
         mode_policy: VolumeModePolicy | None = None,
+        verified_manifest_bytes: bytes | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, object]:
-        manifest_bytes, manifest = _read_manifest(Path(manifest_path))
-        archive_size, archive_sha256 = _validate_archive_input(Path(archive_path), manifest)
+        if verified_manifest_bytes is None:
+            manifest_bytes, manifest = _read_manifest(Path(manifest_path))
+        else:
+            manifest_bytes, manifest = _parse_manifest_bytes(verified_manifest_bytes)
+        archive_size, archive_sha256 = _validate_archive_input(
+            Path(archive_path),
+            manifest,
+            progress_callback=progress_callback,
+        )
 
         _ensure_real_directory(self.volume_root, create=True)
         _require_volume_root_traversable(self.volume_root)
@@ -1712,6 +1816,7 @@ class RuntimeMaterializer:
                     self.runtime_root,
                     mode_policy,
                     capacity_before,
+                    progress_callback,
                 )
             except RuntimeMaterializerError as error:
                 # Preserve the bounded primary code while attaching the
@@ -1737,6 +1842,8 @@ def materialize_runtime(
     *,
     runtime_directory: str = RUNTIME_DIRECTORY,
     mode_policy: VolumeModePolicy | None = None,
+    verified_manifest_bytes: bytes | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, object]:
     """Materialize one archive and return bounded, path-free result metadata."""
 
@@ -1744,6 +1851,8 @@ def materialize_runtime(
         archive_path,
         manifest_path,
         mode_policy=mode_policy,
+        verified_manifest_bytes=verified_manifest_bytes,
+        progress_callback=progress_callback,
     )
 
 
@@ -1754,6 +1863,8 @@ def materialize(
     *,
     runtime_directory: str = RUNTIME_DIRECTORY,
     mode_policy: VolumeModePolicy | None = None,
+    verified_manifest_bytes: bytes | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, object]:
     """Compatibility alias for callers using the shorter function name."""
 
@@ -1763,6 +1874,8 @@ def materialize(
         volume_root,
         runtime_directory=runtime_directory,
         mode_policy=mode_policy,
+        verified_manifest_bytes=verified_manifest_bytes,
+        progress_callback=progress_callback,
     )
 
 

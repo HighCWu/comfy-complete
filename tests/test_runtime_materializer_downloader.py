@@ -6,8 +6,12 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -17,6 +21,7 @@ from urllib import request as urlrequest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from runtime_manifest import canonical_json  # noqa: E402
+import materialize_runtime as materializer_module  # noqa: E402
 
 SPEC = importlib.util.spec_from_file_location(
     "download_materialize_runtime", ROOT / "scripts" / "download_materialize_runtime.py"
@@ -95,6 +100,62 @@ class _RangeOpener:
 
 
 class RuntimeMaterializerDownloaderTests(unittest.TestCase):
+    def test_configuration_accepts_content_addressed_pre_staged_pair(self) -> None:
+        archive_sha256 = "a" * 64
+        manifest_sha256 = "b" * 64
+        root = "/runpod-volume"
+        environment = {
+            "RUNTIME_VOLUME_ROOT": root,
+            "RUNTIME_ARCHIVE_PATH": f"{root}/.runtime-incoming/archives/sha256-{archive_sha256}.tar.zst",
+            "RUNTIME_MANIFEST_PATH": f"{root}/.runtime-incoming/manifests/sha256-{manifest_sha256}.json",
+            "RUNTIME_ARCHIVE_SHA256": archive_sha256,
+            "RUNTIME_ARCHIVE_SIZE_BYTES": "7",
+            "RUNTIME_MANIFEST_SHA256": manifest_sha256,
+            "RUNTIME_MANIFEST_SIZE_BYTES": "9",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            config = downloader.RuntimeDownloadConfig.from_environment()
+        self.assertTrue(config.is_pre_staged)
+        self.assertIsNone(config.archive_url)
+        self.assertIsNone(config.manifest_url)
+        self.assertEqual(config.archive_path, Path(environment["RUNTIME_ARCHIVE_PATH"]))
+        self.assertEqual(config.manifest_path, Path(environment["RUNTIME_MANIFEST_PATH"]))
+
+    def test_configuration_rejects_partial_or_traversing_pre_staged_pair(self) -> None:
+        archive_sha256 = "a" * 64
+        manifest_sha256 = "b" * 64
+        base = {
+            "RUNTIME_VOLUME_ROOT": "/runpod-volume",
+            "RUNTIME_ARCHIVE_SHA256": archive_sha256,
+            "RUNTIME_ARCHIVE_SIZE_BYTES": "7",
+            "RUNTIME_MANIFEST_SHA256": manifest_sha256,
+            "RUNTIME_MANIFEST_SIZE_BYTES": "9",
+        }
+        with patch.dict(
+            os.environ,
+            {
+                **base,
+                "RUNTIME_ARCHIVE_PATH": (
+                    f"/runpod-volume/.runtime-incoming/archives/sha256-{archive_sha256}.tar.zst"
+                ),
+            },
+            clear=True,
+        ), self.assertRaisesRegex(downloader.RuntimeDownloadError, "configuration_invalid"):
+            downloader.RuntimeDownloadConfig.from_environment()
+
+        with patch.dict(
+            os.environ,
+            {
+                **base,
+                "RUNTIME_ARCHIVE_PATH": "/runpod-volume/.runtime-incoming/archives/../outside",
+                "RUNTIME_MANIFEST_PATH": (
+                    f"/runpod-volume/.runtime-incoming/manifests/sha256-{manifest_sha256}.json"
+                ),
+            },
+            clear=True,
+        ), self.assertRaisesRegex(downloader.RuntimeDownloadError, "configuration_invalid"):
+            downloader.RuntimeDownloadConfig.from_environment()
+
     def test_configuration_rejects_non_https_and_userinfo(self) -> None:
         for url in (
             "http://example.test/runtime",
@@ -340,6 +401,55 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
             },
         }
 
+    def _write_valid_staged_bundle(self, volume: Path) -> tuple[Path, Path, bytes, dict[str, object]]:
+        if shutil.which("zstd") is None:
+            self.skipTest("zstd CLI is required")
+        tar_path = volume / "runtime.tar"
+        archive_path = volume / "runtime.tar.zst"
+        with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            for path, mode, payload in (
+                ("app/comfyui", 0o755, None),
+                ("app/comfyui/main.py", 0o755, b"x"),
+                ("opt/conda", 0o755, None),
+                ("opt/conda/bin", 0o755, None),
+                ("opt/conda/bin/python", 0o755, b"x"),
+            ):
+                info = tarfile.TarInfo(path)
+                info.uid = 0
+                info.gid = 0
+                info.mtime = 0
+                info.mode = mode
+                info.pax_headers = {}
+                if payload is None:
+                    info.type = tarfile.DIRTYPE
+                    info.size = 0
+                    archive.addfile(info)
+                else:
+                    info.type = tarfile.REGTYPE
+                    info.size = len(payload)
+                    archive.addfile(info, io.BytesIO(payload))
+        with archive_path.open("wb") as handle:
+            completed = subprocess.run(
+                ["zstd", "-q", "-T1", "--no-progress", "-c", str(tar_path)],
+                stdout=handle,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
+        archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        content_archive = volume / f"sha256-{archive_sha256}.tar.zst"
+        archive_path.replace(content_archive)
+        manifest = self._manifest(archive_sha256, content_archive.stat().st_size)
+        manifest_payload = canonical_json(manifest) + b"\n"
+        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+        staged_archive = volume / ".runtime-incoming" / "archives" / content_archive.name
+        staged_manifest = volume / ".runtime-incoming" / "manifests" / f"sha256-{manifest_sha256}.json"
+        staged_archive.parent.mkdir(parents=True)
+        staged_manifest.parent.mkdir(parents=True)
+        content_archive.replace(staged_archive)
+        staged_manifest.write_bytes(manifest_payload)
+        return staged_archive, staged_manifest, manifest_payload, manifest
+
     def test_run_binds_manifest_archive_identity_before_materializing(self) -> None:
         archive_payload = b"archive"
         archive_sha256 = hashlib.sha256(archive_payload).hexdigest()
@@ -406,6 +516,240 @@ class RuntimeMaterializerDownloaderTests(unittest.TestCase):
         self.assertEqual(materialized[0][0].name, "sha256-" + archive_sha256 + ".tar.zst")
         self.assertEqual(policies, [probe_policy])
         self.assertNotIn("signature", json.dumps(result))
+
+    def test_pre_staged_run_verifies_in_place_without_download_or_cleanup(self) -> None:
+        archive_payload = b"archive"
+        archive_sha256 = hashlib.sha256(archive_payload).hexdigest()
+        manifest = self._manifest(archive_sha256, len(archive_payload))
+        manifest_payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+
+        with tempfile.TemporaryDirectory() as directory:
+            volume = Path(directory)
+            archive_path = volume / ".runtime-incoming" / "archives" / f"sha256-{archive_sha256}.tar.zst"
+            manifest_path = volume / ".runtime-incoming" / "manifests" / f"sha256-{manifest_sha256}.json"
+            archive_path.parent.mkdir(parents=True)
+            manifest_path.parent.mkdir(parents=True)
+            archive_path.write_bytes(archive_payload)
+            manifest_path.write_bytes(manifest_payload)
+            config = downloader.RuntimeDownloadConfig(
+                archive_url=None,
+                manifest_url=None,
+                archive_sha256=archive_sha256,
+                archive_size_bytes=len(archive_payload),
+                manifest_sha256=manifest_sha256,
+                manifest_size_bytes=len(manifest_payload),
+                volume_root=volume,
+                timeout_seconds=5,
+                archive_path=archive_path,
+                manifest_path=manifest_path,
+            )
+            materialized: list[tuple[Path, Path, Path]] = []
+
+            def fake_materialize(
+                archive: Path,
+                staged_manifest: Path,
+                mounted_volume: Path,
+                **_kwargs: object,
+            ) -> dict[str, object]:
+                materialized.append((archive, staged_manifest, mounted_volume))
+                return {
+                    "status": "materialized",
+                    "runtime_digest": manifest["runtime_digest"],
+                    "archive_sha256": archive_sha256,
+                    "archive_size_bytes": len(archive_payload),
+                    "entry_count": 5,
+                    "materialized_bytes": manifest["file_tree"]["total_bytes"],
+                    "current_updated": True,
+                }
+
+            with patch.object(downloader, "_download_file") as download_manifest, patch.object(
+                downloader, "_download_range_chunks"
+            ) as download_archive, patch.object(
+                downloader,
+                "probe_volume_mode_capability",
+                return_value=object(),
+            ), patch.object(downloader, "materialize_runtime", side_effect=fake_materialize):
+                result = downloader.run(config)
+
+            self.assertEqual(result["verified_archive_bytes"], len(archive_payload))
+            self.assertNotIn("downloaded_bytes", result)
+            self.assertEqual(materialized, [(archive_path, manifest_path, volume)])
+            self.assertEqual(archive_path.read_bytes(), archive_payload)
+            self.assertEqual(manifest_path.read_bytes(), manifest_payload)
+            download_manifest.assert_not_called()
+            download_archive.assert_not_called()
+
+    def test_pre_staged_run_rejects_symlink_input_before_materializing(self) -> None:
+        archive_payload = b"archive"
+        archive_sha256 = hashlib.sha256(archive_payload).hexdigest()
+        manifest = self._manifest(archive_sha256, len(archive_payload))
+        manifest_payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            volume = Path(directory)
+            archive_path = volume / ".runtime-incoming" / "archives" / f"sha256-{archive_sha256}.tar.zst"
+            manifest_path = volume / ".runtime-incoming" / "manifests" / f"sha256-{manifest_sha256}.json"
+            archive_path.parent.mkdir(parents=True)
+            manifest_path.parent.mkdir(parents=True)
+            archive_path.symlink_to(Path(outside) / "archive.tar.zst")
+            manifest_path.write_bytes(manifest_payload)
+            config = downloader.RuntimeDownloadConfig(
+                archive_url=None,
+                manifest_url=None,
+                archive_sha256=archive_sha256,
+                archive_size_bytes=len(archive_payload),
+                manifest_sha256=manifest_sha256,
+                manifest_size_bytes=len(manifest_payload),
+                volume_root=volume,
+                timeout_seconds=5,
+                archive_path=archive_path,
+                manifest_path=manifest_path,
+            )
+            with patch.object(downloader, "materialize_runtime") as materialize:
+                with self.assertRaisesRegex(downloader.RuntimeDownloadError, "staged_path_invalid"):
+                    downloader.run(config)
+            materialize.assert_not_called()
+
+    def test_pre_staged_logs_are_bounded_and_path_free(self) -> None:
+        archive_payload = b"archive"
+        archive_sha256 = hashlib.sha256(archive_payload).hexdigest()
+        manifest = self._manifest(archive_sha256, len(archive_payload))
+        manifest_payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            volume = Path(directory)
+            archive_path = volume / ".runtime-incoming" / "archives" / f"sha256-{archive_sha256}.tar.zst"
+            manifest_path = volume / ".runtime-incoming" / "manifests" / f"sha256-{manifest_sha256}.json"
+            archive_path.parent.mkdir(parents=True)
+            manifest_path.parent.mkdir(parents=True)
+            archive_path.write_bytes(archive_payload)
+            manifest_path.write_bytes(manifest_payload)
+            config = downloader.RuntimeDownloadConfig(
+                archive_url=None,
+                manifest_url=None,
+                archive_sha256=archive_sha256,
+                archive_size_bytes=len(archive_payload),
+                manifest_sha256=manifest_sha256,
+                manifest_size_bytes=len(manifest_payload),
+                volume_root=volume,
+                timeout_seconds=5,
+                archive_path=archive_path,
+                manifest_path=manifest_path,
+            )
+            def fake_materialize(*_args: object, **kwargs: object) -> dict[str, object]:
+                callback = kwargs["progress_callback"]
+                assert callable(callback)
+                callback("archive_verify", "start", 0, len(archive_payload))
+                callback("archive_verify", "progress", len(archive_payload), len(archive_payload))
+                callback("archive_verify", "end", len(archive_payload), len(archive_payload))
+                callback("extraction", "start", 0, None)
+                callback("extraction", "end", 1, 1)
+                callback("tree_verify", "start", 0, None)
+                callback("tree_verify", "end", 1, 1)
+                return {
+                    "status": "materialized",
+                    "runtime_digest": manifest["runtime_digest"],
+                    "archive_sha256": archive_sha256,
+                    "archive_size_bytes": len(archive_payload),
+                    "entry_count": 5,
+                    "materialized_bytes": 1,
+                    "current_updated": True,
+                }
+
+            with patch.object(downloader, "probe_volume_mode_capability", return_value=object()), patch.object(
+                downloader,
+                "materialize_runtime",
+                side_effect=fake_materialize,
+            ), patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                downloader.run(config)
+            logs = stderr.getvalue()
+            self.assertIn('"phase":"archive_verify_start"', logs)
+            self.assertIn('"phase":"archive_verify_end"', logs)
+            self.assertIn('"phase":"materialization_start"', logs)
+            self.assertIn('"phase":"materialization_end"', logs)
+            self.assertIn('"phase":"archive_verify"', logs)
+            self.assertNotIn(str(volume), logs)
+            self.assertNotIn("https://", logs)
+
+    def test_pre_staged_archive_is_hashed_once_by_authoritative_materializer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            volume = Path(directory)
+            archive_path, manifest_path, manifest_payload, manifest = self._write_valid_staged_bundle(volume)
+            archive_sha256 = manifest["archive"]["sha256"]
+            assert isinstance(archive_sha256, str)
+            config = downloader.RuntimeDownloadConfig(
+                archive_url=None,
+                manifest_url=None,
+                archive_sha256=archive_sha256,
+                archive_size_bytes=manifest["archive"]["size_bytes"],
+                manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+                manifest_size_bytes=len(manifest_payload),
+                volume_root=volume,
+                timeout_seconds=5,
+                archive_path=archive_path,
+                manifest_path=manifest_path,
+            )
+            Path(volume).chmod(0o755)
+            original_hash = materializer_module._hash_regular_file
+            with patch.object(
+                materializer_module,
+                "_hash_regular_file",
+                wraps=original_hash,
+            ) as hash_file:
+                result = downloader.run(config)
+
+            archive_calls = [
+                call
+                for call in hash_file.call_args_list
+                if call.args and Path(call.args[0]) == archive_path
+            ]
+            self.assertEqual(len(archive_calls), 1)
+            self.assertEqual(result["verified_archive_bytes"], config.archive_size_bytes)
+            self.assertEqual(result["archive_sha256"], archive_sha256)
+            self.assertEqual(result["manifest_sha256"], config.manifest_sha256)
+
+    def test_pre_staged_manifest_replacement_after_wrapper_verification_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            volume = Path(directory)
+            archive_path, manifest_path, manifest_payload, manifest = self._write_valid_staged_bundle(volume)
+            archive_sha256 = manifest["archive"]["sha256"]
+            assert isinstance(archive_sha256, str)
+            manifest_value = json.loads(manifest_payload.decode("utf-8"))
+            manifest_value["runtime_version"] = "replacement-after-verification"
+            replacement_payload = canonical_json(manifest_value) + b"\n"
+            config = downloader.RuntimeDownloadConfig(
+                archive_url=None,
+                manifest_url=None,
+                archive_sha256=archive_sha256,
+                archive_size_bytes=manifest["archive"]["size_bytes"],
+                manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+                manifest_size_bytes=len(manifest_payload),
+                volume_root=volume,
+                timeout_seconds=5,
+                archive_path=archive_path,
+                manifest_path=manifest_path,
+            )
+            Path(volume).chmod(0o755)
+            original_probe = downloader.probe_volume_mode_capability
+
+            def replace_after_probe(root: Path, verified: object) -> object:
+                policy = original_probe(root, verified)
+                manifest_path.write_bytes(replacement_payload)
+                return policy
+
+            with patch.object(
+                downloader,
+                "probe_volume_mode_capability",
+                side_effect=replace_after_probe,
+            ):
+                result = downloader.run(config)
+
+            runtime_hex = str(manifest["runtime_digest"])[len("sha256:") :]
+            published_manifest = (volume / "runtimes" / runtime_hex / "manifest.json").read_bytes()
+            self.assertEqual(published_manifest, manifest_payload)
+            self.assertEqual(result["runtime_digest"], manifest["runtime_digest"])
+            self.assertNotEqual(published_manifest, replacement_payload)
 
     def test_run_forwards_verified_materialized_bytes_from_materializer(self) -> None:
         archive_payload = b"archive"
