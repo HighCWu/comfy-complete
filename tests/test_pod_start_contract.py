@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +95,39 @@ def test_pod_model_objects_use_a_fixed_container_local_root() -> None:
 
     assert "--model-object-root /tmp/comfy-model-objects" in script
     assert "instance_root=\"/tmp/comfy-runtime/${instance_id}\"" in script
+
+
+def test_pool_worker_registers_only_fixed_shared_model_paths() -> None:
+    script = START.read_text(encoding="utf-8")
+    model_paths = script[script.index('model_paths_config="'):]
+    model_paths = model_paths[:model_paths.index("comfy_args+=(")]
+
+    assert 'if [ "${managed_mode}" -eq 1 ]; then' in model_paths
+    assert 'elif [ "${worker_mode}" -eq 1 ]; then' in model_paths
+    assert "python -u /pod-model-bootstrap.py" in model_paths
+    assert "python -u /pool-model-paths.py --config \"${model_paths_config}\"" in model_paths
+    assert model_paths.index("/pod-model-bootstrap.py") < model_paths.index("/pool-model-paths.py")
+    assert "--shared-volume-root /runpod-volume" in model_paths
+    assert "COMFY_CONTROL_PLANE_URL" not in model_paths[model_paths.index('elif [ "${worker_mode}"'):]
+
+    assert 'if [ "${managed_mode}" -eq 1 ] || [ "${worker_mode}" -eq 1 ]; then' in script
+    assert "--extra-model-paths-config" in script
+
+
+def test_pool_start_script_has_valid_bash_syntax() -> None:
+    result = subprocess.run(
+        ["bash", "-n", str(START)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_full_pool_image_contains_model_paths_helper() -> None:
+    dockerfile = (ROOT / "docker" / "Dockerfile.pod").read_text(encoding="utf-8")
+    assert "docker/pod/pool_model_paths.py /pool-model-paths.py" in dockerfile
 
 
 def test_worker_capability_mode_is_opt_in_and_restart_is_signal_only() -> None:

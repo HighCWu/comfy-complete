@@ -157,6 +157,11 @@ if [ "${managed_mode}" -eq 1 ]; then
         --shared-volume-root /runpod-volume \
         --model-object-root /tmp/comfy-model-objects
     python -u /pod-asset-sync.py restore --instance-root "${instance_root}"
+elif [ "${worker_mode}" -eq 1 ]; then
+    # Pool workers have no user/instance lease.  Register only the fixed,
+    # platform-owned Network Volume model tree; never call model_bootstrap,
+    # which would attempt to fetch a lease-bound manifest or use credentials.
+    python -u /pool-model-paths.py --config "${model_paths_config}"
 fi
 comfy_args+=(
     --input-directory "${instance_root}/input"
@@ -164,7 +169,7 @@ comfy_args+=(
     --temp-directory "${instance_root}/temp"
     --user-directory "${instance_root}/user"
 )
-if [ "${managed_mode}" -eq 1 ]; then
+if [ "${managed_mode}" -eq 1 ] || [ "${worker_mode}" -eq 1 ]; then
     comfy_args+=(--extra-model-paths-config "${model_paths_config}")
 fi
 

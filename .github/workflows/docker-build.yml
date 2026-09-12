@@ -425,6 +425,7 @@ jobs:
               docker/pod/gateway.py \
               docker/pod/worker_lifecycle.py \
               docker/pod/model_bootstrap.py \
+              docker/pod/pool_model_paths.py \
               docker/pod/asset_sync.py \
               docker/runpod/comfy-manager-set-mode.sh | LC_ALL=C sort
           } | sha256sum | cut -d' ' -f1)
@@ -1064,6 +1065,7 @@ jobs:
               docker/pod/start.sh \
               docker/pod/gateway.py \
               docker/pod/model_bootstrap.py \
+              docker/pod/pool_model_paths.py \
               docker/pod/asset_sync.py \
               docker/runpod/comfy-manager-set-mode.sh \
               scripts/runtime_manifest.py | LC_ALL=C sort
@@ -1186,6 +1188,7 @@ jobs:
             /pod-gateway.py \
             /worker_lifecycle.py \
             /pod-model-bootstrap.py \
+            /pool-model-paths.py \
             /pod-asset-sync.py \
             /usr/local/bin/comfy-manager-set-mode; do
             test -f "$required"
@@ -1222,6 +1225,7 @@ jobs:
               "/pod-gateway.py",
               "/worker_lifecycle.py",
               "/pod-model-bootstrap.py",
+              "/pool-model-paths.py",
               "/pod-asset-sync.py",
           ):
               with open(path, "rb") as source:
