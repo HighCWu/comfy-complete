@@ -21,6 +21,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -40,6 +41,7 @@ WORKER_PREFIX = "/__worker"
 WORKER_CAPABILITY_ENV = "COMFY_POD_WORKER_CAPABILITY_SECRET"
 WORKER_CAPABILITY_HEADER = "X-Comfy-Worker-Capability"
 ASSIGNMENT_TOKEN_HEADER = "X-Comfy-Worker-Assignment"
+BOOT_ID_HEADER = "X-Comfy-Worker-Boot-ID"
 EXECUTION_PATH = f"{WORKER_PREFIX}/execute"
 RESULT_PATH = f"{WORKER_PREFIX}/result"
 CANCEL_PATH = f"{WORKER_PREFIX}/cancel"
@@ -85,6 +87,8 @@ MAX_COMFY_RESPONSE_BYTES = 8 * 1024 * 1024
 MIN_CANCEL_QUEUE_CONFIRMATIONS = 2
 PROMPT_VISIBILITY_GRACE_MILLIS = 30_000
 RESET_TOTAL_TIMEOUT_SECONDS = 50.0
+BOOT_ID_MAX_LENGTH = 128
+BOOT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,127}\Z")
 
 
 def _load_worker_lifecycle() -> object | None:
@@ -161,6 +165,24 @@ def capability_matches(provided: str | None, expected: str) -> bool:
     return provided is not None and hmac.compare_digest(provided, expected)
 
 
+def generate_boot_id() -> str:
+    """Generate one opaque process-generation identifier.
+
+    This is deliberately independent from the stable D1 worker id.  A Pod
+    restart must produce a different value even when the provider reuses the
+    same Pod and the same configured worker identity.
+    """
+
+    # token_urlsafe may begin with ``-`` or ``_``; prefixing keeps the wire
+    # identifier compatible with the bounded identifier grammar shared by the
+    # Python gateway and the Workers client.
+    return "b_" + secrets.token_urlsafe(24)
+
+
+def boot_id_matches(provided: str | None, expected: str) -> bool:
+    return provided is not None and hmac.compare_digest(provided, expected)
+
+
 def _header_value(request: web.Request, *names: str) -> str | None:
     for name in names:
         value = request.headers.get(name)
@@ -196,6 +218,7 @@ def forwarded_headers(request: web.Request) -> dict[str, str]:
         "x-comfy-pod-capability",
         ASSIGNMENT_TOKEN_HEADER.lower(),
         "x-comfy-assignment-token",
+        BOOT_ID_HEADER.lower(),
     }
     return {
         name: value
@@ -588,6 +611,18 @@ def _valid_identifier(value: object, field: str) -> str:
     return value
 
 
+def _valid_boot_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > BOOT_ID_MAX_LENGTH
+        or "\x00" in value
+        or BOOT_ID_PATTERN.fullmatch(value) is None
+    ):
+        raise WorkerProtocolError("invalid worker boot id")
+    return value
+
+
 def _wire_execution_status(execution: WorkerExecution) -> str:
     """Map controller-only transient states to the public execution enum."""
 
@@ -738,6 +773,8 @@ _ASSIGNMENT_REQUEST_FIELDS = frozenset(
         "affinityKey",
         "model_plan_fingerprint",
         "modelPlanFingerprint",
+        "boot_id",
+        "bootId",
     }
 )
 
@@ -811,7 +848,7 @@ def _assignment_error_response(
     message = str(error)
     if "token" in message:
         status = 401
-    elif "assignment" in message:
+    elif "assignment" in message or "boot id" in message or "boot_id" in message:
         status = 409
     else:
         status = 400
@@ -1303,6 +1340,21 @@ def _optional_affinity_key(payload: Mapping[str, object]) -> str | None:
     return _required_affinity_key(payload)
 
 
+def _optional_boot_id(payload: Mapping[str, object]) -> str | None:
+    """Read the boot id from either wire spelling, rejecting disagreement."""
+
+    values: list[str] = []
+    for field in ("boot_id", "bootId"):
+        if field not in payload:
+            continue
+        values.append(_valid_boot_id(payload[field]))
+    if not values:
+        return None
+    if any(value != values[0] for value in values[1:]):
+        raise WorkerProtocolError("worker boot id fields disagree")
+    return values[0]
+
+
 class WorkerController:
     """Provider-neutral, single-assignment controller for one Pod process.
 
@@ -1329,6 +1381,8 @@ class WorkerController:
         restart_probe_timeout_seconds: float = 30.0,
         reset_timeout_seconds: float = RESET_TOTAL_TIMEOUT_SECONDS,
         now_fn: Callable[[], int] = _now_millis,
+        boot_id: str | None = None,
+        require_boot_id: bool = True,
     ) -> None:
         lifecycle = _protocol_lifecycle()
         self._worker_id = _valid_identifier(worker_id, "id")
@@ -1338,6 +1392,12 @@ class WorkerController:
         except (AttributeError, ValueError) as error:
             raise WorkerProtocolError("invalid worker initial state") from error
         self._record = lifecycle.WorkerRecord(self._worker_id, state)
+        if boot_id is None:
+            boot_id = generate_boot_id()
+        self._boot_id = _valid_boot_id(boot_id)
+        if not isinstance(require_boot_id, bool):
+            raise WorkerProtocolError("worker boot id requirement must be a boolean")
+        self._require_boot_id = require_boot_id
         self._assignment: WorkerAssignment | None = None
         self._baseline = copy.deepcopy(dict(baseline)) if baseline is not None else None
         self._barrier_factory = barrier_factory
@@ -1382,6 +1442,12 @@ class WorkerController:
     @property
     def worker_id(self) -> str:
         return self._worker_id
+
+    @property
+    def boot_id(self) -> str:
+        """Opaque process-generation id used to fence stale control calls."""
+
+        return self._boot_id
 
     @property
     def state(self) -> str:
@@ -1429,6 +1495,7 @@ class WorkerController:
             "ok": state not in {"error", "terminating"},
             "protocol": "comfy-pod-worker/v1",
             "worker_id": self._worker_id,
+            "boot_id": self._boot_id,
             "state": state,
             "ready": state == "ready",
             "affinity": (
@@ -1610,6 +1677,20 @@ class WorkerController:
                 pass
             return False
 
+    def _check_boot_id(
+        self,
+        payload: Mapping[str, object],
+        *,
+        required: bool,
+    ) -> None:
+        supplied = _optional_boot_id(payload)
+        if supplied is None:
+            if required and self._require_boot_id:
+                raise WorkerProtocolError("missing worker field: boot_id")
+            return
+        if not boot_id_matches(supplied, self._boot_id):
+            raise WorkerProtocolError("worker boot id does not match")
+
     def _check_assignment(
         self,
         payload: Mapping[str, object],
@@ -1618,6 +1699,7 @@ class WorkerController:
         assignment = self._assignment
         if assignment is None:
             raise WorkerProtocolError("worker has no active assignment")
+        self._check_boot_id(payload, required=True)
         assignment_id = _required_identifier(payload, "assignment_id", "assignmentId")
         job_id = _required_identifier(payload, "job_id", "jobId")
         user_id = _required_identifier(payload, "user_id", "userId")
@@ -1659,6 +1741,7 @@ class WorkerController:
         assignment = self._assignment
         if assignment is None:
             raise WorkerProtocolError("worker has no active assignment")
+        self._check_boot_id(payload, required=True)
         if token is None or not capability_matches(token, assignment.assignment_token):
             raise WorkerProtocolError("invalid assignment token")
         if (
@@ -2083,6 +2166,11 @@ class WorkerController:
         payload: Mapping[str, object],
     ) -> tuple[int, dict[str, object]]:
         async with self._lock:
+            # The first claim establishes the process generation when the
+            # caller has not observed status yet.  A caller that already has
+            # a D1-bound generation must present it so a restarted Pod cannot
+            # silently accept a stale assignment.
+            self._check_boot_id(payload, required=False)
             assignment_id = _required_identifier(payload, "assignment_id", "assignmentId")
             user_id = _required_identifier(payload, "user_id", "userId")
             workspace_id = _required_identifier(payload, "workspace_id", "workspaceId")
@@ -2731,6 +2819,13 @@ def _worker_capability(request: web.Request) -> str | None:
     )
 
 
+def _worker_boot_id(request: web.Request) -> str | None:
+    value = request.headers.get(BOOT_ID_HEADER)
+    if value is None:
+        return None
+    return _valid_boot_id(value)
+
+
 def _assignment_token(request: web.Request) -> str | None:
     return _header_value(
         request,
@@ -2748,6 +2843,7 @@ _OUTPUT_QUERY_FIELDS = frozenset(
         "affinity_key",
         "execution_id",
         "output_id",
+        "boot_id",
     }
 )
 
@@ -2784,7 +2880,11 @@ async def _stream_worker_output(
     )
     if download is None:
         return _worker_json_response(
-            {"ok": False, "error": "worker output unavailable"},
+            {
+                **controller.status_payload(),
+                "ok": False,
+                "error": "worker output unavailable",
+            },
             status=status,
         )
 
@@ -2796,6 +2896,7 @@ async def _stream_worker_output(
             "Content-Type": output.content_type,
             "X-Output-ID": output.output_id,
             "X-Output-SHA256": output.sha256,
+            BOOT_ID_HEADER: controller.boot_id,
             "Cache-Control": "no-store",
         },
     )
@@ -2848,6 +2949,19 @@ async def worker_route(request: web.Request) -> web.StreamResponse:
 
     try:
         if request.path == f"{WORKER_PREFIX}/status" and request.method == "GET":
+            supplied_boot_id = _worker_boot_id(request)
+            if supplied_boot_id is not None and not boot_id_matches(
+                supplied_boot_id,
+                controller.boot_id,
+            ):
+                return _worker_json_response(
+                    {
+                        **controller.status_payload(),
+                        "ok": False,
+                        "error": "worker boot id does not match",
+                    },
+                    status=409,
+                )
             return _worker_json_response(controller.status_payload())
 
         if request.path == OUTPUT_PATH and request.method == "GET":
@@ -2923,19 +3037,38 @@ async def worker_route(request: web.Request) -> web.StreamResponse:
                 payload,
                 _assignment_token(request),
             )
-        return _worker_json_response(response, status=status)
+        # Every authenticated JSON RPC response carries the process-generation
+        # fence, including a rejected request.  This lets a D1 caller update
+        # or quarantine its worker record without trusting a stale response.
+        return _worker_json_response(
+            {**controller.status_payload(), **response},
+            status=status,
+        )
     except WorkerRequestTooLarge as error:
-        return _worker_json_response({"ok": False, "error": str(error)}, status=413)
+        return _worker_json_response(
+            {**controller.status_payload(), "ok": False, "error": str(error)},
+            status=413,
+        )
     except WorkerProtocolError as error:
-        return _worker_json_response({"ok": False, "error": str(error)}, status=400)
+        return _worker_json_response(
+            {**controller.status_payload(), "ok": False, "error": str(error)},
+            status=400,
+        )
     except WorkerProtocolUnavailable as error:
-        return _worker_json_response({"ok": False, "error": str(error)}, status=503)
+        return _worker_json_response(
+            {**controller.status_payload(), "ok": False, "error": str(error)},
+            status=503,
+        )
     except Exception:
         # Never serialize exception details or claim a ready worker after an
         # unexpected protocol failure.  Keep ordinary gateway requests
         # isolated from failures in this optional namespace.
         return _worker_json_response(
-            {"ok": False, "error": "worker protocol failure"},
+            {
+                **controller.status_payload(),
+                "ok": False,
+                "error": "worker protocol failure",
+            },
             status=500,
         )
 
@@ -3012,6 +3145,8 @@ def create_app(
     worker_instance_root: str | None = None,
     comfy_client: ComfyExecutionClient | None = None,
     restart_probe_timeout_seconds: float = 30.0,
+    worker_boot_id: str | None = None,
+    require_worker_boot_id: bool = True,
 ) -> web.Application:
     app = web.Application(client_max_size=0)
     capability = (
@@ -3043,6 +3178,8 @@ def create_app(
             instance_root=worker_instance_root,
             comfy_client=comfy_client,
             restart_probe_timeout_seconds=restart_probe_timeout_seconds,
+            boot_id=worker_boot_id,
+            require_boot_id=require_worker_boot_id,
         )
     app["worker_controller"] = worker_controller
     app.on_startup.append(create_client_session)

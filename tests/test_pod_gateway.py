@@ -314,6 +314,10 @@ class WorkerProtocolTest(unittest.IsolatedAsyncioTestCase):
             restart_generation_path=restart_generation_path,
             worker_instance_root=str(instance_root),
             comfy_client=comfy_client,
+            # These legacy endpoint tests predate the D1-bound process
+            # generation fence. Dedicated fencing tests below use the
+            # production default instead.
+            require_worker_boot_id=False,
         )
         server = TestServer(app)
         client = TestClient(server)
@@ -384,6 +388,99 @@ class WorkerProtocolTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_boot_id_fences_stale_assignment_requests(self) -> None:
+        instance_root = Path("/tmp/comfy-runtime/inst_bootfencetest")
+        shutil.rmtree(instance_root, ignore_errors=True)
+        instance_root.mkdir(parents=True, exist_ok=True)
+        app = gateway.create_app(
+            token="browser-token",
+            worker_capability_secret="worker-cap",
+            worker_id="worker-boot-fence",
+            worker_initial_state="ready",
+            worker_baseline={"system": {}},
+            worker_boot_id="boot-current",
+            worker_instance_root=str(instance_root),
+        )
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        headers = {gateway.WORKER_CAPABILITY_HEADER: "worker-cap"}
+        identity = {
+            "user_id": "user-a",
+            "workspace_id": "workspace-a",
+            "assignment_id": "assignment-a",
+            "assignment_token": "assignment-secret",
+            "job_id": "job-a",
+            "affinity_key": "plan-a",
+        }
+        try:
+            status = await client.get("/__worker/status", headers=headers)
+            self.assertEqual(status.status, 200)
+            self.assertEqual((await status.json())["boot_id"], "boot-current")
+
+            # The first claim may establish the generation when the caller has
+            # not observed status yet.
+            claimed = await client.post(
+                "/__worker/claim",
+                headers=headers,
+                json=identity,
+            )
+            self.assertEqual(claimed.status, 200)
+
+            stale_claim = await client.post(
+                "/__worker/claim",
+                headers=headers,
+                json={**identity, "boot_id": "boot-old"},
+            )
+            self.assertEqual(stale_claim.status, 400)
+            self.assertEqual((await stale_claim.json())["boot_id"], "boot-current")
+
+            auth_headers = {
+                **headers,
+                gateway.ASSIGNMENT_TOKEN_HEADER: "assignment-secret",
+            }
+            stale_payload = {key: value for key, value in identity.items() if key != "assignment_token"}
+            for path, payload in (
+                ("/__worker/heartbeat", stale_payload),
+                ("/__worker/execute", {**stale_payload, "execution_id": "execution-a", "workflow": {"3": {}}}),
+                ("/__worker/result", {**stale_payload, "execution_id": "execution-a"}),
+                ("/__worker/cancel", {**stale_payload, "execution_id": "execution-a"}),
+                ("/__worker/complete", {**stale_payload, "status": "failed"}),
+                ("/__worker/reset", stale_payload),
+            ):
+                response = await client.post(path, headers=auth_headers, json=payload)
+                self.assertEqual(response.status, 409, path)
+                self.assertEqual((await response.json())["boot_id"], "boot-current")
+
+            output_query = {
+                **stale_payload,
+                "execution_id": "execution-a",
+                "output_id": "a" * 64,
+            }
+            output = await client.get(
+                "/__worker/output",
+                params=output_query,
+                headers=auth_headers,
+            )
+            self.assertEqual(output.status, 409)
+
+            wrong_status = await client.get(
+                "/__worker/status",
+                headers={**headers, gateway.BOOT_ID_HEADER: "boot-old"},
+            )
+            self.assertEqual(wrong_status.status, 409)
+            self.assertEqual((await wrong_status.json())["boot_id"], "boot-current")
+
+            correct_heartbeat = await client.post(
+                "/__worker/heartbeat",
+                headers=auth_headers,
+                json={**stale_payload, "boot_id": "boot-current"},
+            )
+            self.assertEqual(correct_heartbeat.status, 200)
+        finally:
+            await client.close()
+            shutil.rmtree(instance_root, ignore_errors=True)
+
     async def test_reset_deadline_quarantines_a_late_barrier_result(self) -> None:
         instance_root = Path("/tmp/comfy-runtime/inst_timeouttest")
         shutil.rmtree(instance_root, ignore_errors=True)
@@ -396,6 +493,7 @@ class WorkerProtocolTest(unittest.IsolatedAsyncioTestCase):
                 reset_barrier=SlowBarrier(0.1),
                 instance_root=str(instance_root),
                 reset_timeout_seconds=0.02,
+                require_boot_id=False,
             )
             identity = {
                 "assignment_id": "assignment-timeout",
@@ -444,6 +542,7 @@ class WorkerProtocolTest(unittest.IsolatedAsyncioTestCase):
                 reset_barrier=AsyncSlowBarrier(0.1),
                 instance_root=str(instance_root),
                 reset_timeout_seconds=0.02,
+                require_boot_id=False,
             )
             identity = {
                 "assignment_id": "assignment-async-timeout",
