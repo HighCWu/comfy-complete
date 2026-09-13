@@ -1382,6 +1382,120 @@ class WorkerProtocolTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_result_fails_when_accepted_prompt_disappears_from_history_and_queue(self) -> None:
+        comfy = FakeComfyClient()
+        now = [1_000]
+        client, _server = await self._client(
+            capability="worker-cap",
+            comfy_client=comfy,
+            now_fn=lambda: now[0],
+        )
+        headers = {gateway.WORKER_CAPABILITY_HEADER: "worker-cap"}
+        identity = {
+            "user_id": "user-a",
+            "workspace_id": "workspace-a",
+            "assignment_id": "assignment-a",
+            "job_id": "job-a",
+            "affinity_key": "plan-a",
+            "assignment_token": "assignment-secret",
+            "execution_id": "execution-a",
+        }
+        claim_identity = {
+            key: value for key, value in identity.items() if key != "execution_id"
+        }
+        try:
+            response = await client.post(
+                "/__worker/claim", headers=headers, json=claim_identity
+            )
+            self.assertEqual(response.status, 200)
+            response = await client.post(
+                "/__worker/execute",
+                headers={
+                    **headers,
+                    gateway.ASSIGNMENT_TOKEN_HEADER: "assignment-secret",
+                },
+                json={**identity, "workflow": {"3": {"class_type": "Test"}}},
+            )
+            self.assertEqual(response.status, 200)
+
+            comfy.history_value = {}
+            comfy.queue_value = {
+                "queue_running": [[7, "comfy-prompt-1", {"private": True}]],
+                "queue_pending": [],
+            }
+            response = await client.post(
+                "/__worker/result",
+                headers={
+                    **headers,
+                    gateway.ASSIGNMENT_TOKEN_HEADER: "assignment-secret",
+                },
+                json=identity,
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["execution"]["status"], "running")
+
+            comfy.queue_value = {"queue_running": [], "queue_pending": []}
+            response = await client.post(
+                "/__worker/result",
+                headers={
+                    **headers,
+                    gateway.ASSIGNMENT_TOKEN_HEADER: "assignment-secret",
+                },
+                json=identity,
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["execution"]["status"], "queued")
+
+            now[0] += gateway.PROMPT_VISIBILITY_GRACE_MILLIS
+            comfy.queue_value = {
+                "queue_running": [],
+                "queue_pending": [[7, "comfy-prompt-1", {"private": True}]],
+            }
+            response = await client.post(
+                "/__worker/result",
+                headers={
+                    **headers,
+                    gateway.ASSIGNMENT_TOKEN_HEADER: "assignment-secret",
+                },
+                json=identity,
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["execution"]["status"], "queued")
+
+            # Reappearance in the real queue resets the missing-provider
+            # grace period; a later absence must receive a fresh full window.
+            comfy.queue_value = {"queue_running": [], "queue_pending": []}
+            response = await client.post(
+                "/__worker/result",
+                headers={
+                    **headers,
+                    gateway.ASSIGNMENT_TOKEN_HEADER: "assignment-secret",
+                },
+                json=identity,
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["execution"]["status"], "queued")
+
+            now[0] += gateway.PROMPT_VISIBILITY_GRACE_MILLIS
+            response = await client.post(
+                "/__worker/result",
+                headers={
+                    **headers,
+                    gateway.ASSIGNMENT_TOKEN_HEADER: "assignment-secret",
+                },
+                json=identity,
+            )
+            self.assertEqual(response.status, 200)
+            failed = await response.json()
+            self.assertEqual(failed["kind"], "failed")
+            self.assertEqual(failed["execution"]["status"], "failed")
+            self.assertEqual(
+                failed["execution"]["error_code"], "COMFY_PROMPT_MISSING"
+            )
+            self.assertNotIn("comfy-prompt-1", await response.text())
+        finally:
+            await client.close()
+
     async def test_output_download_rejects_wrong_identity_and_unsafe_files(self) -> None:
         comfy = FakeComfyClient()
         client, _server = await self._client(

@@ -83,6 +83,7 @@ PUBLIC_EXECUTION_STATES = frozenset({"queued", "running", *TERMINAL_EXECUTION_ST
 # upstream read bounded without making ordinary large workflows impossible.
 MAX_COMFY_RESPONSE_BYTES = 8 * 1024 * 1024
 MIN_CANCEL_QUEUE_CONFIRMATIONS = 2
+PROMPT_VISIBILITY_GRACE_MILLIS = 30_000
 RESET_TOTAL_TIMEOUT_SECONDS = 50.0
 
 
@@ -562,6 +563,7 @@ class WorkerExecution:
         self.cancel_requested = False
         self.cancel_requested_at: int | None = None
         self.cancel_empty_observations = 0
+        self.provider_missing_since: int | None = None
 
 
 def _protocol_lifecycle() -> object:
@@ -1771,6 +1773,7 @@ class WorkerController:
                 )
                 execution.prompt_id = _valid_identifier(prompt_id, "prompt id")
                 execution.state = "queued"
+                print("comfy-pod: worker execution state queued", flush=True)
             except ComfySubmissionRejected:
                 # A definitive provider rejection is terminal and can be
                 # completed as failed without risking a duplicate submission.
@@ -1828,6 +1831,7 @@ class WorkerController:
                     "ok": False,
                     "error": "execution has no provider id",
                 }
+            previous_state = execution.state
             try:
                 history = await self._client_call(
                     self._comfy_client,
@@ -1836,31 +1840,50 @@ class WorkerController:
                 )
                 entry = _history_entry(history, prompt_id)
                 if entry is None:
-                    if not execution.cancel_requested:
-                        execution.state = "queued"
-                        execution.last_provider_state = "queued"
-                    else:
-                        queue = await self._client_call(
-                            self._comfy_client,
-                            "queue",
-                        )
-                        queue_state = _queue_prompt_state(queue, prompt_id)
-                        if queue_state is not None:
+                    queue = await self._client_call(
+                        self._comfy_client,
+                        "queue",
+                    )
+                    queue_state = _queue_prompt_state(queue, prompt_id)
+                    if queue_state is not None:
+                        execution.provider_missing_since = None
+                        if execution.cancel_requested:
                             execution.cancel_empty_observations = 0
                             execution.last_provider_state = queue_state
                             execution.state = "cancelling"
                         else:
-                            execution.cancel_empty_observations += 1
-                            if (
-                                execution.cancel_empty_observations
-                                >= MIN_CANCEL_QUEUE_CONFIRMATIONS
-                            ):
-                                execution.state = "cancelled"
-                                execution.error_code = None
-                                execution.error = None
-                            else:
-                                execution.state = "cancelling"
+                            execution.last_provider_state = queue_state
+                            execution.state = queue_state
+                    elif execution.cancel_requested:
+                        execution.provider_missing_since = None
+                        execution.cancel_empty_observations += 1
+                        if (
+                            execution.cancel_empty_observations
+                            >= MIN_CANCEL_QUEUE_CONFIRMATIONS
+                        ):
+                            execution.state = "cancelled"
+                            execution.error_code = None
+                            execution.error = None
+                        else:
+                            execution.state = "cancelling"
+                    else:
+                        now = self._now()
+                        if execution.provider_missing_since is None:
+                            execution.provider_missing_since = now
+                            execution.state = "queued"
+                            execution.last_provider_state = "queued"
+                        elif (
+                            now - execution.provider_missing_since
+                            >= PROMPT_VISIBILITY_GRACE_MILLIS
+                        ):
+                            execution.state = "failed"
+                            execution.error_code = "COMFY_PROMPT_MISSING"
+                            execution.error = "ComfyUI lost the accepted prompt"
+                        else:
+                            execution.state = "queued"
+                            execution.last_provider_state = "queued"
                 else:
+                    execution.provider_missing_since = None
                     state, outputs, error = _history_observation(entry)
                     if state in TERMINAL_EXECUTION_STATES:
                         if state == "completed":
@@ -1927,6 +1950,11 @@ class WorkerController:
                 return 502, {"ok": False, "error": "invalid ComfyUI result"}
             except Exception:
                 return 502, {"ok": False, "error": "ComfyUI result unavailable"}
+            if execution.state != previous_state:
+                print(
+                    f"comfy-pod: worker execution state {_wire_execution_status(execution)}",
+                    flush=True,
+                )
             kind = "pending" if execution.state not in TERMINAL_EXECUTION_STATES else execution.state
             if execution.state in TERMINAL_EXECUTION_STATES:
                 execution.result_observed = True
