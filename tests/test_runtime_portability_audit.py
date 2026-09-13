@@ -683,15 +683,7 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
         self.assertEqual(profiles["server"], "gpu_required")
         self.assertEqual(
             {item["module"] for item in validated["imports"] if item["profile"] == "cpu"},
-            {
-                "PIL",
-                "aiohttp",
-                "comfy",
-                "comfyui_workflow_templates",
-                "folder_paths",
-                "numpy",
-                "torch",
-            },
+            {"PIL", "aiohttp", "comfy", "folder_paths", "numpy", "torch"},
         )
 
     def test_critical_entrypoint_finds_real_root_files_outside_selection(self) -> None:
@@ -850,18 +842,7 @@ class RuntimePortabilityAuditTests(unittest.TestCase):
             probe_report["imports"].append(result)
         report = audit._critical_report(config, root, {}, audit.LauncherInventory(), audit.Limits(), probe_report, "cpu")
         findings = [item for item in report["findings"] if item["code"] == "critical_probe_unprovided_shared_object"]
-        self.assertEqual(
-            {item["path"] for item in findings},
-            {
-                "PIL",
-                "aiohttp",
-                "comfy",
-                "comfyui_workflow_templates",
-                "folder_paths",
-                "numpy",
-                "torch",
-            },
-        )
+        self.assertEqual({item["path"] for item in findings}, {"PIL", "aiohttp", "comfy", "folder_paths", "numpy", "torch"})
         self.assertTrue(all(item["evidence"]["mapped_path"] == "/usr/local/cuda/lib/libfixture.so" for item in findings))
 
     def test_critical_probe_schema_rejects_duplicate_imports_and_noncanonical_paths(self) -> None:

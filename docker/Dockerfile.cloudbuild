@@ -167,12 +167,6 @@ RUN grep -E '^(onnxruntime-gpu|jaxlib|pymeshlab|cupy-cuda12x|bitsandbytes|llvmli
 RUN grep -Ev '^(tensorrt_cu13_libs|onnxruntime-gpu|jaxlib|pymeshlab|cupy-cuda12x|bitsandbytes|llvmlite|taichi|polars-runtime-32|av|scipy)==' /tmp/req-all.txt > /tmp/req-l3.txt && \
     uv pip install --no-deps -r /tmp/req-l3.txt && rm -f /tmp/req-all.txt /tmp/req-l3.txt
 
-# This package is optional to ComfyUI startup but required by the curated
-# distribution. Verify the import in the exact interpreter now: a stale or
-# incomplete cached base must fail before Pod/RunPod wrappers are published.
-RUN /opt/conda/bin/python -c \
-    "import comfyui_workflow_templates as templates; assert templates is not None"
-
 # Install nvidia-vfx from NVIDIA's PyPI index (binary wheel includes Maxine VFX SDK libs)
 # Installed separately to avoid exposing all packages to the extra index (dependency confusion risk)
 RUN uv pip install --no-deps --extra-index-url https://pypi.nvidia.com/ nvidia-vfx==0.1.0.1

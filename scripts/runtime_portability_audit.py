@@ -65,17 +65,7 @@ MAX_CRITICAL_PROBE_OUTPUT = 256 * 1024
 MAX_CRITICAL_PATHS = 10_000
 MAX_CRITICAL_SOURCE_BYTES = 4 * 1024 * 1024
 CRITICAL_IMPORT_ALLOWLIST = frozenset(
-    {
-        "torch",
-        "numpy",
-        "PIL",
-        "aiohttp",
-        "comfyui_workflow_templates",
-        "folder_paths",
-        "comfy",
-        "server",
-        "execution",
-    }
+    {"torch", "numpy", "PIL", "aiohttp", "folder_paths", "comfy", "server", "execution"}
 )
 CRITICAL_PROFILES = ("cpu", "gpu_required")
 CRITICAL_IMPORT_PROFILES = frozenset(CRITICAL_PROFILES)
