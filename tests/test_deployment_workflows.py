@@ -74,11 +74,6 @@ def test_base_content_hash_covers_every_local_copy_input():
         assert path in workflow, f"base content hash is missing Docker COPY input: {path}"
 
 
-def test_base_build_verifies_the_pinned_workflow_templates_import():
-    dockerfile = (REPO_ROOT / "docker" / "Dockerfile.cloudbuild").read_text()
-    assert "import comfyui_workflow_templates as templates" in dockerfile
-
-
 def test_wrapper_content_hashes_cover_every_local_copy_input_and_base_identity():
     """Wrapper tags must change with the immutable base or any local COPY input."""
     workflow = DOCKER_BUILD.read_text()

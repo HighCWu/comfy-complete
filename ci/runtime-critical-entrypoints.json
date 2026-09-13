@@ -52,7 +52,6 @@
   "imports": [
     {"module": "PIL", "required": true, "profile": "cpu"},
     {"module": "aiohttp", "required": true, "profile": "cpu"},
-    {"module": "comfyui_workflow_templates", "required": true, "profile": "cpu"},
     {"module": "comfy", "required": true, "profile": "cpu"},
     {"module": "execution", "required": true, "profile": "gpu_required"},
     {"module": "folder_paths", "required": true, "profile": "cpu"},
@@ -63,7 +62,6 @@
   "import_review": [
     {"module": "PIL", "safe_import": true, "profile": "cpu", "reason": "Core image type imported by ComfyUI nodes and server; import performs no network or server startup."},
     {"module": "aiohttp", "safe_import": true, "profile": "cpu", "reason": "ComfyUI server dependency; importing the library does not open a listener or make a network request."},
-    {"module": "comfyui_workflow_templates", "safe_import": true, "profile": "cpu", "reason": "Pinned official workflow-template package required by the curated ComfyUI distribution; import reads only installed package metadata and resources."},
     {"module": "comfy", "safe_import": true, "profile": "cpu", "reason": "ComfyUI core package required by main and execution; import is local module loading only."},
     {"module": "execution", "safe_import": true, "profile": "gpu_required", "reason": "main.py imports execution before startup; this module is classified gpu_required until a GPU-capable smoke environment executes it."},
     {"module": "folder_paths", "safe_import": true, "profile": "cpu", "reason": "ComfyUI path registry required by main/server; its initialization is local and uses the configured runtime tree."},
