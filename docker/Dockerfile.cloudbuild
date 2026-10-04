@@ -94,6 +94,14 @@ RUN apt-get -o Acquire::Retries=3 update && \
   libavcodec-extra58 \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Create the runtime identity before any ComfyUI-owned tree is populated.
+# Building those files as their final owner avoids a later recursive chown,
+# which would copy the whole tree into a new OCI layer (over 2GiB compressed
+# in the measured production image).
+RUN groupadd --gid 1000 comfy \
+    && useradd --uid 1000 --gid 1000 -M --home-dir ${COMFY_PATH} --shell /usr/sbin/nologin comfy \
+    && install -d -o comfy -g comfy ${COMFY_PATH}
+
 # Layer 2: Base tools
 # astral-sh/uv tag: 0.9.29, linux/amd64
 COPY --from=ghcr.io/astral-sh/uv:0.9.29@sha256:efeddf2eadc8e30f9ce73a8a8668574585237becef05213fe804b15a7c52037c /uv /uvx /bin/
@@ -108,10 +116,10 @@ RUN COMFYUI_REF=$(yq -r '.pinned.comfyui.ref' /app/version_lock.yaml) && \
         echo "Error: Could not read .pinned.comfyui.ref from version_lock.yaml" && exit 1; \
     fi && \
     echo "Checking out ComfyUI ref: $COMFYUI_REF" && \
-    git clone --depth 1 ${COMFYUI_REPO_URL} ${COMFY_PATH} && \
+    runuser -u comfy -- git clone --depth 1 ${COMFYUI_REPO_URL} ${COMFY_PATH} && \
     cd ${COMFY_PATH} && \
-    git fetch --depth 1 origin "$COMFYUI_REF" && \
-    git checkout FETCH_HEAD
+    runuser -u comfy -- git fetch --depth 1 origin "$COMFYUI_REF" && \
+    runuser -u comfy -- git checkout FETCH_HEAD
 
 # Set locations where some custom nodes store user-specific data
 ENV XDG_DATA_HOME=/app/comfyui/models/_xdgdata \
@@ -120,25 +128,25 @@ ENV XDG_DATA_HOME=/app/comfyui/models/_xdgdata \
     TRANSPARENT_BACKGROUND_FILE_PATH=/app/comfyui/models
 
 # Create ComfyUI directories
-RUN cd ${COMFY_PATH} && \
-    mkdir -p models/checkpoints \
-    models/clip \
-    models/controlnet \
-    models/diffusers \
-    models/embeddings \
-    models/loras \
-    models/upscale_models \
-    models/vae \
-    models/sams \
-    models/insightface \
-    models/detection \
-    models/ultralytics/bbox \
-    models/ultralytics/segm \
-    output \
-    temp \
-    models/_xdgdata \
-    models/_xdgcache \
-    models/_xdgconfig
+RUN install -d -o comfy -g comfy \
+    ${COMFY_PATH}/models/checkpoints \
+    ${COMFY_PATH}/models/clip \
+    ${COMFY_PATH}/models/controlnet \
+    ${COMFY_PATH}/models/diffusers \
+    ${COMFY_PATH}/models/embeddings \
+    ${COMFY_PATH}/models/loras \
+    ${COMFY_PATH}/models/upscale_models \
+    ${COMFY_PATH}/models/vae \
+    ${COMFY_PATH}/models/sams \
+    ${COMFY_PATH}/models/insightface \
+    ${COMFY_PATH}/models/detection \
+    ${COMFY_PATH}/models/ultralytics/bbox \
+    ${COMFY_PATH}/models/ultralytics/segm \
+    ${COMFY_PATH}/output \
+    ${COMFY_PATH}/temp \
+    ${COMFY_PATH}/models/_xdgdata \
+    ${COMFY_PATH}/models/_xdgcache \
+    ${COMFY_PATH}/models/_xdgconfig
 
 # Layer 4: Python requirements FIRST (change less frequently than nodes)
 # Split into 3 sub-layers so each stays under 5GB — registry mirrors (e.g.
@@ -192,19 +200,21 @@ COPY supported_nodes.yaml /app/supported_nodes.yaml
 COPY scripts/install_custom_nodes.py /app/install_custom_nodes.py
 
 # Create the skip_download_model file in the custom_nodes directory
-RUN touch ${COMFY_PATH}/custom_nodes/skip_download_model
+RUN install -o comfy -g comfy /dev/null ${COMFY_PATH}/custom_nodes/skip_download_model
 
 # Install custom nodes with --no-deps (clone only, deps come from requirements.txt)
 # -u: unbuffered stdout so build logs show incremental progress
-RUN cd ${COMFY_PATH} && ${PYTHON_PATH} -u /app/install_custom_nodes.py --no-deps --comfy-path ${COMFY_PATH}
+RUN cd ${COMFY_PATH} && \
+    runuser -u comfy -- ${PYTHON_PATH} -u /app/install_custom_nodes.py --no-deps --comfy-path ${COMFY_PATH}
 
 # Pre-bake models that custom nodes fetch at import time (would block startup)
 # comfyui_face_parsing: downloads 339MB model + config at import time
 # huggingface-cli has built-in retry + CDN awareness (wget was unreliable on CI runners)
-RUN mkdir -p ${COMFY_PATH}/models/face_parsing ${COMFY_PATH}/models/ultralytics/bbox && \
+RUN runuser -u comfy -- env HOME=${COMFY_PATH} \
     huggingface-cli download jonathandinu/face-parsing \
         model.safetensors config.json preprocessor_config.json \
         --local-dir ${COMFY_PATH}/models/face_parsing && \
+    runuser -u comfy -- env HOME=${COMFY_PATH} \
     huggingface-cli download Bingsu/adetailer \
         face_yolov8m.pt \
         --local-dir ${COMFY_PATH}/models/ultralytics/bbox
@@ -226,17 +236,6 @@ RUN if [ -d "${COMFY_PATH}/custom_nodes/onebuttonprompt" ] && \
 
 # tomli-w: required by comfy-env for pixi.toml manifest generation
 RUN uv pip install tomli-w
-
-# Create user 1000 EARLY — before pixi envs are created.
-# Running comfy-env as user 1000 ensures the ~9GB of pixi envs are born
-# with correct ownership. This eliminates the chown -R that previously
-# duplicated ALL pixi files in a single 11.57GB compressed layer.
-# The chown below covers only the pre-existing content (ComfyUI clone +
-# custom nodes + models, ~3GB uncompressed) — the pixi envs created
-# in subsequent layers are already 1000:1000 owned.
-RUN groupadd --gid 1000 comfy \
-    && useradd --uid 1000 --gid 1000 -M --home-dir ${COMFY_PATH} --shell /usr/sbin/nologin comfy \
-    && chown -R 1000:1000 ${COMFY_PATH}
 
 # comfy-env: materialize pixi envs for nodes with isolated dependencies.
 # Two nodes have comfy-env.toml:
