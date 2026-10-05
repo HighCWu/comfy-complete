@@ -205,6 +205,11 @@ fail closed on a missing, corrupt, or inconsistent export.
 
 ## Runtime object publisher (explicit opt-in)
 
+Full-image Pod Worker Pools do not require this legacy slim route. The Docker
+Build workflow skips the entire runtime export/materialization/publication job
+on pushes and default manual builds. Explicitly select `publish_runtime=true`
+on a manual main-branch run only when the slim route is actually needed.
+
 After the export and `READY.json` checks pass, the independent
 `scripts/publish_runtime.py` helper can publish the archive to an
 S3-compatible object store. It uses content-addressed immutable objects,

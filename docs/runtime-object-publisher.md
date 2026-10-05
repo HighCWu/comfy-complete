@@ -148,13 +148,13 @@ The `Docker Build` workflow accepts two manual-dispatch inputs:
 
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `publish_runtime` | boolean | `false` | The only switch that enables object-store publishing |
+| `publish_runtime` | boolean | `false` | Opt into the entire legacy slim export, materialization, and publication job |
 | `channel` | string | `staging` | One safe channel path component |
 
-The publisher step runs only when `github.event_name` is
+The entire `publish-runtime-slim` job runs only on `main` when `github.event_name` is
 `workflow_dispatch` and `publish_runtime` is explicitly `true`. It validates
 `channel` against `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` and rejects `.` and
-`..`. Ordinary pushes to `main` skip both the validation and publisher steps, receive no
+`..`. Ordinary pushes to `main` and default manual builds skip the entire job, receive no
 `OBJECT_STORE_*` secrets, and make no object-store writes.
 
 The dependency-install and archive-discovery step has no object-store secrets.
