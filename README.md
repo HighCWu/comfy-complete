@@ -254,27 +254,13 @@ allowances cannot silently cross scanner/profile contracts. Static
 runtime candidate exists; the critical import probe is the dynamic proof for
 the base startup closure, while genuinely missing libraries remain blockers.
 
-### Public Docker Build audit
+### Public Docker Build
 
-The `Docker Build` workflow has a separate `audit-base-runtime` job. It waits
-for `build-base`, reuses that job's content-addressed `base-*` tag, pulls the
-published `Dockerfile.cloudbuild` `base` image, and runs the audit inside that
-exact image with `--source-root /`. The container is read-only, has no network,
-and mounts only the audit script, policy, inventory, and small output directory;
-the audit input is therefore the final image rootfs, not this checkout. This
-avoids copying the multi-gigabyte runtime to the runner filesystem while
-preserving the final-container boundary. The job uses the checked-in Ubuntu
-launcher inventory (`ci/runtime-launcher-inventory.json`) plus the
-deny-by-default static gate policy (`ci/runtime-portability-gate.json`).
-Provider-injected CUDA driver names and launcher-provided shell/coreutils
-paths are explicit inventory evidence; any dependency outside that contract
-or outside an exact reviewed finding allowance fails the release gate.
-
-Only small JSON metadata/policy files, the portability report, and its log are
-uploaded as a short-retention workflow artifact. The materialized rootfs and
-the archive from `export_runtime.py` are never uploaded. The audit job has only
-`contents: read` and `packages: read` permissions and performs no R2, RunPod,
-D1, or paid external-resource operation.
+The workflow builds reusable content-addressed base and generic wrapper images.
+The Pod wrapper embeds only the external-module loader; application-specific
+modules are not part of the public image or build context. See
+`docs/EXTERNAL_MODULES.md` for its runtime configuration. The former slim-runtime
+publication and application-specific launcher audit are no longer build jobs.
 
 ## License
 

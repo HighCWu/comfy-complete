@@ -1,0 +1,18 @@
+# Generic wrapper only. Private modules are delivered separately by exact SHA.
+# Generic wrapper: application modules are downloaded at runtime, not embedded.
+
+ARG BASE_IMAGE=ghcr.io/highcwu/comfy-complete:latest
+FROM ${BASE_IMAGE}
+
+USER root
+
+COPY --chmod=644 docker/module-bootstrap.py /module-bootstrap.py
+
+RUN ln -sfn /app/comfyui /comfyui
+
+ENV COMFY_POD_PORT=8189 \
+    COMFY_LOG_LEVEL=INFO
+
+EXPOSE 8189
+WORKDIR /app/comfyui
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "python3", "/module-bootstrap.py"]
