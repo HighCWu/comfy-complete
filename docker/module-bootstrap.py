@@ -70,7 +70,7 @@ def download_archive(url: str, digest: str, destination: Path, *, token: str = "
         def redirect_request(self, *args):
             return None
     opener = opener or urllib.request.build_opener(NoRedirect())
-    request = urllib.request.Request(url, headers={"Accept-Encoding": "identity",
+    request = urllib.request.Request(url, headers={"Accept-Encoding": "identity", "User-Agent": "pod-module-bootstrap/1",
         **({"Authorization": "Bearer " + token} if token else {})})
     try:
         with opener.open(request, timeout=30) as response:

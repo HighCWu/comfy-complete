@@ -1,6 +1,7 @@
 """Generic loader contract; no platform runtime dependencies."""
 import hashlib
 import importlib.util
+import io
 import ssl
 import tempfile
 import urllib.error
@@ -13,6 +14,23 @@ spec.loader.exec_module(loader)
 
 
 class LoaderContract(unittest.TestCase):
+    def test_download_identifies_the_client_without_browser_impersonation(self):
+        url = "https://private.invalid/bundle"
+        class Response(io.BytesIO):
+            status = 200
+            headers = {"Content-Length": "1"}
+            def geturl(self):
+                return url
+        requests = []
+        class Opener:
+            def open(self, request, timeout):
+                requests.append(request)
+                return Response(b"x")
+        with tempfile.TemporaryDirectory() as directory:
+            loader.download_archive(url, hashlib.sha256(b"x").hexdigest(), Path(directory) / "bundle", opener=Opener())
+        self.assertEqual(requests[0].get_header("User-agent"), "pod-module-bootstrap/1")
+        self.assertEqual(requests[0].get_header("Accept-encoding"), "identity")
+
     def test_download_diagnostics_never_include_capabilities(self):
         private_url = "https://private.invalid/?token=must-not-leak"
         cases = [
