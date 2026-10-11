@@ -11,9 +11,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import ssl
 import tarfile
 import tempfile
 import urllib.parse
+import urllib.error
 import urllib.request
 
 MAX_ARCHIVE_BYTES = 8 * 1024 * 1024
@@ -90,10 +92,20 @@ def download_archive(url: str, digest: str, destination: Path, *, token: str = "
                     output.write(chunk)
             if received != expected or checksum.hexdigest() != digest:
                 raise ModuleBootstrapError("module download integrity mismatch")
-    except Exception:
+    except Exception as error:
         destination.unlink(missing_ok=True)
         # Presigned URLs and capability tokens must never enter traceback text.
-        raise ModuleBootstrapError("module download failed") from None
+        if isinstance(error, urllib.error.HTTPError):
+            category = "http_" + str(error.code)
+        elif isinstance(error, urllib.error.URLError):
+            category = "tls_verification" if isinstance(error.reason, ssl.SSLCertVerificationError) else "connection"
+        elif isinstance(error, TimeoutError):
+            category = "timeout"
+        elif isinstance(error, ModuleBootstrapError):
+            category = "response_integrity"
+        else:
+            category = "local_io" if isinstance(error, OSError) else "unexpected"
+        raise ModuleBootstrapError("module download failed (" + category + ")") from None
 
 
 def install_archive(archive_path: Path, digest: str, root: Path) -> Path:
